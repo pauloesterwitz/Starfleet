@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>Starfleet Command</string>
+    <key>CFBundleDisplayName</key>
+    <string>Starfleet Command</string>
+    <key>CFBundleExecutable</key>
+    <string>StarfleetCommand</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.oesterwitz.starfleetcommand</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0</string>
+    <key>CFBundleIconFile</key>
+    <string>app-icon</string>
+    <key>LSUIElement</key>
+    <true/>
+</dict>
+</plist>
