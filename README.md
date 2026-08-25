@@ -37,13 +37,39 @@ Two **NVIDIA DGX Spark** nodes, each a GB10 with ~121 GiB of unified memory and
 
 | Node | Role |
 | --- | --- |
-| **Jean-Luc** | Head node. Runs the `llama-swap` orchestrator, which fronts every model behind a single OpenAI-compatible endpoint, plus Ollama. |
+| **Jean-Luc** | Head node. Runs [llama-swap](https://github.com/mostlygeek/llama-swap), which fronts every model behind a single OpenAI-compatible endpoint, plus Ollama. |
 | **Kathryn** | Worker. Serves models of her own, and pairs with Jean-Luc for tensor-parallel jobs. |
 
-`llama-swap` loads and unloads models on demand and groups them so they don't
-fight over memory — small models co-reside, a huge one evicts everything else,
-and Kathryn's pool is deliberately independent (loading a model on her machine
-frees nothing on his, so her models must never evict his, or vice versa).
+### llama-swap holds the fleet together
+
+**[llama-swap](https://github.com/mostlygeek/llama-swap)** (by
+[mostlygeek](https://github.com/mostlygeek)) is the piece that makes a
+two-machine fleet usable. It's a lightweight proxy that sits in front of your
+inference servers and **swaps models in and out on demand**: a request names a
+model, llama-swap starts whatever process serves it, proxies the request, and
+unloads it again after an idle TTL.
+
+That matters here because 28 models are defined but only ~121 GiB per node is
+available. Without it you'd be manually starting and stopping vLLM. With it,
+everything — the coding agents, this monitor, any OpenAI-compatible client —
+talks to **one endpoint on the head node** and never thinks about placement.
+
+Three features do the heavy lifting for a cluster:
+
+- **Groups with swap/exclusive semantics.** Small models are marked to
+  co-reside; a huge one is exclusive and evicts everything else on load. Crucially,
+  Kathryn's pool is `exclusive: false` — loading a model on *her* machine frees
+  nothing on *his*, so the two pools must never evict each other. Getting that
+  wrong is how you end up with a node thrashing.
+- **Arbitrary launch commands.** A "model" is just a command line, so a member
+  can be a local vLLM, an SSH into Kathryn that starts a server there and tunnels
+  the port back, or a Ray cluster spanning both Sparks for TP=2. All three look
+  identical to the client.
+- **Health checks and TTLs.** `checkEndpoint` gates readiness (a big model can
+  take minutes to load), and `ttl` reclaims memory from idle models automatically.
+
+`/running` on the head node reports what's currently resident — which is exactly
+what the monitor's "Serving:" line reads.
 
 Models are named for what they are and where they run:
 
@@ -82,43 +108,58 @@ One Spark has ~121 GiB. TP=2 pools both, so the ceiling roughly doubles:
 That last one is a 400B-class model running on two desktop boxes at 12.3 tok/s,
 with 2–4 GiB of headroom to spare. Without TP it is simply not servable.
 
-### 2. Speed — for models that are big enough to benefit
+### 2. Throughput under load — not single-stream latency
 
-Splitting the work halves the per-node matrix multiply. On a dense 31B:
+This is the part that surprises people. gemma-4-26B-A4B, measured both ways:
 
-| gemma-4-31B-it (dense) | tok/s |
-| --- | --- |
-| Single node | 10.4 |
-| TP=2 across both Sparks | **18.6** |
+| gemma-4-26B-A4B | Single node | TP=2 |
+| --- | --- | --- |
+| Single stream | 46.2 tok/s | 48.2 tok/s **(+4%)** |
+| Aggregate @16 concurrent | 331.7 tok/s | 453.8 tok/s **(+37%)** |
 
-≈1.8× — close to linear, because a dense model has plenty of per-layer work to
-divide relative to the all-reduce cost.
+If you only ever watch one reply stream, TP=2 is nearly pointless here — two
+extra tok/s for the cost of occupying *both* Sparks. Serve sixteen concurrent
+requests and the same configuration is worth 37%.
 
-### 3. …but TP is not free, and sometimes it loses
+So the model stays wired all four ways — pinned to either node, "whichever node
+has more free memory right now", and TP=2 — and you pick by workload rather
+than assuming the parallel version is simply better.
 
-This is the part worth internalising before wiring a fleet:
+### 3. …and sometimes one Spark is the right answer
 
-| Model | Active params | Best mode | tok/s |
-| --- | --- | --- | --- |
-| Qwen3.6-35B-A3B | ~3B | **single node** | 57.1 |
-| Nemotron-Cascade-2-30B-A3B | ~3B | **single node** | 49.1 |
-| gemma-4-26B-A4B | ~4B | TP=2 | 48.2 |
-| Qwen3.5-122B-A10B | ~10B | TP=2 | 40.3 |
+Two models are served single-node **only** — there is no `-starfleet` member for
+either, for quite different reasons:
 
-A sparse MoE that only activates ~3B parameters per token does very little work
-per layer — so there is almost nothing for TP to split, while the cross-node
-all-reduce still has to happen on **every layer of every token**. The
-communication dominates and TP=2 comes out slower than just running it on one
-box. The rule of thumb: **TP pays when per-layer compute is large relative to
+| Model | tok/s | Why one node |
+| --- | --- | --- |
+| Qwen3.6-35B-A3B | **57.1** | Sparse MoE, ~3B active — measured *faster* single than TP=2 |
+| Qwen3.8-27B | ~14 | Memory-bandwidth-bound, not compute-bound |
+
+**Qwen3.6-35B** is the fastest thing on the fleet, and it gets there by staying
+on one box. A sparse MoE that activates only ~3B parameters per token does very
+little work per layer — so there is almost nothing for TP to split, while the
+cross-node all-reduce still fires on **every layer of every token**.
+Communication dominates and TP=2 comes out slower.
+
+**Qwen3.8-27B** is limited by something TP doesn't address at all. Each decode
+step reads 15.13 GiB of weights (12.76 GiB body + 2.37 GiB BF16 `lm_head`), and
+against the GB10's 273 GB/s that puts the roofline at ~16.8 tok/s. The measured
+~14 is close to that ceiling, so the win is quantising `lm_head` to NVFP4 —
+worth ~2 GiB/step and a lift to ~19.5 — not adding nodes. Being bandwidth-bound
+also makes batching nearly free, which is why it's better to point many
+concurrent requests at one endpoint than to serialise them.
+
+The rule of thumb: **TP pays when per-layer compute is large relative to
 interconnect latency.** Active parameter count predicts that far better than
-total model size.
+total model size — and if the bottleneck is memory bandwidth, more nodes is the
+wrong lever entirely.
 
 Two corollaries:
 
 - **The interconnect is the whole ballgame.** These nodes talk over RoCE (RDMA
   over Converged Ethernet). On a slower link the break-even point moves sharply
   toward larger models.
-- **Benchmark, don't assume.** The roster above pins each model to whichever
+- **Benchmark, don't assume.** Every model in the roster is pinned to whichever
   mode actually measured faster — which is why some `-starfleet` members exist
   and some models are deliberately single-node.
 
