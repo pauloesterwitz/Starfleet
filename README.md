@@ -1,8 +1,9 @@
 # Starfleet
 
-Monitoring for a small home GPU cluster, on three surfaces: a **macOS menu bar
-app**, a **floating desktop widget**, and a **physical 3.5" USB panel** on the
-desk.
+One macOS app (**Starfleet Command**) for a small home GPU cluster: three
+read-only monitoring surfaces — a **menu bar** dropdown, a **floating desktop
+widget**, and a **physical 3.5" USB panel** on the desk — plus **Fleet**, a
+window for actively pinning which models stay resident.
 
 It watches two NVIDIA DGX Spark nodes over SSH — GPU load, temperature, power,
 memory, which models `llama-swap` currently has resident, and which coding-agent
@@ -17,16 +18,19 @@ so the fleet is Starfleet.
 
 ---
 
-## The three surfaces
+## The four surfaces
 
 | Surface | What it's for |
 | --- | --- |
 | **Menu bar** | Always-visible health glyph + a `⚡N` count of actively-generating sessions. Click for the full per-host breakdown, expandable session transcripts, and settings. |
 | **Desktop widget** | A borderless always-on-top panel with the same live data, for when you want it visible without clicking. Drag anywhere; position persists. |
 | **USB IPS panel** | A physical 320×480 LCARS-styled readout on the desk. Costs no extra SSH — it feeds off the same pollers. |
+| **Fleet** | A window ("Open Fleet…" in the menu bar dropdown) for browsing every model and pinning one to keep it resident — see [below](#fleet--pin-models-from-a-window). The only one of the four that's a control surface, not read-only. |
 
-All three share one set of `StatusPoller`s, so adding a surface adds **zero**
-polling load on the cluster.
+The first three share one set of `StatusPoller`s, so adding a surface adds
+**zero** polling load on the cluster. Fleet talks to a separate backend
+(`fleet-ui/`, running on the head node) since pinning is a fundamentally
+different job from monitoring.
 
 ---
 
@@ -70,10 +74,6 @@ Three features do the heavy lifting for a cluster:
 
 `/running` on the head node reports what's currently resident — which is exactly
 what the monitor's "Serving:" line reads.
-
-The three monitoring surfaces above are read-only. **[Fleet](#fleet--pin-models-from-a-mac-window)**,
-further down, is the control surface: browse every model, pin one so it stays
-resident, and watch it come straight back if anything evicts it.
 
 Models are named for what they are and where they run:
 
@@ -169,14 +169,20 @@ Two corollaries:
 
 ---
 
-## Fleet — pin models from a Mac window
+## Fleet — pin models from a window
 
-**[Fleet](Fleet)** is a small native macOS window (Swift, `WKWebView`) around
-**[`fleet-ui`](fleet-ui)**, a single-file stdlib-only Python dashboard that runs
-on the head node. It's the control surface for the cluster: search the whole
-model catalogue, see which node(s) a model occupies and its measured tok/s,
-watch per-node RAM/GPU/temp/power/load and running containers, and **pin** a
-model so it stays resident.
+**Fleet** is a window inside Starfleet Command (`FleetView.swift`, a `WKWebView`)
+around **[`fleet-ui`](fleet-ui)**, a single-file stdlib-only Python dashboard
+that runs on the head node. Opened on demand — "Open Fleet…" in the menu bar
+dropdown — rather than shown at launch: the app is normally a menu-bar-only
+accessory process with no Dock icon, and switches to a regular app (Dock icon,
+`⌘`-Tab entry) only for as long as the Fleet window is open, reverting the
+moment it's closed.
+
+Fleet is the control surface for the cluster: search the whole model
+catalogue, see which node(s) a model occupies and its measured tok/s, watch
+per-node RAM/GPU/temp/power/load and running containers, and **pin** a model
+so it stays resident.
 
 ### What "pin" actually guarantees
 
@@ -203,12 +209,12 @@ why it left":
    `python3 fleet.py` (binds the Tailscale IP by default so it's reachable
    from your Mac but not the LAN; see `default_host()`). A systemd user unit
    works well for keeping it up across reboots.
-2. Point `Fleet/Sources/Fleet/ContentView.swift`'s `fleetURL` and
-   `Fleet/Sources/Fleet/Info.plist`'s `NSExceptionDomains` entry at your own
-   head node's address — fleet-ui serves plain HTTP, so that ATS exception is
-   what lets `WKWebView` load it.
-3. Build with `Fleet/package.sh`, same pattern as the app above — produces
-   `Fleet.app`, ad-hoc signed. Drag it to `/Applications`.
+2. Point [`Sources/OpencodeMonitor/FleetView.swift`](Sources/OpencodeMonitor/FleetView.swift)'s
+   `fleetURL` and [`Sources/OpencodeMonitor/Info.plist`](Sources/OpencodeMonitor/Info.plist)'s
+   `NSExceptionDomains` entry at your own head node's address — fleet-ui serves
+   plain HTTP, so that ATS exception is what lets `WKWebView` load it.
+3. Build with `./package.sh`, same as the rest of the app (see below) — Fleet
+   ships inside `Starfleet Command.app`, not as its own bundle.
 
 ---
 
@@ -298,17 +304,17 @@ appears next to it.
 
 ```
 Sources/OpencodeMonitor/   the app
-  App.swift                 entry point; where the nodes are declared
+  App.swift                 entry point; where the nodes are declared, MenuBarExtra + Fleet's Window scene
   StatusPoller.swift        SSH polling, stall detection, Tailscale re-auth
   Models.swift              payload decoding + session ordering
   ContentView.swift         menu bar dropdown
+  FleetView.swift           the Fleet window (WKWebView) + its Dock-icon-on-demand logic
   DesktopWidget*.swift      floating panel
   Panel*.swift              USB panel driver + controller
 cluster/                   scripts that live on each node
 panel-theme/               offline tooling for the USB panel's theme
 docs/menu-bar-app.md       deep-dive on the app's behaviour and known limits
 assets/                    icon + brand mark generators
-Fleet/                     the Fleet app -- model pinning UI (Package.swift, own package.sh)
 fleet-ui/                  Fleet's backend: fleet.py + fleet.html, copied to the head node
 ```
 

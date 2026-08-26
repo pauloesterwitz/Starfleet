@@ -10,17 +10,20 @@ extension Notification.Name {
     static let fleetReload = Notification.Name("fleetReload")
 }
 
-struct ContentView: View {
+/// The Fleet dashboard window: llama-swap model pinning + per-node resources.
+/// Lives in the same app/menu-bar-extra as the session monitor, opened on
+/// demand from ContentView's "Open Fleet" button, not shown at launch.
+struct FleetDashboardView: View {
     @State private var webView: WKWebView = {
         let view = WKWebView(frame: .zero)
-        view.customUserAgent = "Fleet.app/1.0 (macOS)"
+        view.customUserAgent = "Starfleet Command/1.0 (macOS)"
         return view
     }()
     @State private var loadError: String?
 
     var body: some View {
         ZStack {
-            WebViewRepresentable(webView: webView, url: fleetURL, loadError: $loadError)
+            FleetWebView(webView: webView, url: fleetURL, loadError: $loadError)
                 .ignoresSafeArea()
 
             if let loadError {
@@ -48,16 +51,20 @@ struct ContentView: View {
                 .clipShape(RoundedRectangle(cornerRadius: 12))
             }
         }
-        .background(WindowChromeAccessor())
+        .background(FleetWindowChrome())
         .onReceive(NotificationCenter.default.publisher(for: .fleetReload)) { _ in
             webView.load(URLRequest(url: fleetURL))
         }
     }
 }
 
-// Strips the title bar down to just the traffic lights (floating over the
-// page's own black background) so the LCARS header is the only header.
-private struct WindowChromeAccessor: NSViewRepresentable {
+/// Two jobs: (1) strip the title bar down to just the traffic lights, floating
+/// over the page's own black background, so the LCARS header is the only
+/// header; (2) this app is normally .accessory (no Dock icon, no Cmd+Tab
+/// entry -- see App.swift), but the Fleet window is a real, primary-feeling
+/// window someone will want to alt-tab back to, so flip to .regular for as
+/// long as it's open and back to .accessory the moment it closes.
+private struct FleetWindowChrome: NSViewRepresentable {
     func makeNSView(context: Context) -> NSView {
         let view = NSView(frame: .zero)
         DispatchQueue.main.async {
@@ -67,6 +74,14 @@ private struct WindowChromeAccessor: NSViewRepresentable {
             window.styleMask.insert(.fullSizeContentView)
             window.isMovableByWindowBackground = true
             window.backgroundColor = .black
+
+            NSApp.setActivationPolicy(.regular)
+            NSApp.activate(ignoringOtherApps: true)
+            NotificationCenter.default.addObserver(
+                forName: NSWindow.willCloseNotification, object: window, queue: .main
+            ) { _ in
+                NSApp.setActivationPolicy(.accessory)
+            }
         }
         return view
     }
@@ -74,7 +89,7 @@ private struct WindowChromeAccessor: NSViewRepresentable {
     func updateNSView(_ nsView: NSView, context: Context) {}
 }
 
-private struct WebViewRepresentable: NSViewRepresentable {
+private struct FleetWebView: NSViewRepresentable {
     let webView: WKWebView
     let url: URL
     @Binding var loadError: String?
@@ -92,8 +107,8 @@ private struct WebViewRepresentable: NSViewRepresentable {
     }
 
     final class Coordinator: NSObject, WKNavigationDelegate {
-        let parent: WebViewRepresentable
-        init(_ parent: WebViewRepresentable) { self.parent = parent }
+        let parent: FleetWebView
+        init(_ parent: FleetWebView) { self.parent = parent }
 
         func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
             parent.loadError = nil

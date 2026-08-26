@@ -7,6 +7,7 @@ struct ContentView: View {
     @ObservedObject var widgetController: DesktopWidgetController
     @ObservedObject var panelController: PanelController
     @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -24,6 +25,11 @@ struct ContentView: View {
             .frame(maxHeight: 420)
 
             Divider()
+            Button("Open Fleet…") {
+                openWindow(id: "fleet")
+            }
+            .font(.caption)
+
             Toggle("Show desktop widget", isOn: $widgetController.isVisible)
                 .toggleStyle(.checkbox)
                 .font(.caption)

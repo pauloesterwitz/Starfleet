@@ -51,5 +51,21 @@ struct StarfleetCommandApp: App {
             .help("Jean-Luc: \(jeanLuc.lastError ?? "ok") · Kathryn: \(kathryn.lastError ?? "ok")")
         }
         .menuBarExtraStyle(.window)
+        .commands {
+            CommandGroup(after: .toolbar) {
+                Button("Reload Fleet") {
+                    NotificationCenter.default.post(name: .fleetReload, object: nil)
+                }
+                .keyboardShortcut("r", modifiers: .command)
+            }
+        }
+
+        // Singleton window (not WindowGroup -- there's only ever one Fleet
+        // dashboard), opened on demand via ContentView's "Open Fleet" button.
+        Window("Fleet", id: "fleet") {
+            FleetDashboardView()
+                .frame(minWidth: 960, minHeight: 640)
+        }
+        .windowStyle(.hiddenTitleBar)
     }
 }
