@@ -25,7 +25,7 @@ so the fleet is Starfleet.
 | **Menu bar** | Always-visible health glyph + a `⚡N` count of actively-generating sessions. Click for the full per-host breakdown, expandable session transcripts, and settings. |
 | **Desktop widget** | A borderless always-on-top panel with the same live data, for when you want it visible without clicking. Drag anywhere; position persists. |
 | **USB IPS panel** | A physical 320×480 LCARS-styled readout on the desk. Costs no extra SSH — it feeds off the same pollers. |
-| **Fleet** | A window ("Open Fleet…" in the menu bar dropdown) for browsing every model and pinning one to keep it resident — see [below](#fleet--pin-models-from-a-window). The only one of the four that's a control surface, not read-only. |
+| **Fleet** | A window ("Open Starfleet Command…" in the menu bar dropdown) for browsing every model and pinning one to keep it resident — see [below](#fleet--pin-models-from-a-window). The only one of the four that's a control surface, not read-only. |
 
 The first three share one set of `StatusPoller`s, so adding a surface adds
 **zero** polling load on the cluster. Fleet talks to a separate backend
@@ -173,7 +173,7 @@ Two corollaries:
 
 **Fleet** is a window inside Starfleet Command (`FleetView.swift`, a `WKWebView`)
 around **[`fleet-ui`](fleet-ui)**, a single-file stdlib-only Python dashboard
-that runs on the head node. Opened on demand — "Open Fleet…" in the menu bar
+that runs on the head node. Opened on demand — "Open Starfleet Command…" in the menu bar
 dropdown — rather than shown at launch: the app is normally a menu-bar-only
 accessory process with no Dock icon, and switches to a regular app (Dock icon,
 `⌘`-Tab entry) only for as long as the Fleet window is open, reverting the

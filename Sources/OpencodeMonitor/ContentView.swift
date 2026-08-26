@@ -25,7 +25,7 @@ struct ContentView: View {
             .frame(maxHeight: 420)
 
             Divider()
-            Button("Open Fleet…") {
+            Button("Open Starfleet Command…") {
                 openWindow(id: "fleet")
             }
             .font(.caption)
