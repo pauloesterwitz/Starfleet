@@ -71,6 +71,10 @@ Three features do the heavy lifting for a cluster:
 `/running` on the head node reports what's currently resident — which is exactly
 what the monitor's "Serving:" line reads.
 
+The three monitoring surfaces above are read-only. **[Fleet](#fleet--pin-models-from-a-mac-window)**,
+further down, is the control surface: browse every model, pin one so it stays
+resident, and watch it come straight back if anything evicts it.
+
 Models are named for what they are and where they run:
 
 ```
@@ -162,6 +166,49 @@ Two corollaries:
 - **Benchmark, don't assume.** Every model in the roster is pinned to whichever
   mode actually measured faster — which is why some `-starfleet` members exist
   and some models are deliberately single-node.
+
+---
+
+## Fleet — pin models from a Mac window
+
+**[Fleet](Fleet)** is a small native macOS window (Swift, `WKWebView`) around
+**[`fleet-ui`](fleet-ui)**, a single-file stdlib-only Python dashboard that runs
+on the head node. It's the control surface for the cluster: search the whole
+model catalogue, see which node(s) a model occupies and its measured tok/s,
+watch per-node RAM/GPU/temp/power/load and running containers, and **pin** a
+model so it stays resident.
+
+### What "pin" actually guarantees
+
+llama-swap's own idle `ttl` and swap-group exclusivity (see above) still fully
+apply — Fleet doesn't and shouldn't override them, since group exclusivity is
+deliberate, memory-driven config (e.g. the `starfleet` group is `swap: true`
+because only one TP=2 model can occupy both Sparks at once). Instead, Fleet
+treats "pinned" as "bring it straight back the instant it's gone, no matter
+why it left":
+
+- A 5-second watchdog checks every pinned model against `/running`. Missing —
+  because its ttl lapsed, *or* because a different member of its swap group
+  got requested and evicted it — triggers an immediate reload, not a wait for
+  the next tick.
+- Each reload runs in its own thread. A slow cold load (TP=2 can take 20+
+  minutes) no longer blocks refreshing every *other* pin, which is what the
+  original single-threaded, one-at-a-time loop did.
+- A model that's still resident just gets a periodic ttl-refresh touch
+  (`GET /upstream/<model>/health`), well inside the shortest configured ttl.
+
+### Setup
+
+1. Copy `fleet-ui/fleet.py` and `fleet-ui/fleet.html` to the head node and run
+   `python3 fleet.py` (binds the Tailscale IP by default so it's reachable
+   from your Mac but not the LAN; see `default_host()`). A systemd user unit
+   works well for keeping it up across reboots.
+2. Point `Fleet/Sources/Fleet/ContentView.swift`'s `fleetURL` and
+   `Fleet/Sources/Fleet/Info.plist`'s `NSExceptionDomains` entry at your own
+   head node's address — fleet-ui serves plain HTTP, so that ATS exception is
+   what lets `WKWebView` load it.
+3. Build with `Fleet/package.sh`, same pattern as the app above — produces
+   `Fleet.app`, ad-hoc signed. Drag it to `/Applications`.
 
 ---
 
@@ -261,6 +308,8 @@ cluster/                   scripts that live on each node
 panel-theme/               offline tooling for the USB panel's theme
 docs/menu-bar-app.md       deep-dive on the app's behaviour and known limits
 assets/                    icon + brand mark generators
+Fleet/                     the Fleet app -- model pinning UI (Package.swift, own package.sh)
+fleet-ui/                  Fleet's backend: fleet.py + fleet.html, copied to the head node
 ```
 
 ---

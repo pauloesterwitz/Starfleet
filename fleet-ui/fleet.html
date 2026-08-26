@@ -1,0 +1,271 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>LCARS · Fleet</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Antonio:wght@400;600;700&display=swap" rel="stylesheet">
+<style>
+:root{
+  --orange:#f90;   --peach:#f96;  --mauve:#c9c;  --blue:#9cf;
+  --amber:#fc6;    --red:#c66;    --magenta:#d46ab8;  /* brand magenta, lifted for black */
+  --ink:#000; --text:#ffcc99; --dim:#a4855f; --grid:#332211;
+  --lcars:"Antonio","Oswald","Helvetica Neue Condensed","Arial Narrow",sans-serif;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--ink);color:var(--text);font-family:var(--lcars);
+  letter-spacing:.06em;-webkit-font-smoothing:antialiased}
+.frame{display:grid;grid-template-columns:150px 1fr;gap:6px;padding:6px;min-height:100vh}
+
+/* ---- left rail: stacked blocks, elbow at top and bottom ---- */
+.rail{display:flex;flex-direction:column;gap:6px;position:sticky;top:6px;
+  height:calc(100vh - 12px)}
+.blk{background:var(--orange);color:#000;border-radius:0;padding:6px 10px 8px;
+  display:flex;flex-direction:column;justify-content:flex-end;align-items:flex-end;
+  line-height:1;text-transform:uppercase}
+.blk .n{font-size:26px;font-weight:700}
+.blk .l{font-size:11px;font-weight:600;opacity:.72;margin-top:3px}
+.blk.elbow-t{height:96px;border-top-left-radius:76px;background:var(--peach)}
+.blk.elbow-b{height:70px;border-bottom-left-radius:76px;background:var(--mauve);flex:0 0 auto}
+.blk.c2{background:var(--mauve)} .blk.c3{background:var(--blue)}
+.blk.c4{background:var(--amber)} .blk.c5{background:var(--magenta)}
+.blk.fill{flex:1 1 auto;background:var(--grid);min-height:20px}
+
+/* ---- header ---- */
+.top{display:flex;align-items:flex-end;gap:8px;height:96px}
+.top .bar{flex:1;height:38px;background:var(--orange);border-top-right-radius:19px;
+  border-bottom-right-radius:19px;display:flex;align-items:center;justify-content:flex-end;
+  padding-right:18px;color:#000;font-size:13px;font-weight:600;text-transform:uppercase}
+.title{font-size:40px;font-weight:700;text-transform:uppercase;color:var(--peach);
+  line-height:.9;white-space:nowrap}
+.title span{color:var(--blue)}
+
+/* ---- section header bars ---- */
+.sec{display:flex;align-items:center;gap:8px;margin:14px 0 8px}
+.sec .cap{width:44px;height:22px;background:var(--mauve);border-radius:0 11px 11px 0}
+.sec h2{margin:0;font-size:17px;font-weight:600;text-transform:uppercase;color:var(--amber)}
+.sec .rule{flex:1;height:6px;background:var(--grid);border-radius:3px}
+
+/* ---- node panels ---- */
+.nodes{display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:8px}
+.node{border-left:8px solid var(--blue);background:#0b0803;padding:10px 14px 12px}
+.node.warn{border-left-color:var(--amber)} .node.crit{border-left-color:var(--red)}
+.node h3{margin:0;font-size:24px;font-weight:700;text-transform:uppercase;color:var(--blue)}
+.node.warn h3{color:var(--amber)} .node.crit h3{color:var(--red)}
+.mem{font-size:30px;font-weight:700;color:var(--peach);line-height:1.1;margin-top:4px}
+.mem s{text-decoration:none;font-size:14px;color:var(--dim)}
+/* segmented LCARS gauge */
+.gauge{display:flex;gap:2px;margin:8px 0 6px;height:14px}
+.gauge i{flex:1;background:#241a0d;border-radius:1px}
+.gauge i.on{background:var(--peach)}
+.node.warn .gauge i.on{background:var(--amber)}
+.node.crit .gauge i.on{background:var(--red)}
+.free{font-size:12px;color:var(--dim);text-transform:uppercase;letter-spacing:.08em}
+.stats{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+.stat{background:var(--grid);padding:2px 9px 3px;border-radius:10px;font-size:12px;color:var(--dim);
+  text-transform:uppercase}
+.stat b{color:var(--text);font-weight:600;font-size:14px;margin-left:5px}
+.ctrs{margin-top:9px;display:flex;flex-wrap:wrap;gap:4px}
+.ctrs u{text-decoration:none;font-size:11px;background:#1a1409;color:var(--dim);
+  border-radius:9px;padding:2px 9px;letter-spacing:.04em}
+.ctrs u.mcp{color:var(--mauve)} .ctrs u.gpu{color:var(--blue)}
+
+/* ---- filter ---- */
+.filter{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-bottom:8px}
+.filter input{font-family:var(--lcars);font-size:15px;letter-spacing:.08em;text-transform:uppercase;
+  background:#0b0803;border:2px solid var(--grid);border-radius:14px;color:var(--peach);
+  padding:4px 14px;outline:none;min-width:210px}
+.filter input:focus{border-color:var(--orange)}
+.pill{font-family:var(--lcars);font-size:12px;font-weight:600;letter-spacing:.08em;
+  text-transform:uppercase;background:var(--grid);color:var(--dim);border:0;border-radius:11px;
+  padding:4px 13px;cursor:pointer}
+.pill:hover{color:var(--text)}
+.pill.on{background:var(--orange);color:#000}
+.count{margin-left:auto;font-size:12px;color:var(--dim);text-transform:uppercase}
+
+/* ---- model table ---- */
+table{width:100%;border-collapse:separate;border-spacing:0 3px}
+th{text-align:left;font-size:11px;font-weight:600;text-transform:uppercase;color:var(--dim);
+  padding:0 10px 4px}
+td{background:#0b0803;padding:7px 10px;vertical-align:middle}
+td:first-child{border-left:7px solid var(--grid)}
+tr.pinned td{background:#170f18}
+tr.pinned td:first-child{border-left-color:var(--magenta)}
+tr.live td:first-child{border-left-color:var(--blue)}
+.mid{font-size:15px;color:var(--text);letter-spacing:.04em}
+.tag{font-size:11px;font-weight:600;letter-spacing:.06em;border-radius:9px;padding:1px 9px;
+  margin-right:3px;color:#000;display:inline-block}
+.tag.jl{background:var(--blue)} .tag.ka{background:var(--amber)}
+.tag.dy{background:var(--mauve)}
+.st{font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.08em}
+.st.ready{color:var(--blue)} .st.starting{color:var(--amber)}
+.st.stopped{color:var(--dim)} .st.working{color:var(--magenta)}
+.act{text-align:right;white-space:nowrap}
+.act button{font-family:var(--lcars);font-size:12px;font-weight:600;letter-spacing:.08em;
+  text-transform:uppercase;border:0;border-radius:11px;padding:4px 14px;margin-left:4px;
+  background:var(--grid);color:var(--text);cursor:pointer}
+.act button:hover{background:var(--peach);color:#000}
+.act button.on{background:var(--magenta);color:#000}
+.act button:disabled{opacity:.32;cursor:default;background:var(--grid);color:var(--dim)}
+.err{color:var(--red);font-size:12px;margin-top:3px;white-space:pre-wrap;word-break:break-word;
+  letter-spacing:.03em}
+#banner{display:none;background:var(--red);color:#000;padding:7px 16px;border-radius:14px;
+  margin:10px 0;font-size:14px;font-weight:600;text-transform:uppercase}
+.empty{color:var(--dim);font-size:14px;padding:14px 10px;text-transform:uppercase}
+</style></head><body>
+<div class="frame">
+  <div class="rail">
+    <div class="blk elbow-t"><div class="n" id="r-mdl">--</div><div class="l">Models</div></div>
+    <div class="blk c3"><div class="n" id="r-res">--</div><div class="l">Resident</div></div>
+    <div class="blk c5"><div class="n" id="r-pin">--</div><div class="l">Pinned</div></div>
+    <div class="blk c4"><div class="n" id="r-node">--</div><div class="l">Nodes</div></div>
+    <div class="blk fill"></div>
+    <div class="blk elbow-b"><div class="n" id="r-free">--</div><div class="l">GB Free</div></div>
+  </div>
+
+  <div class="main">
+    <div class="top">
+      <div class="title">Starfleet <span>Fleet</span></div>
+      <div class="bar"><span id="clock">--:--:--</span></div>
+    </div>
+
+    <div id="banner"></div>
+
+    <div class="sec"><div class="cap"></div><h2>Node Status</h2><div class="rule"></div></div>
+    <div class="nodes" id="nodes"></div>
+
+    <div class="sec"><div class="cap"></div><h2>Model Registry</h2><div class="rule"></div></div>
+    <div class="filter">
+      <input id="q" placeholder="Search models" autocomplete="off">
+      <button class="pill on" data-f="all">All</button>
+      <button class="pill" data-f="jean-luc">Jean-Luc</button>
+      <button class="pill" data-f="kathryn">Kathryn</button>
+      <button class="pill" data-f="starfleet">Starfleet TP2</button>
+      <button class="pill" data-f="dynamic">Auto</button>
+      <button class="pill" data-f="live">Resident</button>
+      <button class="pill" data-f="pinned">Pinned</button>
+      <span class="count" id="count"></span>
+    </div>
+    <table><thead><tr><th>Model</th><th>Node</th><th>Speed</th><th>State</th><th>TTL</th>
+      <th class="act">Persistent</th></tr></thead><tbody id="rows"></tbody></table>
+  </div>
+</div>
+
+<script>
+const TAG={"jean-luc":["jl","JEAN-LUC"],"kathryn":["ka","KATHRYN"],"dynamic":["dy","AUTO"]};
+const gb=kb=>(kb/1048576).toFixed(1);
+const busy=new Set();
+const FILTERS=["all","jean-luc","kathryn","starfleet","dynamic","live","pinned"];
+/* the hash makes a view bookmarkable — open #kathryn to land straight on her models */
+let filter=FILTERS.includes(location.hash.slice(1))?location.hash.slice(1):"all";
+let query="", last={nodes:{},models:[],running:[],pins:[],errors:{}};
+
+/* filter controls live outside the re-rendered table, so typing is never interrupted */
+function setFilter(f){
+  filter=f; location.hash=f;
+  document.querySelectorAll(".pill").forEach(x=>x.classList.toggle("on",x.dataset.f===f));
+  render(last);
+}
+document.querySelectorAll(".pill").forEach(b=>b.onclick=()=>setFilter(b.dataset.f));
+addEventListener("hashchange",()=>{
+  const f=location.hash.slice(1);
+  if(FILTERS.includes(f)&&f!==filter) setFilter(f);
+});
+setFilter(filter);
+document.getElementById("q").oninput=e=>{query=e.target.value.trim().toLowerCase();render(last);};
+
+function keep(m,run){
+  if(query && !m.id.toLowerCase().includes(query)) return false;
+  switch(filter){
+    case "all": return true;
+    case "live": return !!run[m.id];
+    case "pinned": return m.pinned;
+    case "starfleet": return m.nodes.length>1;
+    default: return m.nodes.includes(filter) && m.nodes.length===1;
+  }
+}
+
+function gauge(pct){
+  const N=28, on=Math.round(pct/100*N);
+  return `<div class="gauge">${Array.from({length:N},(_,i)=>
+    `<i class="${i<on?"on":""}"></i>`).join("")}</div>`;
+}
+function ctrClass(n){
+  /* the trailing _word_word pattern still catches anything Docker auto-named */
+  if(/mcp/.test(n)||/^[a-z]+_[a-z]+$/.test(n)) return "mcp";
+  if(/comfy|vllm|ds4|ray|cluster/.test(n)) return "gpu";
+  return "";
+}
+function nodeCard(name,n){
+  if(!n||n.error) return `<div class="node crit"><h3>${name}</h3>
+    <div class="err">${n?n.error:"PROBING..."}</div></div>`;
+  const used=n.mem_total_kb-n.mem_avail_kb, pct=used/n.mem_total_kb*100;
+  const cls=pct>85?"crit":pct>65?"warn":"";
+  return `<div class="node ${cls}"><h3>${n.host||name}</h3>
+    <div class="mem">${gb(used)}<s> / ${gb(n.mem_total_kb)} GB</s></div>
+    ${gauge(pct)}
+    <div class="free">${gb(n.mem_avail_kb)} GB free for models</div>
+    <div class="stats">
+      <span class="stat">GPU<b>${n.gpu_util??"?"}%</b></span>
+      <span class="stat">Temp<b>${n.gpu_temp??"?"}&deg;</b></span>
+      <span class="stat">Pwr<b>${n.gpu_power??"?"}W</b></span>
+      <span class="stat">Load<b>${n.load??"?"}</b></span></div>
+    <div class="ctrs">${(n.containers||[]).map(c=>
+      `<u class="${ctrClass(c)}">${c}</u>`).join("")||"<u>no containers</u>"}</div></div>`;
+}
+
+async function act(url,model,pin){
+  busy.add(model); render(last);
+  try{
+    const r=await fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({model,pin})});
+    if(!r.ok) alert((await r.json()).error||"failed");
+  }catch(e){ alert(e.message); }
+  busy.delete(model); refresh();
+}
+
+function render(s){
+  last=s;
+  const run={}; (s.running||[]).forEach(r=>run[r.model]=r);
+
+  document.getElementById("nodes").innerHTML=
+    ["jean-luc","kathryn"].map(k=>nodeCard(k,s.nodes[k])).join("");
+
+  const ok=Object.values(s.nodes).filter(n=>n&&!n.error);
+  const free=ok.reduce((a,n)=>a+n.mem_avail_kb,0);
+  document.getElementById("r-mdl").textContent=s.models.length;
+  document.getElementById("r-res").textContent=(s.running||[]).length;
+  document.getElementById("r-pin").textContent=(s.pins||[]).length;
+  document.getElementById("r-node").textContent=ok.length+"/"+Object.keys(s.nodes).length;
+  document.getElementById("r-free").textContent=ok.length?gb(free):"--";
+
+  const b=document.getElementById("banner");
+  if(s.errors&&s.errors._swap){b.style.display="block";b.textContent=s.errors._swap;}
+  else b.style.display="none";
+
+  const shown=[...s.models].filter(m=>keep(m,run)).sort((a,c)=>
+    (c.pinned-a.pinned)||((run[c.id]?1:0)-(run[a.id]?1:0))||a.id.localeCompare(c.id));
+  document.getElementById("count").textContent=`${shown.length} of ${s.models.length}`;
+
+  document.getElementById("rows").innerHTML = shown.length ? shown.map(m=>{
+    const r=run[m.id], working=busy.has(m.id), st=working?"working":(r?r.state:"stopped");
+    return `<tr class="${m.pinned?"pinned":r?"live":""}">
+      <td><div class="mid">${m.id}</div>${m.error?`<div class="err">${m.error}</div>`:""}</td>
+      <td>${m.nodes.map(n=>`<span class="tag ${TAG[n][0]}">${TAG[n][1]}</span>`).join("")}</td>
+      <td class="mid">${m.tps?m.tps+" T/S":"&mdash;"}</td>
+      <td><span class="st ${st}">${st}</span></td>
+      <td class="mid">${r&&r.ttl?Math.round(r.ttl/60)+" MIN":"&mdash;"}</td>
+      <td class="act">
+        <button class="${m.pinned?"on":""}" ${working?"disabled":""}
+          onclick="act('/api/pin','${m.id}',${!m.pinned})">${m.pinned?"Pinned":"Pin"}</button>
+        <button ${working||!r?"disabled":""}
+          onclick="act('/api/unload','${m.id}')">Unload</button></td></tr>`;
+  }).join("") : `<tr><td colspan="6" class="empty">No models match this filter</td></tr>`;
+
+  document.getElementById("clock").textContent=new Date().toLocaleTimeString();
+}
+
+async function refresh(){
+  try{ render(await (await fetch("/api/state")).json()); }catch(e){}
+}
+refresh(); setInterval(refresh,3000);
+</script></body></html>
