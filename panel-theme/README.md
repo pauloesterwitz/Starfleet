@@ -159,13 +159,34 @@ Status enum — send exactly these integers:
 | 1 | WORKING | 4 | IDLE |
 | 2 | STALLED | 5…9 | UNKNOWN (never send these) |
 
+The resident model per machine rides on each node's heading line:
+
+| Ch | Meaning |
+| --- | --- |
+| 18 | Jean-Luc resident model |
+| 19 | Kathryn resident model |
+
+Model enum — send exactly these integers. These are model **families**, not
+full member names: a single decimal digit only indexes ten atlas cells, and the
+roster has 26 members across 12 families, so 1–4 are the everyday residents,
+5–8 the tensor-parallel ones, and 9 the catch-all.
+
+| Value | Word | Value | Word |
+| --- | --- | --- | --- |
+| 0 | — (nothing resident) | 5 | QWEN3.5 |
+| 1 | GEMMA4 | 6 | QWEN235B |
+| 2 | QWEN3.6 | 7 | NEMOTRON |
+| 3 | QWEN3.8 | 8 | MINIMAX |
+| 4 | NEMCASC | 9 | OTHER |
+
 ### How a number widget draws a *word*
 
 The status fields are ordinary number widgets (record `0x92`). A number widget
 renders a value by splitting it into decimal digits and blitting one bitmap per
 digit out of a 12-cell glyph atlas — and nothing requires those cells to contain
 digits. The status atlas holds **words** in cells 0…4, so a channel value of
-`1` draws the cell that contains `WORKING`.
+`1` draws the cell that contains `WORKING`; the model atlas uses all ten cells
+the same way.
 
 Two things keep that honest rather than fragile:
 

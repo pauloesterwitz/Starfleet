@@ -44,9 +44,11 @@ atlas is just ``sum(glyph_widths) * glyph_height`` bytes of 8-bit coverage,
 cells concatenated in order ``0123456789.-``, and the record carries the 12
 cell widths as big-endian u16 (record bytes 22..45).
 
-Nothing in that says the cells have to contain *digits*.  So the session
-status fields put WORDS in cells 0..4, and a channel value of 0..4 selects
-one:  0=NONE 1=WORKING 2=STALLED 3=WAITING 4=IDLE.
+Nothing in that says the cells have to contain *digits*.  So four fields on
+this panel put WORDS in the atlas and let a single-digit channel value select
+one: the two session status fields (0=NONE 1=WORKING 2=STALLED 3=WAITING
+4=IDLE) and the two resident-model fields (0=em dash, then nine model family
+names).  See ``atlas_cell_words()`` and ``ThemeBuilder.word_field()``.
 
 Two properties make this safe rather than clever:
 
@@ -58,8 +60,9 @@ Two properties make this safe rather than clever:
   cumulative-width indexing and fixed-stride indexing land on exactly the
   same bytes, so the trick does not depend on which one the firmware uses.
 
-Cells 5..9 hold "UNKNOWN" so an out-of-range enum degrades visibly instead of
-drawing garbage, and cells 10/11 (the '.' and '-' slots) hold a dash.
+Any of cells 0..9 a field does not define holds a filler word, so an
+out-of-range enum degrades visibly instead of drawing garbage, and cells 10/11
+(the '.' and '-' slots, unreachable from a plain integer) hold a dash.
 """
 
 from __future__ import annotations
@@ -265,12 +268,22 @@ CH_AGENTS = 9
 # Two most-recently-active agent sessions across both Sparks.
 CH_S1_STATUS, CH_S1_AGE, CH_S1_DONE, CH_S1_TOTAL = 10, 11, 12, 13
 CH_S2_STATUS, CH_S2_AGE, CH_S2_DONE, CH_S2_TOTAL = 14, 15, 16, 17
+# Resident model per machine.
+CH_JL_MODEL, CH_KT_MODEL = 18, 19
 
 # Status enum -> word, selected by the value the app sends on the status
 # channel.  Index in this tuple IS the wire value.
 STATUS_WORDS = ("NONE", "WORKING", "STALLED", "WAITING", "IDLE")
 STATUS_FILLER = "UNKNOWN"   # atlas cells 5..9: enum values we never send
-STATUS_PUNCT = "-"          # atlas cells 10/11: the '.' and '-' slots
+ATLAS_PUNCT = "-"           # atlas cells 10/11: the '.' and '-' slots
+
+# Resident-model enum -> word.  Index IS the wire value, and a single decimal
+# digit only indexes ten cells, so these are model FAMILIES rather than the
+# roster's 26 full member names: 1-4 the everyday residents, 5-8 the
+# tensor-parallel ones, 9 a catch-all.  Cell 0 is an em dash for "nothing
+# resident" -- it rasterises as a centred bar, which reads as a blank field.
+MODEL_WORDS = ("—", "GEMMA4", "QWEN3.6", "QWEN3.8", "NEMCASC",
+               "QWEN3.5", "QWEN235B", "NEMOTRON", "MINIMAX", "OTHER")
 
 # Only used to draw theme_preview.png -- never written to the device.
 SAMPLE_VALUES = {
@@ -279,6 +292,9 @@ SAMPLE_VALUES = {
     CH_AGENTS: 2,
     CH_S1_STATUS: 1, CH_S1_AGE: 3, CH_S1_DONE: 4, CH_S1_TOTAL: 9,      # WORKING
     CH_S2_STATUS: 3, CH_S2_AGE: 47, CH_S2_DONE: 12, CH_S2_TOTAL: 12,   # WAITING
+    # A short word on one node and the longest on the other, so the preview
+    # shows both fields and the widest string at once.
+    CH_JL_MODEL: 1, CH_KT_MODEL: 7,                                    # GEMMA4 / NEMOTRON
 }
 
 
@@ -290,9 +306,16 @@ SAMPLE_VALUES = {
 #
 # Vertical budget, from the top:
 #     0.. 66   header      (title, subtitle, rule)
-#    74..224   JEAN-LUC    (heading + 2x2 metric grid)
+#    74..224   JEAN-LUC    (heading + resident model + 2x2 metric grid)
 #   234..384   KATHRYN     (same)
-#   388..477   AGENT SESSIONS (count + column captions + 2 session rows)
+#   388..468   AGENT SESSIONS (count + column captions + 2 session rows)
+#
+# The resident-model row costs no vertical space at all: the node heading only
+# uses ~103px of a 284px-wide line, so the model caption and word ride on the
+# heading line beside the machine name.  That is the only free space on the
+# panel -- a node block cannot grow (its two metric rows already sit 2-4px
+# apart) and adding a third row per node would have needed ~90px that does not
+# exist.
 MARGIN_X = 18
 GUTTER = 18
 COL_W = (PANEL_W - 2 * MARGIN_X - GUTTER) // 2          # 133
@@ -325,18 +348,31 @@ NODE_ROW_DY = (36, 94)          # caption y, relative to heading y
 NODE_VALUE_DY = 16              # value y, relative to its caption y
 NODE_BLOCK_H = 150              # height of the left accent pill
 
+# Resident model, sharing the heading line.  The offsets centre each item's
+# INK on the machine name's ink (which runs top+0..top+23), not their boxes --
+# the three fonts have very different descents.  The word box bottom lands at
+# top+26, clear of the hairline at top+30.
+NODE_MODEL_CAPTION_X = 140
+NODE_MODEL_CAPTION_DY = 5
+NODE_MODEL_X = 182
+NODE_MODEL_DY = 2
+
 SECTION_RULE_Y = (226, 384)     # full-width rules closing each node block
 
 # --- agent sessions block --------------------------------------------------
+# Shrunk on request: the row font drops 22pt -> 18pt (29px boxes -> 24px), and
+# the whole band goes from 388..477 to 388..468, leaving a real bottom margin
+# instead of 3px.  Both rows are kept -- smaller, not fewer.
 SESS_TOP = 388
 SESS_COUNT_Y = 388              # the ch9 "how many are generating" number
 SESS_COUNT_X = 118
-SESS_CAPTION_Y = 394            # "AGENT SESSIONS" / "MIN" / "TODO"
+SESS_CAPTION_Y = 392            # "AGENT SESSIONS" / "MIN" / "TODO"
 SESS_RULE_Y = 414               # hairline between the captions and the rows
-SESS_ROW_Y = (418, 448)         # top of each session row
+SESS_ROW_Y = (418, 444)         # top of each session row
+SESS_PILL_BOTTOM = 470          # the left accent pill wraps the rows
 SESS_STATUS_X = MARGIN_X        # word-atlas status field
-SESS_AGE_X = 156                # minutes since last activity
-SESS_TODO_X = 206               # todos done / total
+SESS_AGE_X = 150                # minutes since last activity
+SESS_TODO_X = 200               # todos done / total
 SESS_GAP = 3                    # padding either side of the "/"
 
 # Fonts: (family key, point size)
@@ -345,19 +381,24 @@ F_SUBTITLE = ("DIN Condensed Bold", 12)
 F_NODE = ("DIN Condensed Bold", 24)
 F_CAPTION = ("DIN Condensed Bold", 12)      # was 16pt -- shrunk to free room
 F_VALUE = ("DIN Alternate Bold", 26)        # the big live numbers, unchanged
-F_SESSION = ("DIN Condensed Bold", 22)      # session rows (words and numbers)
-F_COUNT = ("DIN Condensed Bold", 22)
+F_SESSION = ("DIN Condensed Bold", 18)      # session rows -- was 22pt
+F_COUNT = ("DIN Condensed Bold", 18)
+# 18pt fits the widest model word (NEMOTRON, 82px) in an 86px cell, which
+# leaves 34px of right margin on the heading line.
+F_MODEL = ("DIN Condensed Bold", 18)
 
 NODES = (
     {
         "name": "JEAN-LUC",
         "accent": AMBER,
         "channels": (CH_JL_GPU, CH_JL_TEMP, CH_JL_RAM, CH_JL_PWR),
+        "model_channel": CH_JL_MODEL,
     },
     {
         "name": "KATHRYN",
         "accent": LILAC,
         "channels": (CH_KT_GPU, CH_KT_TEMP, CH_KT_RAM, CH_KT_PWR),
+        "model_channel": CH_KT_MODEL,
     },
 )
 # Cell order is row-major: (GPU, TEMP) then (RAM, PWR).
@@ -385,6 +426,7 @@ class WordAtlas:
     cell_h: int
     ink_boxes: list[tuple[int, int, int, int]]   # per-cell ink bbox, post-gamma
     cells: list[bytes]          # exact per-cell bytes, for byte-level checks
+    report_count: int = 10      # leading cells that are real wire values
 
     @property
     def payload(self) -> bytes:
@@ -397,13 +439,21 @@ class WordAtlas:
         return [self.cell_w] * len(self.cells)
 
 
-def status_atlas_words() -> list[str]:
-    """The 12 atlas cells for a status field, in wire-value order."""
-    words = list(STATUS_WORDS)                                  # values 0..4
-    words += [STATUS_FILLER] * (10 - len(words))                # values 5..9
-    words += [STATUS_PUNCT, STATUS_PUNCT]                       # '.' and '-'
-    assert len(words) == ATLAS_CELLS
-    return words
+def atlas_cell_words(words: tuple[str, ...], filler: str) -> list[str]:
+    """Pad a word list out to the atlas's 12 cells, in wire-value order.
+
+    Cells 0..9 are what a single decimal digit can select; any the caller does
+    not define get ``filler`` so an unexpected value degrades visibly instead
+    of drawing garbage.  Cells 10/11 are the '.' and '-' slots, unreachable
+    from a plain integer, so they get a dash.
+    """
+    cells = list(words)
+    if len(cells) > 10:
+        raise ValueError(f"a digit can only select 10 cells, got {len(cells)}")
+    cells += [filler] * (10 - len(cells))
+    cells += [ATLAS_PUNCT, ATLAS_PUNCT]
+    assert len(cells) == ATLAS_CELLS
+    return cells
 
 
 def _apply_gamma(image: Image.Image, gamma: float | None) -> Image.Image:
@@ -414,7 +464,8 @@ def _apply_gamma(image: Image.Image, gamma: float | None) -> Image.Image:
     )
 
 
-def render_word_atlas(font: FontSpec, words: list[str], gamma: float | None = 1.4) -> WordAtlas:
+def render_word_atlas(font: FontSpec, words: list[str], gamma: float | None = 1.4,
+                      report_count: int = 10) -> WordAtlas:
     """Rasterise ``words`` into a uniform-width glyph atlas.
 
     Mirrors ``render.render_number_glyph_payload``: same ``_render_mask`` (so
@@ -437,7 +488,7 @@ def render_word_atlas(font: FontSpec, words: list[str], gamma: float | None = 1.
         # to zero and can shave a column off the ink box.
         ink_boxes.append(cell.getbbox() or (0, 0, 0, 0))
     return WordAtlas(words=words, cell_w=cell_w, cell_h=cell_h,
-                     ink_boxes=ink_boxes, cells=cells)
+                     ink_boxes=ink_boxes, cells=cells, report_count=report_count)
 
 
 def font_atlas_words(font: FontSpec | None) -> list[str] | None:
@@ -780,7 +831,7 @@ def build_background(path: Path) -> Path:
 
     # --- agent sessions block --------------------------------------------
     draw.rounded_rectangle(
-        (PILL_X, SESS_TOP, PILL_X + PILL_W, PANEL_H - 4),
+        (PILL_X, SESS_TOP, PILL_X + PILL_W, SESS_PILL_BOTTOM),
         radius=PILL_W // 2,
         fill=_rgb(SALMON),
     )
@@ -907,11 +958,17 @@ class ThemeBuilder:
                             f"num ch{channel}", width)
         return width
 
-    def status_word(self, channel: int, spec, color: int, x: int, y: int) -> int:
-        """Live *word* widget: a number widget over a word glyph atlas."""
-        words = status_atlas_words()
-        font = self._font(spec, color, text=WORD_ATLAS_MARK.join(words))
-        atlas = render_word_atlas(font, words, gamma=1.4)
+    def word_field(self, channel: int, spec, color: int, x: int, y: int,
+                   words: tuple[str, ...], filler: str) -> int:
+        """Live *word* widget: a number widget over a word glyph atlas.
+
+        The box is the atlas cell width, which is the widest word plus
+        WORD_CELL_PAD -- so no word can be clipped by construction, and
+        validate() re-proves it against the compiled bytes.
+        """
+        cells = atlas_cell_words(words, filler)
+        font = self._font(spec, color, text=WORD_ATLAS_MARK.join(cells))
+        atlas = render_word_atlas(font, cells, gamma=1.4, report_count=len(words))
         WORD_ATLASES[channel] = atlas
         self._number_widget(channel, font, x, y, atlas.cell_w, atlas.cell_h,
                             f"word ch{channel}", atlas.cell_w)
@@ -928,6 +985,12 @@ def build_widgets() -> ThemeBuilder:
     # --- one block per DGX Spark node -------------------------------------
     for node, top in zip(NODES, NODE_TOP):
         builder.text(node["name"], F_NODE, node["accent"], MARGIN_X, top)
+        # Resident model, riding on the heading line beside the machine name.
+        builder.text("MODEL", F_CAPTION, BLUE,
+                     NODE_MODEL_CAPTION_X, top + NODE_MODEL_CAPTION_DY)
+        builder.word_field(node["model_channel"], F_MODEL, node["accent"],
+                           NODE_MODEL_X, top + NODE_MODEL_DY,
+                           MODEL_WORDS, MODEL_WORDS[-1])
         for index, (caption, channel) in enumerate(zip(CELL_CAPTIONS, node["channels"])):
             col_x = COL_X[index % 2]
             caption_y = top + NODE_ROW_DY[index // 2]
@@ -942,7 +1005,8 @@ def build_widgets() -> ThemeBuilder:
     builder.text("TODO", F_CAPTION, BLUE, SESS_TODO_X, SESS_CAPTION_Y)
 
     for (status_ch, age_ch, done_ch, total_ch), row_y in zip(SESSIONS, SESS_ROW_Y):
-        builder.status_word(status_ch, F_SESSION, SALMON, SESS_STATUS_X, row_y)
+        builder.word_field(status_ch, F_SESSION, SALMON, SESS_STATUS_X, row_y,
+                           STATUS_WORDS, STATUS_FILLER)
         builder.number(age_ch, F_SESSION, BLUE, SESS_AGE_X, row_y, digits=4)
         done_w = builder.number(done_ch, F_SESSION, BLUE, SESS_TODO_X, row_y, digits=2)
         slash_x = SESS_TODO_X + done_w + SESS_GAP
@@ -1088,6 +1152,15 @@ def validate(data: bytes, expected_channels: list[int]) -> dict:
     ]
     if seen_channels != expected_channels:
         problems.append(f"number channels {seen_channels} != expected {expected_channels}")
+    # The app addresses these by number, so the set must be a contiguous 1..N
+    # with nothing skipped and nothing bound twice -- a duplicate would make two
+    # fields shadow each other and a gap means a channel the app writes to
+    # lands nowhere.  (The ORDER is just widget creation order and does not
+    # matter: the model field is built with its node's heading.)
+    if sorted(seen_channels) != list(range(1, len(seen_channels) + 1)):
+        problems.append(
+            f"sensor channels are not a contiguous 1..N set: {sorted(seen_channels)}"
+        )
 
     # -- widget ids unique --------------------------------------------------
     widget_ids = [
@@ -1174,7 +1247,7 @@ def validate(data: bytes, expected_channels: list[int]) -> dict:
                 problems.append(f"ch{channel}: cell {index} ({word!r}) ink starts at x={bbox[0]}, expected 0..1")
             if bbox[2] > widths[index]:
                 problems.append(f"ch{channel}: cell {index} ({word!r}) ink overflows its cell")
-            if index < len(STATUS_WORDS):
+            if index < atlas.report_count:
                 word_report.append(
                     f"    ch{channel} value {index} -> {word:<8} ink {bbox[2] - bbox[0]:>3}px "
                     f"of {widths[index]}px cell, rows {bbox[1]}..{bbox[3]}"
@@ -1330,6 +1403,25 @@ def _check_emblems(data: bytes, records: list, problems: list[str]) -> list[str]
         behind = set(_pixels(background.crop(title_box)))
         if behind != {navy}:
             problems.append(f"background behind the title is not flat navy: {sorted(behind)[:4]}")
+
+    # Every number widget repaints its whole box when its value changes, so
+    # background chrome underneath it is liable to be erased.  The layout has
+    # always kept the art in the gutters and the gaps; this asserts it rather
+    # than leaving it to be re-checked by eye each time a row moves.
+    for record in records:
+        if record.record_type != 0x92:
+            continue
+        box = _record_box(record)
+        if box is None:
+            continue
+        x, y, width, height = box
+        under = set(_pixels(background.crop((x, y, x + width, y + height))))
+        if under != {navy}:
+            channel = int(record.fields["fast_sensor"])
+            problems.append(
+                f"ch{channel}: background under its repaint box {box} is not flat navy "
+                f"({sorted(under)[:3]}) -- a value update would erase that art"
+            )
     return report
 
 

@@ -87,6 +87,47 @@ final class PanelController: ObservableObject {
             (10, 11, 12, 13),
             (14, 15, 16, 17),
         ]
+        static let jeanLucModel: UInt8 = 18
+        static let kathrynModel: UInt8 = 19
+    }
+
+    /// Which model family llama-swap currently has resident on a node, rendered
+    /// on the panel as a WORD via the theme's glyph atlas (see PanelStatus).
+    ///
+    /// A single digit indexes ten atlas cells, so this is deliberately the model
+    /// FAMILY, not the member name -- the roster is 26 members across 12
+    /// families. 1...4 are the everyday residents, 5...8 the tensor-parallel
+    /// ones, 9 catches everything else. Keep in sync with build_theme.py.
+    private enum PanelModel: UInt16 {
+        case none = 0
+        case gemma4 = 1
+        case qwen36 = 2
+        case qwen38 = 3
+        case nemcascade = 4
+        case qwen35 = 5
+        case qwen235b = 6
+        case nemotron = 7
+        case minimax = 8
+        case other = 9
+
+        /// Matched against llama-swap's member id (e.g. "gemma4-26b-46tps-kathryn",
+        /// "qwen3.6-35b-57tps-mtp4-jean-luc"), lowercased. Order matters: the
+        /// 235B check must precede the generic "qwen3" families, and gemma4
+        /// covers both the 26b and 31b variants.
+        init(memberID: String) {
+            let id = memberID.lowercased()
+            switch true {
+            case id.contains("qwen3-235b"), id.contains("qwenvl235"): self = .qwen235b
+            case id.contains("qwen3.5"):                              self = .qwen35
+            case id.contains("qwen3.6"):                              self = .qwen36
+            case id.contains("qwen3.8"):                              self = .qwen38
+            case id.contains("gemma4"):                               self = .gemma4
+            case id.contains("nemcascade"):                           self = .nemcascade
+            case id.contains("nemotron"):                             self = .nemotron
+            case id.contains("minimax"):                              self = .minimax
+            default:                                                  self = .other
+            }
+        }
     }
 
     /// Rendered on the panel as a WORD, not a number: the theme's glyph atlas
@@ -184,6 +225,9 @@ final class PanelController: ObservableObject {
             + (kathryn.status?.sessions.processingCount ?? 0)
         values[Channel.sessions] = UInt16(clamping: generating)
 
+        values[Channel.jeanLucModel] = residentModel(on: jeanLuc, other: kathryn).rawValue
+        values[Channel.kathrynModel] = residentModel(on: kathryn, other: jeanLuc).rawValue
+
         addSessionRows(into: &values)
 
         let ok = driver.sendSensors(values)
@@ -193,6 +237,23 @@ final class PanelController: ObservableObject {
         _ = driver.sendDateTime(brightness: Self.level(brightness),
                                 timeout: Self.blankAfter)
         isConnected = ok
+    }
+
+    /// The model family resident on one node, for its MODEL row.
+    ///
+    /// Uses `effectiveLlamaSwapModels` rather than the host's own report so a
+    /// TP=2 cluster model shows under BOTH Sparks -- llama-swap only runs on the
+    /// head node, but such a model genuinely occupies both. Several models can
+    /// be co-resident (the small-model group is `swap: false`), so this reports
+    /// the first, matching the "Serving:" line in the dropdown and widget.
+    private func residentModel(on poller: StatusPoller, other: StatusPoller) -> PanelModel {
+        guard let host = poller.status?.host else { return .none }
+        let models = effectiveLlamaSwapModels(
+            own: host.llamaSwap,
+            other: other.status?.host.llamaSwap ?? .unavailable
+        )
+        guard let name = models.compactMap(\.model).first else { return .none }
+        return PanelModel(memberID: name)
     }
 
     /// Fills the two session rows from whichever sessions are most worth

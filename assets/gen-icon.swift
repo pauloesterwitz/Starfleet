@@ -39,10 +39,16 @@ let s = markHeight / 156.4396 // scale factor from the source geometry's own uni
 let outlineColor = NSColor.black
 let deltaColor = NSColor(srgbRed: 0.95, green: 0.80, blue: 0.20, alpha: 1) // command-division gold/yellow
 
+// Source x is NOT zero-based: it runs from -50.34267 (left wing) to 47.3482
+// (right wing), with the tip at x = 0. Subtract the left extent before scaling
+// -- adding raw x to markOriginX (already the left edge of the centred box)
+// pushed the whole delta half its own width off to the left.
+let markMinX: CGFloat = -50.34267
+
 func markPoint(_ x: CGFloat, _ y: CGFloat) -> CGPoint {
     // Source coords have y growing downward from the shape's top (tip);
     // CoreGraphics grows y upward, so flip: y' = markOriginY + (156.4396 - y) * s
-    CGPoint(x: markOriginX + x * s, y: markOriginY + (156.4396 - y) * s)
+    CGPoint(x: markOriginX + (x - markMinX) * s, y: markOriginY + (156.4396 - y) * s)
 }
 
 /// The delta outline, built at `inset` from the true edge (in source units)

@@ -78,9 +78,9 @@ what the monitor's "Serving:" line reads.
 Models are named for what they are and where they run:
 
 ```
-gemma4-26b-46tps-jean-luc     pinned to the head node
-gemma4-26b-46tps-kathryn      pinned to the worker
-gemma4-26b-48tps-starfleet    tensor-parallel across BOTH
+gemma4-26b-54tps-jean-luc     pinned to the head node
+gemma4-26b-57tps-kathryn      pinned to the worker
+gemma4-31b-19tps-starfleet    tensor-parallel across BOTH
 ```
 
 The embedded tok/s figure is the measured single-stream throughput of that exact
