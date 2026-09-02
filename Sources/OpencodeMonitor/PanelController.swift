@@ -7,7 +7,7 @@ import SwiftUI
 /// the panel costs zero extra polling on either Spark.
 ///
 /// The panel renders a compiled theme stored on the device; all we push are
-/// numbers on channels 1...9. The channel map below MUST stay in sync with the
+/// numbers on channels 1...21. The channel map below MUST stay in sync with the
 /// theme generator (`build_theme.py`), because the labels next to each value
 /// live in the theme, not here -- swapping two channels here would silently
 /// mislabel them on screen.
@@ -87,6 +87,122 @@ final class PanelController: ObservableObject {
             (10, 11, 12, 13),
             (14, 15, 16, 17),
         ]
+        /// Resident model per node: a BRAND field with a VARIANT field drawn
+        /// flush against it. Two channels each rather than one because of the
+        /// ten-cell ceiling described on PanelModel.
+        static let jeanLucBrand: UInt8 = 18
+        static let jeanLucVariant: UInt8 = 19
+        static let kathrynBrand: UInt8 = 20
+        static let kathrynVariant: UInt8 = 21
+    }
+
+    /// Which model llama-swap currently has resident on a node, as the pair of
+    /// glyph-atlas indices the panel draws side by side: a BRAND word with a
+    /// VARIANT word butted against it, so "QWEN" + "3.6" reads as one name.
+    ///
+    /// Two fields rather than one because each is a number widget over a
+    /// twelve-cell glyph atlas and a plain integer reaches only ten of those
+    /// cells -- fewer than the roster has families, which is why everything
+    /// outside a hardcoded eight used to collapse to "OTHER". Two fields
+    /// multiply where one could only enumerate: ten brands x ten variants
+    /// covers all 28 members. They cannot be the two DIGITS of one field,
+    /// because both digits index the same atlas -- "QWEN" and "3.6" would have
+    /// to be cells of a single ten-cell set, and the brands alone fill it.
+    ///
+    /// Keep in sync with build_theme.py's MODEL_BRANDS / MODEL_VARIANTS.
+    private struct PanelModel {
+        /// Index into the theme's MODEL_BRANDS atlas.
+        enum Brand: UInt16 {
+            case none = 0       // em dash: nothing resident
+            case qwen = 1
+            case gemma4 = 2
+            case nem = 3        // Nemotron Cascade / Nemotron, split by variant
+            case minimax = 4
+            case deepseek = 5
+            case glm53 = 6
+            case hunyuan = 7
+            case aux = 8        // the ~1GB embedding + image-gen containers
+            case other = 9      // a family added to llama-swap and not yet here
+        }
+
+        /// Index into the theme's MODEL_VARIANTS atlas. `none` is that atlas's
+        /// deliberately blank cell, which is what an unqualified brand draws.
+        enum Variant: UInt16 {
+            case none = 0
+            case v35 = 1        // 3.5
+            case v36 = 2        // 3.6
+            case v38 = 3        // 3.8
+            case b235 = 4       // 235B
+            case vl3 = 5        // 3VL
+            case cascade = 6    // CASC
+            case otron = 7      // OTRON
+            case b31 = 8        // 31B
+            case tp2 = 9        // TP2
+        }
+
+        let brand: Brand
+        let variant: Variant
+
+        static let absent = PanelModel(brand: .none, variant: .none)
+
+        /// Matched against llama-swap's member id (e.g. "gemma4-26b-54tps-kathryn",
+        /// "qwen3.6-35b-85tps-mtp4-jean-luc"), lowercased.
+        ///
+        /// Matching on family substrings rather than whole ids is what let this
+        /// survive the 2026-09-01 rename, which rewrote the measured tok/s in
+        /// every name. Order matters where one pattern contains another.
+        init(memberID: String) {
+            let id = memberID.lowercased()
+            switch true {
+            // -- Qwen: the version IS the interesting part, so it always
+            // carries a variant. "qwen38fn" has no dot -- it is the SGLang
+            // build of 3.8, not a family of its own. "qwenvl235" is the
+            // vision 235B, so it shares 235B rather than the 32B "3VL".
+            case id.contains("qwen3-235b"), id.contains("qwenvl235"):
+                self.init(brand: .qwen, variant: .b235)
+            case id.contains("qwen3vl"):
+                self.init(brand: .qwen, variant: .vl3)
+            case id.contains("qwen3.5"):
+                self.init(brand: .qwen, variant: .v35)
+            case id.contains("qwen3.6"):
+                self.init(brand: .qwen, variant: .v36)
+            case id.contains("qwen3.8"), id.contains("qwen38"):
+                self.init(brand: .qwen, variant: .v38)
+
+            // -- everything else. The 31B Gemma is the both-Sparks one, worth
+            // telling apart from the 26B that runs on a single node.
+            case id.contains("gemma4-31b"):
+                self.init(brand: .gemma4, variant: .b31)
+            case id.contains("gemma4"):
+                self.init(brand: .gemma4, variant: .none)
+            case id.contains("nemcascade"):
+                self.init(brand: .nem, variant: .cascade)
+            case id.contains("nemotron"):
+                self.init(brand: .nem, variant: .otron)
+            case id.contains("minimax"):
+                self.init(brand: .minimax, variant: .none)
+            // "ds4" is the TP=2 build of the same DeepSeek V4 weights as
+            // "deepseek-v4-flash", so both are DEEPSEEK and only the second
+            // Spark tells them apart.
+            case id.hasPrefix("ds4"):
+                self.init(brand: .deepseek, variant: .tp2)
+            case id.contains("deepseek"):
+                self.init(brand: .deepseek, variant: .none)
+            case id.contains("glm5"):
+                self.init(brand: .glm53, variant: .none)
+            case id.hasPrefix("hy3"):
+                self.init(brand: .hunyuan, variant: .none)
+            case id.contains("embed"), id.contains("imagegen"):
+                self.init(brand: .aux, variant: .none)
+            default:
+                self.init(brand: .other, variant: .none)
+            }
+        }
+
+        private init(brand: Brand, variant: Variant) {
+            self.brand = brand
+            self.variant = variant
+        }
     }
 
     /// Rendered on the panel as a WORD, not a number: the theme's glyph atlas
@@ -184,6 +300,13 @@ final class PanelController: ObservableObject {
             + (kathryn.status?.sessions.processingCount ?? 0)
         values[Channel.sessions] = UInt16(clamping: generating)
 
+        let jeanLucModel = residentModel(on: jeanLuc, other: kathryn)
+        let kathrynModel = residentModel(on: kathryn, other: jeanLuc)
+        values[Channel.jeanLucBrand] = jeanLucModel.brand.rawValue
+        values[Channel.jeanLucVariant] = jeanLucModel.variant.rawValue
+        values[Channel.kathrynBrand] = kathrynModel.brand.rawValue
+        values[Channel.kathrynVariant] = kathrynModel.variant.rawValue
+
         addSessionRows(into: &values)
 
         let ok = driver.sendSensors(values)
@@ -193,6 +316,45 @@ final class PanelController: ObservableObject {
         _ = driver.sendDateTime(brightness: Self.level(brightness),
                                 timeout: Self.blankAfter)
         isConnected = ok
+    }
+
+    /// The model to name on one node's MODEL field.
+    ///
+    /// Uses `effectiveLlamaSwapModels` rather than the host's own report so a
+    /// TP=2 cluster model shows under BOTH Sparks -- llama-swap only runs on the
+    /// head node, but such a model genuinely occupies both.
+    ///
+    /// Picking one of several matters here, because a node really does run
+    /// several at once: llama-swap's `spark-small` group is `swap: false` (up
+    /// to five co-resident), and the ~1GB embedding and image-gen containers
+    /// are `swap: false` + `exclusive: false`, so they co-reside with
+    /// everything. Taking the report's first entry therefore named whichever
+    /// one llama-swap happened to list first, which could be
+    /// `nomic-embed-text` -- never what "what is this Spark running" means.
+    /// So: a both-Sparks cluster model wins (it is the headline, and the other
+    /// node is showing it too), then any ordinary LLM, and the helper
+    /// containers only when they are all there is.
+    private func residentModel(on poller: StatusPoller, other: StatusPoller) -> PanelModel {
+        guard let host = poller.status?.host else { return .absent }
+        let models = effectiveLlamaSwapModels(
+            own: host.llamaSwap,
+            other: other.status?.host.llamaSwap ?? .unavailable
+        )
+        // min(by:) keeps the first of equal-ranked entries, so llama-swap's own
+        // order still breaks ties within a rank.
+        guard let pick = models.min(by: { Self.displayRank($0) < Self.displayRank($1) }),
+              let name = pick.model
+        else { return .absent }
+        return PanelModel(memberID: name)
+    }
+
+    /// Lower wins. See `residentModel` for why these three ranks.
+    private static func displayRank(_ model: LlamaSwapModel) -> Int {
+        guard let id = model.model else { return 3 }
+        // Derived from the brand rather than a second list of name fragments,
+        // so "which ids are helpers" is stated in exactly one place.
+        if PanelModel(memberID: id).brand == .aux { return 2 }
+        return model.cluster ? 0 : 1
     }
 
     /// Fills the two session rows from whichever sessions are most worth

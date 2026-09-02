@@ -51,11 +51,38 @@ struct FleetDashboardView: View {
                 .clipShape(RoundedRectangle(cornerRadius: 12))
             }
         }
+        .overlay(alignment: .top) {
+            WindowDragStrip()
+                .frame(height: 52)
+                .ignoresSafeArea()
+        }
         .background(FleetWindowChrome())
         .onReceive(NotificationCenter.default.publisher(for: .fleetReload)) { _ in
             webView.load(URLRequest(url: fleetURL))
         }
     }
+}
+
+/// A transparent grab handle along the top of the window.
+///
+/// The Fleet window is `.hiddenTitleBar` with a full-bleed WKWebView over the
+/// titlebar area (`.ignoresSafeArea()`), which left it with no draggable
+/// surface at all: there's no title bar to grab, and `isMovableByWindowBackground`
+/// (set in FleetWindowChrome) only fires for mouse-downs that reach the window
+/// background -- a web view consumes every one of them first.
+///
+/// 52pt tall so it lands entirely in the empty upper half of the page's 96px
+/// LCARS header, whose title and clock are `align-items:flex-end` bottom-aligned
+/// -- nothing in the page needs clicks up there. The traffic lights sit in the
+/// window's own title bar, which stays above the content view, so they keep
+/// working through this.
+private struct WindowDragStrip: NSViewRepresentable {
+    final class DragView: NSView {
+        override var mouseDownCanMoveWindow: Bool { true }
+    }
+
+    func makeNSView(context: Context) -> NSView { DragView() }
+    func updateNSView(_ nsView: NSView, context: Context) {}
 }
 
 /// Two jobs: (1) strip the title bar down to just the traffic lights, floating

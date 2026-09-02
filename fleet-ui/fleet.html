@@ -96,9 +96,27 @@ tr.live td:first-child{border-left-color:var(--blue)}
   margin-right:3px;color:#000;display:inline-block}
 .tag.jl{background:var(--blue)} .tag.ka{background:var(--amber)}
 .tag.dy{background:var(--mauve)}
+/* ---- cold-load progress ---- */
+#loading{display:none;margin:8px 0 2px}
+.load{background:#160f06;border:1px solid var(--grid);border-radius:14px;padding:10px 14px;
+  margin-bottom:6px}
+.load .hd{display:flex;align-items:baseline;gap:10px}
+.load .nm{color:var(--peach);font-size:14px;font-weight:600}
+.load .tm{margin-left:auto;color:var(--amber);font-size:13px;font-variant-numeric:tabular-nums}
+.load .track{height:12px;background:#241a0d;border-radius:6px;overflow:hidden;margin-top:8px}
+.load .track i{display:block;height:100%;width:0;background:var(--peach);border-radius:6px;
+  transition:width .9s linear}
+.load.over .track i{background:var(--amber)}
+/* no history for this model yet -> sweep instead of lying about a percentage */
+.load .track.indet i{width:32%;background:var(--blue);animation:sweep 1.6s ease-in-out infinite;
+  transition:none}
+@keyframes sweep{0%{transform:translateX(-100%)}100%{transform:translateX(313%)}}
+.load .sub{margin-top:6px;font-size:11px;color:var(--dim)}
+
 .st{font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.08em}
 .st.ready{color:var(--blue)} .st.starting{color:var(--amber)}
 .st.stopped{color:var(--dim)} .st.working{color:var(--magenta)}
+.st.loading{color:var(--peach)}
 .act{text-align:right;white-space:nowrap}
 .act button{font-family:var(--lcars);font-size:12px;font-weight:600;letter-spacing:.08em;
   text-transform:uppercase;border:0;border-radius:11px;padding:4px 14px;margin-left:4px;
@@ -106,6 +124,11 @@ tr.live td:first-child{border-left-color:var(--blue)}
 .act button:hover{background:var(--peach);color:#000}
 .act button.on{background:var(--magenta);color:#000}
 .act button:disabled{opacity:.32;cursor:default;background:var(--grid);color:var(--dim)}
+.ctx select{font-family:var(--lcars);font-size:12px;font-weight:600;letter-spacing:.06em;
+  border:0;border-radius:11px;padding:3px 8px;background:var(--grid);color:var(--text);
+  cursor:pointer}
+.ctx select:disabled{opacity:.32;cursor:default;color:var(--dim)}
+.ctx select.set{background:var(--blue);color:#000}
 .err{color:var(--red);font-size:12px;margin-top:3px;white-space:pre-wrap;word-break:break-word;
   letter-spacing:.03em}
 #banner{display:none;background:var(--red);color:#000;padding:7px 16px;border-radius:14px;
@@ -129,6 +152,7 @@ tr.live td:first-child{border-left-color:var(--blue)}
     </div>
 
     <div id="banner"></div>
+    <div id="loading"></div>
 
     <div class="sec"><div class="cap"></div><h2>Node Status</h2><div class="rule"></div></div>
     <div class="nodes" id="nodes"></div>
@@ -145,8 +169,9 @@ tr.live td:first-child{border-left-color:var(--blue)}
       <button class="pill" data-f="pinned">Pinned</button>
       <span class="count" id="count"></span>
     </div>
-    <table><thead><tr><th>Model</th><th>Node</th><th>Speed</th><th>State</th><th>TTL</th>
-      <th class="act">Persistent</th></tr></thead><tbody id="rows"></tbody></table>
+    <table><thead><tr><th>Model</th><th>Node</th><th>Speed</th><th>Context</th><th>State</th>
+      <th>TTL</th><th class="act">Persistent</th></tr></thead>
+      <tbody id="rows"></tbody></table>
   </div>
 </div>
 
@@ -157,7 +182,10 @@ const busy=new Set();
 const FILTERS=["all","jean-luc","kathryn","starfleet","dynamic","live","pinned"];
 /* the hash makes a view bookmarkable — open #kathryn to land straight on her models */
 let filter=FILTERS.includes(location.hash.slice(1))?location.hash.slice(1):"all";
-let query="", last={nodes:{},models:[],running:[],pins:[],errors:{}};
+let query="", last={nodes:{},models:[],running:[],pins:[],errors:{},loading:[]};
+/* Date.now() of the poll that produced last.loading, so the bar can tick every
+   second instead of jumping once per 3s poll */
+let loadAt=0;
 
 /* filter controls live outside the re-rendered table, so typing is never interrupted */
 function setFilter(f){
@@ -213,6 +241,37 @@ function nodeCard(name,n){
       `<u class="${ctrClass(c)}">${c}</u>`).join("")||"<u>no containers</u>"}</div></div>`;
 }
 
+/* The ladder ctxproxy's docs recommend sticking to -- every change is a cold
+   reload, so a handful of sizes beats a free-text box. "" = deployed default. */
+const CTX_CHOICES=[["","Default"],["8192","8K"],["16384","16K"],["32768","32K"],
+                   ["65536","64K"],["131072","128K"],["262144","256K"]];
+
+function ctxOptions(cur){
+  const opts=CTX_CHOICES.slice();
+  /* a size set elsewhere (ctxproxy, or by hand) may not be on the ladder --
+     show it rather than silently rendering the wrong selection */
+  if(cur&&!opts.some(([v])=>v===String(cur))) opts.push([String(cur),String(cur)]);
+  return opts.map(([v,l])=>
+    `<option value="${v}"${String(cur||"")===v?" selected":""}>${l}</option>`).join("");
+}
+
+async function setCtx(model,val,resident){
+  /* vLLM sizes its KV pool at startup: there is no live resize, so this costs a
+     cold load. Only worth warning about when something is actually loaded. */
+  if(resident&&!confirm(`Change the context window for ${model}?\n\n`+
+      `vLLM allocates its KV pool at startup, so this unloads the model and `+
+      `reloads it at the new size -- a cold load of several minutes.`)){
+    render(last); return;
+  }
+  busy.add(model); render(last);
+  try{
+    const r=await fetch("/api/ctx",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({model,ctx:val?Number(val):null})});
+    if(!r.ok) alert((await r.json()).error||"failed");
+  }catch(e){ alert(e.message); }
+  busy.delete(model); refresh();
+}
+
 async function act(url,model,pin){
   busy.add(model); render(last);
   try{
@@ -223,8 +282,40 @@ async function act(url,model,pin){
   busy.delete(model); refresh();
 }
 
+function mmss(s){
+  s=Math.max(0,Math.round(s));
+  const m=Math.floor(s/60), r=s%60;
+  return m?`${m}m ${String(r).padStart(2,"0")}s`:`${r}s`;
+}
+
+/* Redrawn on its own 1s timer, not only on the 3s poll, so elapsed time counts
+   up smoothly. Everything it needs comes from the last poll plus local drift. */
+function paintLoading(){
+  const el=document.getElementById("loading"), ld=last.loading||[];
+  if(!ld.length){ el.style.display="none"; el.innerHTML=""; return; }
+  const drift=(Date.now()-loadAt)/1000;
+  el.style.display="block";
+  el.innerHTML=ld.map(l=>{
+    const t=l.elapsed+drift, eta=l.eta, over=eta&&t>eta;
+    /* capped at 99: the bar must never read full while the load is still going */
+    const pct=eta?Math.min(99,t/eta*100):0;
+    const sub=!eta ? "First recorded load of this model &mdash; no estimate yet"
+      : over ? "Taking longer than usual &mdash; still loading"
+      : `about ${mmss(eta-t)} left`;
+    return `<div class="load ${over?"over":""}">
+      <div class="hd"><span class="nm">${l.model}</span>
+        <span class="st loading">loading</span>
+        <span class="tm">${mmss(t)}${eta?` / ~${mmss(eta)}`:""}</span></div>
+      <div class="track ${eta?"":"indet"}"><i style="${eta?`width:${pct}%`:""}"></i></div>
+      <div class="sub">${sub}</div></div>`;
+  }).join("");
+}
+setInterval(paintLoading,1000);
+
 function render(s){
   last=s;
+  loadAt=Date.now();
+  paintLoading();
   const run={}; (s.running||[]).forEach(r=>run[r.model]=r);
 
   document.getElementById("nodes").innerHTML=
@@ -242,16 +333,20 @@ function render(s){
   if(s.errors&&s.errors._swap){b.style.display="block";b.textContent=s.errors._swap;}
   else b.style.display="none";
 
+  const loadingIds=new Set((s.loading||[]).map(l=>l.model));
   const shown=[...s.models].filter(m=>keep(m,run)).sort((a,c)=>
     (c.pinned-a.pinned)||((run[c.id]?1:0)-(run[a.id]?1:0))||a.id.localeCompare(c.id));
   document.getElementById("count").textContent=`${shown.length} of ${s.models.length}`;
 
   document.getElementById("rows").innerHTML = shown.length ? shown.map(m=>{
-    const r=run[m.id], working=busy.has(m.id), st=working?"working":(r?r.state:"stopped");
+    const r=run[m.id], working=busy.has(m.id), loading=loadingIds.has(m.id),
+          st=loading?"loading":working?"working":(r?r.state:"stopped");
     return `<tr class="${m.pinned?"pinned":r?"live":""}">
       <td><div class="mid">${m.id}</div>${m.error?`<div class="err">${m.error}</div>`:""}</td>
       <td>${m.nodes.map(n=>`<span class="tag ${TAG[n][0]}">${TAG[n][1]}</span>`).join("")}</td>
       <td class="mid">${m.tps?m.tps+" T/S":"&mdash;"}</td>
+      <td class="ctx">${m.ctx_capable?`<select class="${m.ctx?"set":""}" ${working?"disabled":""}
+        onchange="setCtx('${m.id}',this.value,${!!r})">${ctxOptions(m.ctx)}</select>`:"&mdash;"}</td>
       <td><span class="st ${st}">${st}</span></td>
       <td class="mid">${r&&r.ttl?Math.round(r.ttl/60)+" MIN":"&mdash;"}</td>
       <td class="act">
@@ -259,7 +354,7 @@ function render(s){
           onclick="act('/api/pin','${m.id}',${!m.pinned})">${m.pinned?"Pinned":"Pin"}</button>
         <button ${working||!r?"disabled":""}
           onclick="act('/api/unload','${m.id}')">Unload</button></td></tr>`;
-  }).join("") : `<tr><td colspan="6" class="empty">No models match this filter</td></tr>`;
+  }).join("") : `<tr><td colspan="7" class="empty">No models match this filter</td></tr>`;
 
   document.getElementById("clock").textContent=new Date().toLocaleTimeString();
 }

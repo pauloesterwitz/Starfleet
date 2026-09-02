@@ -38,6 +38,17 @@ SWAP = os.environ.get("FLEET_SWAP", "http://127.0.0.1:28080")
 NODES = {"jean-luc": None, "kathryn": "kathryn.fritz.box"}
 
 PIN_FILE = os.path.expanduser("~/.config/fleet-ui/pins.json")
+LOAD_TIMES_FILE = os.path.expanduser("~/.config/fleet-ui/load-times.json")
+LOAD_HISTORY = 5     # cold-load durations kept per model, for the ETA
+MIN_COLD_LOAD = 5.0  # seconds; below this a "cold" touch was really a ttl refresh
+
+# Per-model context override. This is the same file ctx-env.sh reads at launch
+# (and ctxproxy.py writes for a sized `model@32768` request) -- see
+# llama-swap/ctxproxy.py. Writing it here is the documented contract; ctxproxy
+# is a pure request relay with no control endpoint to call instead.
+CTX_DIR = os.path.join(os.environ.get("GB10_STATE_DIR") or os.path.expanduser("~/.gb10"), "ctx")
+SWAP_CONFIG = os.path.expanduser("~/llama-swap/config.yaml")
+MIN_CTX, MAX_CTX = 256, 1048576  # the bounds ctx-env.sh and ctxproxy both enforce
 NODE_POLL = 5        # seconds between resource probes
 KEEPALIVE = 240      # seconds between ttl-refresh touches of a resident pin (shortest ttl is 600)
 RECHECK = 5           # seconds between checks for a pin that isn't currently running
@@ -49,7 +60,11 @@ PROBE = (
     'echo "LOAD:$(cut -d\" \" -f1-3 /proc/loadavg)"; '
     'echo "GPU:$(nvidia-smi --query-gpu=utilization.gpu,temperature.gpu,power.draw '
     '--format=csv,noheader,nounits 2>/dev/null | head -1)"; '
-    'echo "DOCKER:$(docker ps --format "{{.Names}}" 2>/dev/null | paste -sd, -)"'
+    'echo "DOCKER:$(docker ps --format "{{.Names}}" 2>/dev/null | paste -sd, -)"; '
+    # Live entries only: a reservation whose owner pid is gone is stale and must
+    # not be shown as held memory (memcheck.sh prunes those on its next run).
+    'echo "RES:$(t=0; for f in $HOME/.gb10/reservations/*; do [ -e "$f" ] || continue; '
+    'read -r pp mm _ < "$f" || continue; kill -0 "$pp" 2>/dev/null && t=$((t+mm)); done; echo $t)"'
 )
 
 STATE = {"nodes": {}, "models": [], "running": [], "pins": [], "errors": {}}
@@ -96,6 +111,11 @@ def parse_probe(text):
         elif line.startswith("DOCKER:"):
             names = line[7:].strip()
             out["containers"] = [n for n in names.split(",") if n]
+        elif line.startswith("RES:"):
+            try:
+                out["reserved_mb"] = int(line[4:].strip() or 0)
+            except ValueError:
+                out["reserved_mb"] = 0
     return out if "mem_total_kb" in out else None
 
 
@@ -116,6 +136,128 @@ def save_pins(pins):
     os.makedirs(os.path.dirname(PIN_FILE), exist_ok=True)
     with open(PIN_FILE, "w") as f:
         json.dump(sorted(pins), f, indent=2)
+
+
+# ------------------------------------------------- cold-load progress + ETA
+
+# Cold loads in flight: model -> {"started": ts, "eta": secs|None}. Published
+# on /api/state so the page can show a progress bar for a load that takes
+# minutes (a cold TP=2 load runs ~20 min) instead of just sitting on "stopped".
+_loading = {}
+_loading_lock = threading.Lock()
+
+
+def _median(xs):
+    xs = sorted(xs)
+    return xs[len(xs) // 2] if xs else None
+
+
+def load_times():
+    """Observed cold-load durations per model, oldest first."""
+    try:
+        with open(LOAD_TIMES_FILE) as f:
+            data = json.load(f)
+        return {k: list(v) for k, v in data.items() if isinstance(v, list)}
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
+def record_load_time(model, secs):
+    """Append one cold-load duration, keeping only the last LOAD_HISTORY."""
+    hist = load_times()
+    hist[model] = (hist.get(model, []) + [round(secs, 1)])[-LOAD_HISTORY:]
+    os.makedirs(os.path.dirname(LOAD_TIMES_FILE), exist_ok=True)
+    tmp = LOAD_TIMES_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(hist, f, indent=2, sort_keys=True)
+    os.replace(tmp, LOAD_TIMES_FILE)  # atomic -- never leave a half-written file
+
+
+def eta_for(model, hist=None):
+    """Expected cold-load seconds -- None until the model has loaded once.
+
+    Median, not mean: one slow load that had to evict a big neighbour first
+    shouldn't permanently inflate the estimate for the normal case.
+    """
+    return _median((load_times() if hist is None else hist).get(model, []))
+
+
+# ------------------------------------------------- per-model context window
+
+_ctx_lock = threading.Lock()
+
+
+def wired_members(path=SWAP_CONFIG):
+    """Members whose cmd runs through ctx-env.sh -- the only ones a context size
+    can reach. Parsed the same way ctxproxy.py does it, and re-read per call so a
+    member added to config.yaml works without restarting Fleet."""
+    found, current = set(), None
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                key = re.match(r"^  ([A-Za-z0-9._:-]+):\s*$", line)
+                if key:
+                    current = key.group(1)
+                elif current and line.startswith("    cmd:") and "ctx-env.sh" in line:
+                    found.add(current)
+    except OSError:
+        pass
+    return found
+
+
+def read_ctx(member):
+    """The size currently recorded for `member`, or None meaning "deployed default".
+
+    Out-of-range or junk reads as None for the same reason ctx-env.sh ignores it:
+    a bad override must never be why a model refuses to load.
+    """
+    try:
+        with open(os.path.join(CTX_DIR, member)) as fh:
+            ctx = int(fh.read().strip().split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+    return ctx if MIN_CTX <= ctx <= MAX_CTX else None
+
+
+def read_all_ctx():
+    try:
+        names = os.listdir(CTX_DIR)
+    except OSError:
+        return {}
+    return {n: c for n in names for c in [read_ctx(n)] if c is not None}
+
+
+def apply_ctx(model, ctx):
+    """Record a context size for `model` (None clears it, back to the deployed
+    default) and evict it if it is resident, so it comes back at the new size.
+
+    vLLM allocates its KV pool at startup, so a context change is only a cold
+    reload away -- there is no live resize. A pinned model is re-touched by
+    keepalive within RECHECK seconds; an unpinned one simply stays down until
+    next use. Returns True if a running model was unloaded.
+    """
+    path = os.path.join(CTX_DIR, model)
+    # One lock, mirroring ctxproxy: a write and its unload must not interleave.
+    with _ctx_lock:
+        if read_ctx(model) == ctx:
+            return False
+        if ctx is None:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        else:
+            os.makedirs(CTX_DIR, exist_ok=True)
+            tmp = path + ".tmp"
+            with open(tmp, "w") as fh:
+                fh.write("%d\n" % ctx)
+            os.replace(tmp, path)  # atomic -- ctx-env.sh never reads a half file
+        with LOCK:
+            resident = any(r.get("model") == model for r in STATE["running"])
+        if not resident:
+            return False
+        swap_get("/unload?model=" + urllib.parse.quote(model, safe=""))
+        return True
 
 
 # ---------------------------------------------------------------- workers
@@ -163,8 +305,23 @@ def touch(model):
     second-guessing the fit here.
     """
     q = urllib.parse.quote(model, safe="")
+    # A touch of an already-resident model is only a ttl refresh and returns
+    # near-instantly; a touch of something not currently running is a real cold
+    # load. Only the latter is worth publishing as progress or timing.
+    with LOCK:
+        cold = not any(r.get("model") == model for r in STATE["running"])
+    started = time.time()
+    if cold:
+        with _loading_lock:
+            _loading[model] = {"started": started, "eta": eta_for(model)}
     try:
         swap_get(f"/upstream/{q}/health", timeout=LOAD_TIMEOUT)
+        elapsed = time.time() - started
+        # MIN_COLD_LOAD guards the history against a "cold" touch that was in
+        # fact served instantly -- the model came up between poll_swap's 3s
+        # snapshot and this call. Averaging those in drags every ETA to zero.
+        if cold and elapsed >= MIN_COLD_LOAD:
+            record_load_time(model, elapsed)
         with LOCK:
             STATE["errors"].pop(model, None)
         return True
@@ -172,6 +329,10 @@ def touch(model):
         msg = e.read().decode(errors="replace")[:400] or f"HTTP {e.code}"
     except (urllib.error.URLError, OSError) as e:
         msg = str(e)[:400]
+    finally:
+        if cold:
+            with _loading_lock:
+                _loading.pop(model, None)
     with LOCK:
         STATE["errors"][model] = msg
     return False
@@ -232,6 +393,110 @@ def keepalive():
         time.sleep(RECHECK)
 
 
+# ---------------------------------------------------------------- jobs
+
+PUEUE = os.path.expanduser("~/.local/bin/pueue")
+
+# gpujob wraps every command twice: `ssh ... kathryn 'gpujob-run --need-mb N ... -- REAL'`.
+# The Mac app wants REAL, so peel both layers off for display only.
+_SSH_WRAP = re.compile(r"^ssh\s+.*?fritz\.box\s+'(?P<inner>.*)'\s*$", re.S)
+_RUN_WRAP = re.compile(r"gpujob-run\s+(?P<opts>.*?)\s+--\s+(?P<real>.*)$", re.S)
+
+
+def _unwrap(cmd):
+    """-> (real_command, need_mb, idle_s). Falls back to the raw string."""
+    m = _SSH_WRAP.match(cmd.strip())
+    if m:
+        # shlex.quote escaped every inner ' as '"'"' to survive the ssh arg.
+        # Undo it or the Mac app shows that noise instead of the command.
+        cmd = m.group("inner").replace("""'"'"'""", "'")
+    m = _RUN_WRAP.search(cmd)
+    if not m:
+        return cmd.strip(), None, None
+    opts = m.group("opts")
+
+    def opt(flag):
+        o = re.search(flag + r"\s+(\d+)", opts)
+        return int(o.group(1)) if o else None
+
+    return m.group("real").strip(), opt("--need-mb"), opt("--idle-s")
+
+
+def _job_state(status):
+    """pueue's tagged union -> one flat state string plus its timestamps.
+
+    'planned' is the state the Mac app cares about most: stashed WITH an
+    enqueue_at is a job deliberately parked until tonight, not a stuck one.
+    """
+    if isinstance(status, str):                       # "Queued", "Paused", ...
+        return status.lower(), {}
+    kind, body = next(iter(status.items()))
+    body = body or {}
+    if kind == "Stashed":
+        at = body.get("enqueue_at")
+        return ("planned" if at else "stashed"), {"starts_at": at}
+    if kind == "Running":
+        return "running", {"start": body.get("start"), "enqueued_at": body.get("enqueued_at")}
+    if kind == "Done":
+        return "done", {
+            "start": body.get("start"), "end": body.get("end"),
+            "result": body.get("result") if isinstance(body.get("result"), str)
+            else next(iter(body.get("result", {})), None),
+        }
+    return kind.lower(), body
+
+
+def jobs_snapshot():
+    """pueue tasks + per-node capacity, in ONE flat shape for the Mac app."""
+    snap = {"jobs": [], "nodes": {}, "queue": {}, "error": None}
+    try:
+        r = subprocess.run([PUEUE, "status", "--json"],
+                           capture_output=True, text=True, timeout=10)
+        data = json.loads(r.stdout)
+    except (subprocess.SubprocessError, OSError, ValueError) as e:
+        snap["error"] = f"pueue unreachable: {str(e)[:200]}"
+        data = {"tasks": {}, "groups": {}}
+
+    for t in data.get("tasks", {}).values():
+        state, times = _job_state(t.get("status"))
+        real, need_mb, idle_s = _unwrap(t.get("command", ""))
+        # NOTE: t["envs"] is deliberately dropped — it carries the submitting
+        # shell's whole environment, tokens included. Never serve it.
+        snap["jobs"].append({
+            "id": t.get("id"), "node": t.get("group"), "label": t.get("label"),
+            "state": state, "cmd": real, "need_mb": need_mb, "idle_s": idle_s,
+            "created_at": t.get("created_at"), **times,
+        })
+    snap["jobs"].sort(key=lambda j: (j["state"] != "running", j["id"]))
+
+    for g, gi in data.get("groups", {}).items():
+        snap["queue"][g] = {"status": gi.get("status"),
+                            "parallel": gi.get("parallel_tasks")}
+
+    with LOCK:
+        nodes = json.loads(json.dumps(STATE["nodes"]))
+        running = json.loads(json.dumps(STATE["running"]))
+    for name, info in nodes.items():
+        avail = info.get("mem_avail_kb")
+        snap["nodes"][name] = {
+            "free_mb": avail // 1024 if avail else None,
+            "reserved_mb": info.get("reserved_mb"),
+            "gpu_util": info.get("gpu_util"),
+            "load": info.get("load"),
+            "models": [m["model"] for m in running if name in node_of(m["model"])],
+            "error": info.get("error"),
+            # Split on purpose: "planned" is parked until its clock, "queued" is
+            # waiting for this node's slot right now. The Mac app shows them apart.
+            "planned": sum(1 for j in snap["jobs"]
+                           if j["node"] == name and j["state"] == "planned"),
+            "queued": sum(1 for j in snap["jobs"]
+                          if j["node"] == name and j["state"] == "queued"),
+            "running": sum(1 for j in snap["jobs"]
+                           if j["node"] == name and j["state"] == "running"),
+        }
+    return snap
+
+
 # ---------------------------------------------------------------- http
 
 class Handler(BaseHTTPRequestHandler):
@@ -249,10 +514,14 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/":
             return self._send(200, page(), "text/html; charset=utf-8")
+        if self.path == "/api/jobs":
+            return self._send(200, json.dumps(jobs_snapshot()), "application/json")
         if self.path == "/api/state":
             with LOCK:
                 snap = json.loads(json.dumps(STATE))
             snap["pins"] = load_pins()
+            times = load_times()  # read once, not once per model
+            ctxs, wired = read_all_ctx(), wired_members()
             snap["models"] = [
                 {
                     "id": m,
@@ -260,9 +529,19 @@ class Handler(BaseHTTPRequestHandler):
                     "tps": tps_of(m),
                     "pinned": m in snap["pins"],
                     "error": snap["errors"].get(m),
+                    "load_eta": eta_for(m, times),
+                    "ctx": ctxs.get(m),
+                    "ctx_capable": m in wired,
                 }
                 for m in snap["models"]
             ]
+            now = time.time()
+            with _loading_lock:
+                snap["loading"] = sorted(
+                    ({"model": m, "elapsed": round(now - v["started"], 1), "eta": v["eta"]}
+                     for m, v in _loading.items()),
+                    key=lambda d: d["model"],
+                )
             return self._send(200, json.dumps(snap), "application/json")
         self._send(404, "not found", "text/plain")
 
@@ -287,6 +566,32 @@ class Handler(BaseHTTPRequestHandler):
                 pins.discard(model)
                 save_pins(pins)
             return self._send(200, '{"ok":true}', "application/json")
+
+        if self.path == "/api/ctx":
+            raw = body.get("ctx")
+            if raw in (None, "", 0):
+                ctx = None                      # clear -> serve the deployed default
+            else:
+                try:
+                    ctx = int(raw)
+                except (TypeError, ValueError):
+                    return self._send(400, '{"error":"context size must be an integer"}',
+                                      "application/json")
+                if not MIN_CTX <= ctx <= MAX_CTX:
+                    return self._send(400, json.dumps(
+                        {"error": f"context size {ctx} is outside {MIN_CTX}..{MAX_CTX}"}),
+                        "application/json")
+                if model not in wired_members():
+                    return self._send(400, json.dumps(
+                        {"error": f"{model} has no dynamic context size -- its cmd in "
+                                  f"config.yaml is not wired through ctx-env.sh"}),
+                        "application/json")
+            try:
+                reloaded = apply_ctx(model, ctx)
+            except OSError as e:
+                return self._send(500, json.dumps({"error": str(e)[:200]}), "application/json")
+            return self._send(200, json.dumps({"ok": True, "reloaded": reloaded}),
+                              "application/json")
 
         if self.path == "/api/unload":
             pins = set(load_pins())
@@ -322,6 +627,21 @@ def selfcheck():
     assert _pins_needing_touch(["a", "b"], {"a", "b"}, due_for_refresh=False) == []
     assert _pins_needing_touch(["a", "b"], {"a", "b"}, due_for_refresh=True) == ["a", "b"]
     assert _pins_needing_touch([], {"a"}, due_for_refresh=True) == []
+
+    # ETA maths: median (not mean) of recorded cold loads, and None while a
+    # model has no history -- the page shows an indeterminate bar for that.
+    assert _median([]) is None
+    assert _median([10]) == 10
+    assert _median([30, 10, 20]) == 20
+    assert eta_for("never-loaded", {}) is None
+    assert eta_for("m", {"m": [100, 10, 12]}) == 12
+
+    # Context overrides: bounds match ctx-env.sh/ctxproxy, junk and unknown
+    # members read as "no override" rather than as a bogus size.
+    assert (MIN_CTX, MAX_CTX) == (256, 1048576)
+    assert read_ctx("definitely-not-a-member") is None
+    if os.path.exists(SWAP_CONFIG):
+        assert wired_members(), f"no ctx-env.sh-wired members found in {SWAP_CONFIG}"
 
     # _touch_async must actually dedup in flight, not just in theory: fire it
     # twice for the same model while the first call is still "loading" and

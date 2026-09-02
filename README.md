@@ -78,9 +78,9 @@ what the monitor's "Serving:" line reads.
 Models are named for what they are and where they run:
 
 ```
-gemma4-26b-46tps-jean-luc     pinned to the head node
-gemma4-26b-46tps-kathryn      pinned to the worker
-gemma4-26b-48tps-starfleet    tensor-parallel across BOTH
+gemma4-26b-54tps-jean-luc     pinned to the head node
+gemma4-26b-57tps-kathryn      pinned to the worker
+gemma4-31b-19tps-starfleet    tensor-parallel across BOTH
 ```
 
 The embedded tok/s figure is the measured single-stream throughput of that exact
@@ -292,7 +292,7 @@ it to `/Applications`. Use the `.app` rather than `swift run` — notifications 
 See **[panel-theme/README.md](panel-theme/README.md)** for the full story. Short
 version: it's a 3.5" USB HID "sensor panel" (`0483:0065`), *not* a display — it
 stores a compiled theme in flash and renders locally while the host pushes
-numbers on 17 channels. That README documents the protocol, the theme format,
+numbers on 21 channels. That README documents the protocol, the theme format,
 and several traps that cost real time to find.
 
 Once flashed, tick **"Send to USB panel"** in the dropdown; a brightness slider

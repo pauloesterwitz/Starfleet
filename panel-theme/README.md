@@ -17,10 +17,24 @@ Displays, and that is not a missing driver:
   307 KB — about 5 seconds per frame. It physically cannot be a desktop display.
 
 Instead it stores a compiled **theme** (`img.dat`) in flash and renders locally,
-while the host pushes **numeric values on channels 1…20**. Those channels are
+while the host pushes **numeric values on numbered channels**. Those channels are
 just numbered slots; the firmware's own names for them (`cpu_temperature`,
 `gpu_usage`, …) are irrelevant, because the labels drawn next to each value live
 in the theme, which we author.
+
+**This theme uses 21 channels, and 20 is not the ceiling it looks like.**
+`hidss.h` declares `HIDSS_SENSOR_KEY_MAX = 20`, which reads like a firmware
+limit and is easy to design around unnecessarily — but count Buren's
+`HIDSS_SENSOR_*` enum and it has exactly 20 named entries, so that constant is
+the size of *his own sensor list*, not a device constraint. `smartmonitor_hid_lib`
+imposes nothing of the kind: it caps only **pairs per packet** (20, which is
+just what fits in 64 bytes) and requires the tag to fit in one byte.
+
+Confirmed on this device on 2026-09-02: channel 21 renders. Channels beyond
+that are untested — the tag is a `uint8_t`, so more are plausible, but nothing
+here has proved it. If you do need more, note that going past 20 channels means
+a full push no longer fits one report; `PanelDriver.sendSensors` already splits
+across reports, which the same test exercised.
 
 > Separately: this Mac is a **MacBook Air M4**, which supports a maximum of two
 > external displays, and both LS27A80s already use them. Even a *real* small
@@ -141,6 +155,12 @@ on screen with no error anywhere.
 | 4 | Jean-Luc GPU watts | 8 | Kathryn GPU watts |
 | 9 | actively-generating agent sessions, both nodes | | |
 
+With 21 channels the map no longer fits one 64-byte report (`[type][count]`
+plus 20 × `[channel][u16]`), so `PanelDriver.sendSensors` splits a push across
+reports. There is no begin/commit around a sensor write — the firmware applies
+each pair as it arrives — so the only effect is that the last fields land a
+fraction of a millisecond after the first.
+
 The two session rows show the **most recently active** sessions across both
 Sparks, row 1 above row 2:
 
@@ -159,13 +179,60 @@ Status enum — send exactly these integers:
 | 1 | WORKING | 4 | IDLE |
 | 2 | STALLED | 5…9 | UNKNOWN (never send these) |
 
+The resident model per machine rides on each node's heading line, as **two**
+fields drawn flush against each other — a brand and a variant:
+
+| Ch | Meaning | Ch | Meaning |
+| --- | --- | --- | --- |
+| 18 | Jean-Luc model brand | 19 | Jean-Luc model variant |
+| 20 | Kathryn model brand | 21 | Kathryn model variant |
+
+Two fields rather than one because **an atlas has twelve cells and a plain
+integer reaches ten of them** — fewer than the roster has families, which is
+why an earlier single-field version collapsed most of the roster to `OTHER`.
+Two fields *multiply* where one could only enumerate: 10 brands × 10 variants
+covers all 28 members. They cannot be the two **digits** of one field, because
+both digits index the *same* atlas — `QWEN` and `3.6` would have to be cells of
+one ten-cell set, and the brands alone fill it.
+
+Brand cells rasterise flush **right** and variant cells flush **left**, so the
+two always meet at the seam between the boxes with `WORD_CELL_PAD` of gap:
+`QWEN` + `3.6` reads as one word, and a brand needing no qualifier just ends at
+the seam. `build_theme.py` asserts that abutment against the compiled record
+geometry, so the halves cannot drift apart unnoticed.
+
+| Value | Brand (ch18/20) | Variant (ch19/21) |
+| --- | --- | --- |
+| 0 | — (nothing resident) | *(blank — an unqualified brand)* |
+| 1 | QWEN | 3.5 |
+| 2 | GEMMA4 | 3.6 |
+| 3 | NEM | 3.8 |
+| 4 | MINIMAX | 235B |
+| 5 | DEEPSEEK | 3VL |
+| 6 | GLM5.3 | CASC |
+| 7 | HUNYUAN | OTRON |
+| 8 | AUX (embeddings / imagegen) | 31B |
+| 9 | OTHER | TP2 |
+
+Between them these cover **every** member of the current 28-model roster —
+`OTHER` is a tripwire for a family added to llama-swap and not yet added to
+`PanelModel`, not a bucket anything currently falls into.
+
+⚠️ The app selects a cell *by index* while this file decides what is drawn *in*
+it, so the two agree only by position. `check_swift_sync()` cross-checks
+`PanelController.swift`'s `Brand`/`Variant` raw values and the four channel
+constants on every build, because inserting a brand on one side alone fails
+nowhere — it just draws the wrong word for everything after it.
+
 ### How a number widget draws a *word*
 
-The status fields are ordinary number widgets (record `0x92`). A number widget
+The status and model fields are ordinary number widgets (record `0x92`). A number widget
 renders a value by splitting it into decimal digits and blitting one bitmap per
 digit out of a 12-cell glyph atlas — and nothing requires those cells to contain
 digits. The status atlas holds **words** in cells 0…4, so a channel value of
-`1` draws the cell that contains `WORKING`.
+`1` draws the cell that contains `WORKING`; the brand and variant atlases use
+all ten cells the same way (the variant atlas's cell 0 is blank by design —
+it is what an unqualified brand selects).
 
 Two things keep that honest rather than fragile:
 
@@ -179,8 +246,9 @@ Two things keep that honest rather than fragile:
 
 `build_theme.py` verifies this offline: it decodes each atlas back out of the
 compiled `img.dat` and checks the cell bytes against a fresh rasterisation of
-each word, plus per-cell ink bounding boxes. Values above 4 land on `UNKNOWN`
-cells rather than on garbage.
+each word, plus per-cell ink bounding boxes. On the status fields, values above
+4 land on `UNKNOWN` cells rather than on garbage; the brand and variant atlases
+define all ten, so there is nothing out of range to land on.
 
 ## Text rendering — don't let the library binarise it
 
@@ -279,7 +347,7 @@ portrait-vs-landscape selector.)
 | --- | --- | --- |
 | `0x00` | widget | `[type][n]` then n × `[id][u16be value]` |
 | `0x01` | command | `0x01` + `"reset\0"` |
-| `0x02` | sensor | `[type][n]` then n × `[channel][s16be value]`, max 20 |
+| `0x02` | sensor | `[type][n]` then n × `[channel][s16be value]`, max 20 **pairs per report** (not a cap on channel *ids* — send more channels in more reports) |
 | `0x03` | datetime | `[03][01][15][yr-2000][mon][day][hr][min][sec][blTimeout][brightness 1..100]` |
 
 **Debugging tip that saves hours:** the *backlight brightness* byte in the
@@ -313,7 +381,10 @@ and in the Swift app were written against their documented protocol.
   commit `37c4b21` (2024-03-02), from <https://gitlab.com/braewoods/usb-smart-screen>.
   The GitHub `braewoods/hidss` repo was deleted; GitLab is the surviving copy.
   `inc/hidss.h` and `ctl/device.c` are the authoritative protocol description,
-  and are what `PanelDriver.swift` was transcribed from.
+  and are what `PanelDriver.swift` was transcribed from. Two of its constants
+  describe *his* build rather than this device, though: rotate-at-offset-0 (see
+  above) and `HIDSS_SENSOR_KEY_MAX = 20`, which is the length of his named-sensor
+  enum — this panel happily renders channel 21.
 - `vendor/smartmonitor_hid_lib` — **GPL-3.0**, commit `c7d7ceb` (2026-05-01),
   from <https://github.com/Agentry433/smartmonitor_hid_lib>. Used by
   `build_theme.py` for its `.ui` → `img.dat` compiler and glyph rendering.
