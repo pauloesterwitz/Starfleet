@@ -17,10 +17,24 @@ Displays, and that is not a missing driver:
   307 KB — about 5 seconds per frame. It physically cannot be a desktop display.
 
 Instead it stores a compiled **theme** (`img.dat`) in flash and renders locally,
-while the host pushes **numeric values on channels 1…20**. Those channels are
+while the host pushes **numeric values on numbered channels**. Those channels are
 just numbered slots; the firmware's own names for them (`cpu_temperature`,
 `gpu_usage`, …) are irrelevant, because the labels drawn next to each value live
 in the theme, which we author.
+
+**This theme uses 21 channels, and 20 is not the ceiling it looks like.**
+`hidss.h` declares `HIDSS_SENSOR_KEY_MAX = 20`, which reads like a firmware
+limit and is easy to design around unnecessarily — but count Buren's
+`HIDSS_SENSOR_*` enum and it has exactly 20 named entries, so that constant is
+the size of *his own sensor list*, not a device constraint. `smartmonitor_hid_lib`
+imposes nothing of the kind: it caps only **pairs per packet** (20, which is
+just what fits in 64 bytes) and requires the tag to fit in one byte.
+
+Confirmed on this device on 2026-09-02: channel 21 renders. Channels beyond
+that are untested — the tag is a `uint8_t`, so more are plausible, but nothing
+here has proved it. If you do need more, note that going past 20 channels means
+a full push no longer fits one report; `PanelDriver.sendSensors` already splits
+across reports, which the same test exercised.
 
 > Separately: this Mac is a **MacBook Air M4**, which supports a maximum of two
 > external displays, and both LS27A80s already use them. Even a *real* small
@@ -333,7 +347,7 @@ portrait-vs-landscape selector.)
 | --- | --- | --- |
 | `0x00` | widget | `[type][n]` then n × `[id][u16be value]` |
 | `0x01` | command | `0x01` + `"reset\0"` |
-| `0x02` | sensor | `[type][n]` then n × `[channel][s16be value]`, max 20 |
+| `0x02` | sensor | `[type][n]` then n × `[channel][s16be value]`, max 20 **pairs per report** (not a cap on channel *ids* — send more channels in more reports) |
 | `0x03` | datetime | `[03][01][15][yr-2000][mon][day][hr][min][sec][blTimeout][brightness 1..100]` |
 
 **Debugging tip that saves hours:** the *backlight brightness* byte in the
@@ -367,7 +381,10 @@ and in the Swift app were written against their documented protocol.
   commit `37c4b21` (2024-03-02), from <https://gitlab.com/braewoods/usb-smart-screen>.
   The GitHub `braewoods/hidss` repo was deleted; GitLab is the surviving copy.
   `inc/hidss.h` and `ctl/device.c` are the authoritative protocol description,
-  and are what `PanelDriver.swift` was transcribed from.
+  and are what `PanelDriver.swift` was transcribed from. Two of its constants
+  describe *his* build rather than this device, though: rotate-at-offset-0 (see
+  above) and `HIDSS_SENSOR_KEY_MAX = 20`, which is the length of his named-sensor
+  enum — this panel happily renders channel 21.
 - `vendor/smartmonitor_hid_lib` — **GPL-3.0**, commit `c7d7ceb` (2026-05-01),
   from <https://github.com/Agentry433/smartmonitor_hid_lib>. Used by
   `build_theme.py` for its `.ui` → `img.dat` compiler and glyph rendering.
