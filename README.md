@@ -292,7 +292,7 @@ it to `/Applications`. Use the `.app` rather than `swift run` — notifications 
 See **[panel-theme/README.md](panel-theme/README.md)** for the full story. Short
 version: it's a 3.5" USB HID "sensor panel" (`0483:0065`), *not* a display — it
 stores a compiled theme in flash and renders locally while the host pushes
-numbers on 17 channels. That README documents the protocol, the theme format,
+numbers on 21 channels. That README documents the protocol, the theme format,
 and several traps that cost real time to find.
 
 Once flashed, tick **"Send to USB panel"** in the dropdown; a brightness slider

@@ -44,11 +44,20 @@ atlas is just ``sum(glyph_widths) * glyph_height`` bytes of 8-bit coverage,
 cells concatenated in order ``0123456789.-``, and the record carries the 12
 cell widths as big-endian u16 (record bytes 22..45).
 
-Nothing in that says the cells have to contain *digits*.  So four fields on
+Nothing in that says the cells have to contain *digits*.  So six fields on
 this panel put WORDS in the atlas and let a single-digit channel value select
 one: the two session status fields (0=NONE 1=WORKING 2=STALLED 3=WAITING
-4=IDLE) and the two resident-model fields (0=em dash, then nine model family
-names).  See ``atlas_cell_words()`` and ``ThemeBuilder.word_field()``.
+4=IDLE) and, per node, a resident-model BRAND field with a VARIANT field drawn
+flush against it.  See ``atlas_cell_words()`` and ``ThemeBuilder.word_field()``.
+
+That brand/variant split is what gets the model roster onto the panel at all.
+An atlas has twelve cells and a plain integer reaches ten of them, so ONE
+field can name ten things -- fewer than the roster has families.  Two fields
+side by side multiply instead of add: ten brands x ten variants covers all 28
+members with nothing left over for a catch-all to swallow.  They cannot share
+one field's two digits, because both digits index the SAME atlas -- "QWEN" and
+"3.6" would have to be cells of one ten-cell set, and the brands alone fill
+it.
 
 Two properties make this safe rather than clever:
 
@@ -69,6 +78,7 @@ from __future__ import annotations
 
 import importlib.machinery
 import importlib.util
+import re
 import sys
 import types
 from dataclasses import dataclass
@@ -268,8 +278,10 @@ CH_AGENTS = 9
 # Two most-recently-active agent sessions across both Sparks.
 CH_S1_STATUS, CH_S1_AGE, CH_S1_DONE, CH_S1_TOTAL = 10, 11, 12, 13
 CH_S2_STATUS, CH_S2_AGE, CH_S2_DONE, CH_S2_TOTAL = 14, 15, 16, 17
-# Resident model per machine.
-CH_JL_MODEL, CH_KT_MODEL = 18, 19
+# Resident model per machine: a BRAND field with a VARIANT field beside it.
+CH_JL_BRAND, CH_JL_VARIANT = 18, 19
+CH_KT_BRAND, CH_KT_VARIANT = 20, 21
+MODEL_FIELD_PAIRS = ((CH_JL_BRAND, CH_JL_VARIANT), (CH_KT_BRAND, CH_KT_VARIANT))
 
 # Status enum -> word, selected by the value the app sends on the status
 # channel.  Index in this tuple IS the wire value.
@@ -277,13 +289,22 @@ STATUS_WORDS = ("NONE", "WORKING", "STALLED", "WAITING", "IDLE")
 STATUS_FILLER = "UNKNOWN"   # atlas cells 5..9: enum values we never send
 ATLAS_PUNCT = "-"           # atlas cells 10/11: the '.' and '-' slots
 
-# Resident-model enum -> word.  Index IS the wire value, and a single decimal
-# digit only indexes ten cells, so these are model FAMILIES rather than the
-# roster's 26 full member names: 1-4 the everyday residents, 5-8 the
-# tensor-parallel ones, 9 a catch-all.  Cell 0 is an em dash for "nothing
-# resident" -- it rasterises as a centred bar, which reads as a blank field.
-MODEL_WORDS = ("—", "GEMMA4", "QWEN3.6", "QWEN3.8", "NEMCASC",
-               "QWEN3.5", "QWEN235B", "NEMOTRON", "MINIMAX", "OTHER")
+# Resident model, split across two adjacent fields.  Index IS the wire value.
+#
+# BRAND cells rasterise flush RIGHT and VARIANT cells flush LEFT, so the two
+# always meet at the seam between the boxes with exactly WORD_CELL_PAD of gap
+# between the ink: "QWEN" + "3.6" reads as one word, and a brand needing no
+# qualifier simply ends at the seam.  Brand cell 0 is an em dash for "nothing
+# resident"; variant cell 0 is deliberately EMPTY, which is what every
+# unqualified brand selects.
+#
+# Between them these cover every member of the 28-model roster -- OTHER is a
+# tripwire for a family added to llama-swap and not yet added here, not a
+# bucket anything currently falls into.  Keep in sync with PanelController.swift.
+MODEL_BRANDS = ("—", "QWEN", "GEMMA4", "NEM", "MINIMAX",
+                "DEEPSEEK", "GLM5.3", "HUNYUAN", "AUX", "OTHER")
+MODEL_VARIANTS = ("", "3.5", "3.6", "3.8", "235B",
+                  "3VL", "CASC", "OTRON", "31B", "TP2")
 
 # Only used to draw theme_preview.png -- never written to the device.
 SAMPLE_VALUES = {
@@ -292,9 +313,10 @@ SAMPLE_VALUES = {
     CH_AGENTS: 2,
     CH_S1_STATUS: 1, CH_S1_AGE: 3, CH_S1_DONE: 4, CH_S1_TOTAL: 9,      # WORKING
     CH_S2_STATUS: 3, CH_S2_AGE: 47, CH_S2_DONE: 12, CH_S2_TOTAL: 12,   # WAITING
-    # A short word on one node and the longest on the other, so the preview
-    # shows both fields and the widest string at once.
-    CH_JL_MODEL: 1, CH_KT_MODEL: 7,                                    # GEMMA4 / NEMOTRON
+    # A composed pair on one node and the widest brand on the other, so the
+    # preview shows the seam and the longest string the field can hold.
+    CH_JL_BRAND: 1, CH_JL_VARIANT: 2,                                  # QWEN3.6
+    CH_KT_BRAND: 5, CH_KT_VARIANT: 9,                                  # DEEPSEEK TP2
 }
 
 
@@ -352,9 +374,8 @@ NODE_BLOCK_H = 150              # height of the left accent pill
 # INK on the machine name's ink (which runs top+0..top+23), not their boxes --
 # the three fonts have very different descents.  The word box bottom lands at
 # top+26, clear of the hairline at top+30.
-NODE_MODEL_CAPTION_X = 140
+NODE_MODEL_CAPTION_GAP = 6      # between the "MODEL" caption and the brand box
 NODE_MODEL_CAPTION_DY = 5
-NODE_MODEL_X = 182
 NODE_MODEL_DY = 2
 
 SECTION_RULE_Y = (226, 384)     # full-width rules closing each node block
@@ -392,13 +413,15 @@ NODES = (
         "name": "JEAN-LUC",
         "accent": AMBER,
         "channels": (CH_JL_GPU, CH_JL_TEMP, CH_JL_RAM, CH_JL_PWR),
-        "model_channel": CH_JL_MODEL,
+        "brand_channel": CH_JL_BRAND,
+        "variant_channel": CH_JL_VARIANT,
     },
     {
         "name": "KATHRYN",
         "accent": LILAC,
         "channels": (CH_KT_GPU, CH_KT_TEMP, CH_KT_RAM, CH_KT_PWR),
-        "model_channel": CH_KT_MODEL,
+        "brand_channel": CH_KT_BRAND,
+        "variant_channel": CH_KT_VARIANT,
     },
 )
 # Cell order is row-major: (GPU, TEMP) then (RAM, PWR).
@@ -427,6 +450,7 @@ class WordAtlas:
     ink_boxes: list[tuple[int, int, int, int]]   # per-cell ink bbox, post-gamma
     cells: list[bytes]          # exact per-cell bytes, for byte-level checks
     report_count: int = 10      # leading cells that are real wire values
+    align: str = "left"         # which cell edge the ink is flush against
 
     @property
     def payload(self) -> bytes:
@@ -456,6 +480,22 @@ def atlas_cell_words(words: tuple[str, ...], filler: str) -> list[str]:
     return cells
 
 
+# FontSpec.text -> cell alignment.  The compiler re-rasterises each atlas from
+# the FontSpec alone (see _glyph_payload_dispatch), long after the builder that
+# chose the alignment has returned, so it has to be recoverable from the text.
+WORD_ATLAS_ALIGN: dict[str, str] = {}
+
+
+def _word_mask(word: str, image_font):
+    """``_render_mask`` sizes the bitmap to the ink bounding box, which the
+    empty string has none of.  The blank variant cell -- what an unqualified
+    brand selects -- gets a 1px transparent stand-in instead of a crash; it is
+    the narrowest mask, so it never drives ``cell_w``."""
+    if not word:
+        return Image.new("L", (1, 1), 0)
+    return LIB.render._render_mask(word, image_font)
+
+
 def _apply_gamma(image: Image.Image, gamma: float | None) -> Image.Image:
     if gamma is None or gamma == 1.0:
         return image
@@ -465,15 +505,22 @@ def _apply_gamma(image: Image.Image, gamma: float | None) -> Image.Image:
 
 
 def render_word_atlas(font: FontSpec, words: list[str], gamma: float | None = 1.4,
-                      report_count: int = 10) -> WordAtlas:
+                      report_count: int = 10, align: str = "left") -> WordAtlas:
     """Rasterise ``words`` into a uniform-width glyph atlas.
 
     Mirrors ``render.render_number_glyph_payload``: same ``_render_mask`` (so
     every cell shares one baseline), same gamma, same concatenation order --
     only the cell contents and the uniform padding differ.
+
+    ``align`` places the ink inside each cell.  "left" is what a standalone
+    field wants, so its words all share a left edge.  "right" is for the brand
+    half of a brand+variant pair: the ink then ends WORD_CELL_PAD short of the
+    cell's right edge, which is exactly where the variant field's box begins,
+    so the two halves meet at a constant gap whatever the brand's width.
     """
+    assert align in ("left", "right"), align
     image_font = LIB.render.load_font(font)
-    masks = [LIB.render._render_mask(word, image_font) for word in words]
+    masks = [_word_mask(word, image_font) for word in words]
     cell_h = max(mask.height for mask in masks)
     cell_w = max(mask.width for mask in masks) + WORD_CELL_PAD
 
@@ -481,14 +528,18 @@ def render_word_atlas(font: FontSpec, words: list[str], gamma: float | None = 1.
     ink_boxes: list[tuple[int, int, int, int]] = []
     for mask in masks:
         cell = Image.new("L", (cell_w, cell_h), 0)
-        cell.paste(mask, (0, 0))
+        # Right-aligned cells still keep WORD_CELL_PAD clear on the right --
+        # that pad IS the inter-word gap once the variant field abuts them.
+        left = 0 if align == "left" else cell_w - WORD_CELL_PAD - mask.width
+        cell.paste(mask, (left, 0))
         cell = _apply_gamma(cell, gamma)
         cells.append(cell.tobytes())
         # Measured AFTER gamma, because gamma rounds the faintest antialiasing
         # to zero and can shave a column off the ink box.
         ink_boxes.append(cell.getbbox() or (0, 0, 0, 0))
     return WordAtlas(words=words, cell_w=cell_w, cell_h=cell_h,
-                     ink_boxes=ink_boxes, cells=cells, report_count=report_count)
+                     ink_boxes=ink_boxes, cells=cells, report_count=report_count,
+                     align=align)
 
 
 def font_atlas_words(font: FontSpec | None) -> list[str] | None:
@@ -512,7 +563,8 @@ def _glyph_payload_dispatch(font, glyphs=LIB.render.DEFAULT_NUMBER_GLYPHS,
     words = font_atlas_words(font)
     if words is None:
         return _RENDER_DIGIT_ATLAS(font, glyphs, font_path, pixel_size, gamma)
-    atlas = render_word_atlas(font, words, gamma=gamma)
+    atlas = render_word_atlas(font, words, gamma=gamma,
+                              align=WORD_ATLAS_ALIGN.get(font.text or "", "left"))
     return atlas.widths, atlas.cell_h, atlas.payload
 
 
@@ -897,14 +949,21 @@ class ThemeBuilder:
         self._next_id += 1
         return global_id
 
-    def text(self, text: str, spec, color: int, x: int, y: int, *, center: bool = False) -> int:
-        """Static text widget (type 2 -> record 0x93).  Returns its width."""
+    def text(self, text: str, spec, color: int, x: int, y: int, *,
+             center: bool = False, right: bool = False) -> int:
+        """Static text widget (type 2 -> record 0x93).  Returns its width.
+
+        ``right`` reads ``x`` as the RIGHT edge instead of the left, for labels
+        placed relative to something whose own width decided the layout.
+        """
         font = self._font(spec, color, text=text)
         rendered = LIB.render.render_static_text_payload(
             text, font, vendor_mode=True, binary_threshold=160
         )
         if center:
             x = (PANEL_W - rendered.width) // 2
+        elif right:
+            x -= rendered.width
         self.widgets.append(
             Widget(
                 global_id=self._alloc_id(),
@@ -959,7 +1018,7 @@ class ThemeBuilder:
         return width
 
     def word_field(self, channel: int, spec, color: int, x: int, y: int,
-                   words: tuple[str, ...], filler: str) -> int:
+                   words: tuple[str, ...], filler: str, align: str = "left") -> int:
         """Live *word* widget: a number widget over a word glyph atlas.
 
         The box is the atlas cell width, which is the widest word plus
@@ -967,12 +1026,26 @@ class ThemeBuilder:
         validate() re-proves it against the compiled bytes.
         """
         cells = atlas_cell_words(words, filler)
-        font = self._font(spec, color, text=WORD_ATLAS_MARK.join(cells))
-        atlas = render_word_atlas(font, cells, gamma=1.4, report_count=len(words))
+        text = WORD_ATLAS_MARK.join(cells)
+        WORD_ATLAS_ALIGN[text] = align
+        font = self._font(spec, color, text=text)
+        atlas = render_word_atlas(font, cells, gamma=1.4, report_count=len(words),
+                                  align=align)
         WORD_ATLASES[channel] = atlas
         self._number_widget(channel, font, x, y, atlas.cell_w, atlas.cell_h,
                             f"word ch{channel}", atlas.cell_w)
         return atlas.cell_w
+
+
+def word_field_width(spec, words: tuple[str, ...], filler: str) -> int:
+    """The width ``ThemeBuilder.word_field`` will take, without placing it.
+
+    Layout needs the two model fields' widths before either is built, to sit
+    the pair against the right margin.  Alignment does not affect the width.
+    """
+    cells = atlas_cell_words(words, filler)
+    font = make_font(spec, 0, text=WORD_ATLAS_MARK.join(cells))
+    return render_word_atlas(font, cells, gamma=1.4).cell_w
 
 
 def build_widgets() -> ThemeBuilder:
@@ -985,12 +1058,23 @@ def build_widgets() -> ThemeBuilder:
     # --- one block per DGX Spark node -------------------------------------
     for node, top in zip(NODES, NODE_TOP):
         builder.text(node["name"], F_NODE, node["accent"], MARGIN_X, top)
-        # Resident model, riding on the heading line beside the machine name.
+        # Resident model, riding on the heading line beside the machine name:
+        # BRAND then VARIANT, boxes abutting so the two halves read as one
+        # word.  The pair is right-aligned to the margin and the caption fills
+        # what is left, so a wider word list moves the caption rather than
+        # silently running off the panel (which validate() would catch anyway).
+        brand_w = word_field_width(F_MODEL, MODEL_BRANDS, MODEL_BRANDS[-1])
+        variant_w = word_field_width(F_MODEL, MODEL_VARIANTS, MODEL_VARIANTS[0])
+        brand_x = PANEL_W - MARGIN_X - brand_w - variant_w
         builder.text("MODEL", F_CAPTION, BLUE,
-                     NODE_MODEL_CAPTION_X, top + NODE_MODEL_CAPTION_DY)
-        builder.word_field(node["model_channel"], F_MODEL, node["accent"],
-                           NODE_MODEL_X, top + NODE_MODEL_DY,
-                           MODEL_WORDS, MODEL_WORDS[-1])
+                     brand_x - NODE_MODEL_CAPTION_GAP, top + NODE_MODEL_CAPTION_DY,
+                     right=True)
+        builder.word_field(node["brand_channel"], F_MODEL, node["accent"],
+                           brand_x, top + NODE_MODEL_DY,
+                           MODEL_BRANDS, MODEL_BRANDS[-1], align="right")
+        builder.word_field(node["variant_channel"], F_MODEL, node["accent"],
+                           brand_x + brand_w, top + NODE_MODEL_DY,
+                           MODEL_VARIANTS, MODEL_VARIANTS[0], align="left")
         for index, (caption, channel) in enumerate(zip(CELL_CAPTIONS, node["channels"])):
             col_x = COL_X[index % 2]
             caption_y = top + NODE_ROW_DY[index // 2]
@@ -1108,6 +1192,63 @@ def _record_box(record) -> tuple[int, int, int, int] | None:
     return None
 
 
+SWIFT_PANEL = Path(__file__).resolve().parent.parent / "Sources" / "OpencodeMonitor" / "PanelController.swift"
+
+
+def check_swift_sync() -> list[str]:
+    """Cross-check the app's copy of the model tables against this one.
+
+    The app decides WHICH atlas cell to select and this file decides WHAT is
+    drawn in it, so the two agree only by index.  Adding a brand on one side
+    alone does not fail anywhere -- the panel just draws the wrong word for
+    every model after the insertion point, which looks like a matching bug in
+    the app and is miserable to track down from a photo of a 3.5" screen.
+
+    Deliberately structural, not semantic: it checks the enums are the same
+    length as the word tuples with contiguous raw values, and that the four
+    channel numbers agree.  Mapping ``case v36`` to ``"3.6"`` would need a
+    naming convention neither side wants to be bound by.
+    """
+    try:
+        source = SWIFT_PANEL.read_text()
+    except OSError:
+        # The theme builder is usable on its own, so a missing app checkout is
+        # not a reason to refuse to build a theme.  main() reports that the
+        # cross-check did not run, rather than letting it pass silently.
+        return []
+
+    problems: list[str] = []
+
+    def raw_values(enum_name: str) -> list[int]:
+        match = re.search(rf"enum {enum_name}: UInt16 {{(.*?)\n        }}", source, re.S)
+        if match is None:
+            problems.append(f"{SWIFT_PANEL.name}: no `enum {enum_name}: UInt16` found")
+            return []
+        return [int(v) for v in re.findall(r"case \w+ = (\d+)", match.group(1))]
+
+    for enum_name, words in (("Brand", MODEL_BRANDS), ("Variant", MODEL_VARIANTS)):
+        values = raw_values(enum_name)
+        if not values:
+            continue
+        if values != list(range(len(words))):
+            problems.append(
+                f"{SWIFT_PANEL.name}: {enum_name} raw values {values} != "
+                f"0..{len(words) - 1}, the {len(words)} cells this theme draws"
+            )
+
+    for const, expected in (("jeanLucBrand", CH_JL_BRAND), ("jeanLucVariant", CH_JL_VARIANT),
+                            ("kathrynBrand", CH_KT_BRAND), ("kathrynVariant", CH_KT_VARIANT)):
+        match = re.search(rf"static let {const}: UInt8 = (\d+)", source)
+        if match is None:
+            problems.append(f"{SWIFT_PANEL.name}: no `{const}` channel constant found")
+        elif int(match.group(1)) != expected:
+            problems.append(
+                f"{SWIFT_PANEL.name}: {const} is channel {match.group(1)}, "
+                f"this theme binds it to {expected}"
+            )
+    return problems
+
+
 def validate(data: bytes, expected_channels: list[int]) -> dict:
     imgdat = LIB.imgdat
     parsed = imgdat.parse_imgdat(data, path=str(OUT_IMGDAT))
@@ -1207,9 +1348,15 @@ def validate(data: bytes, expected_channels: list[int]) -> dict:
             cursor += width * height
 
         for index, cell in enumerate(cells[:10]):
-            if not any(cell):
-                what = f"word {atlas.words[index]!r}" if atlas else f"digit '{index}'"
-                problems.append(f"slot {record.index} (ch{channel}): {what} cell is blank")
+            if any(cell):
+                continue
+            # The variant atlas's cell 0 is blank BY DESIGN -- it is what an
+            # unqualified brand selects.  Any other empty cell means a glyph
+            # payload went missing.
+            if atlas is not None and atlas.words[index] == "":
+                continue
+            what = f"word {atlas.words[index]!r}" if atlas else f"digit '{index}'"
+            problems.append(f"slot {record.index} (ch{channel}): {what} cell is blank")
 
         if atlas is None:
             continue
@@ -1233,29 +1380,81 @@ def validate(data: bytes, expected_channels: list[int]) -> dict:
             image = Image.frombytes("L", (widths[index], height), cell)
             bbox = image.getbbox()
             if bbox is None:
-                problems.append(f"ch{channel}: cell {index} ({word!r}) has no ink")
+                # Only the empty variant cell is allowed to carry no ink.
+                if word != "":
+                    problems.append(f"ch{channel}: cell {index} ({word!r}) has no ink")
+                elif index < atlas.report_count:
+                    # Say so out loud -- a silently absent row would read as a
+                    # cell that failed to rasterise rather than one that is
+                    # blank on purpose.
+                    word_report.append(
+                        f"    ch{channel} value {index} -> {'(blank)':<8} "
+                        f"no ink, by design (an unqualified brand)"
+                    )
                 continue
             if bbox != atlas.ink_boxes[index]:
                 problems.append(
                     f"ch{channel}: cell {index} ({word!r}) ink box {bbox} "
                     f"!= rasterised {atlas.ink_boxes[index]}"
                 )
-            # The word has to sit flush left in its cell, or the columns of the
-            # two session rows would not line up.  1px of slack because gamma
-            # can round the leading antialiased column away.
-            if bbox[0] > 1:
-                problems.append(f"ch{channel}: cell {index} ({word!r}) ink starts at x={bbox[0]}, expected 0..1")
+            # Flush against whichever edge the atlas aligns to.  Left-aligned
+            # words share a left edge, so the two session rows' columns line
+            # up; a right-aligned brand cell must END where the variant field's
+            # box begins, or the two halves of one model name would not meet.
+            # 1px of slack because gamma can round the outermost antialiased
+            # column away.
+            if atlas.align == "left":
+                if bbox[0] > 1:
+                    problems.append(
+                        f"ch{channel}: cell {index} ({word!r}) ink starts at x={bbox[0]}, expected 0..1")
+            else:
+                seam = widths[index] - WORD_CELL_PAD
+                if not seam - 1 <= bbox[2] <= seam:
+                    problems.append(
+                        f"ch{channel}: cell {index} ({word!r}) ink ends at x={bbox[2]}, "
+                        f"expected the seam at {seam}"
+                    )
             if bbox[2] > widths[index]:
                 problems.append(f"ch{channel}: cell {index} ({word!r}) ink overflows its cell")
             if index < atlas.report_count:
                 word_report.append(
-                    f"    ch{channel} value {index} -> {word:<8} ink {bbox[2] - bbox[0]:>3}px "
+                    f"    ch{channel} value {index} -> {word or '(blank)':<8} "
+                    f"ink {bbox[2] - bbox[0]:>3}px "
                     f"of {widths[index]}px cell, rows {bbox[1]}..{bbox[3]}"
                 )
 
         box = _record_box(record)
         if box and widths[0] > box[2]:
             problems.append(f"ch{channel}: widget box {box[2]}px is narrower than the {widths[0]}px word cell")
+
+    # -- the two halves of a model name have to meet -----------------------
+    # Everything else about the brand/variant trick is proved per-atlas above;
+    # this is the one property that lives BETWEEN two widgets.  If the variant
+    # box drifts off the brand box's right edge, nothing errors -- the panel
+    # just draws "QWEN   3.6" with a hole in it, or overlaps the two.
+    model_boxes = {
+        int(record.fields["fast_sensor"]): _record_box(record)
+        for record in records if record.record_type == 0x92
+    }
+    for brand_ch, variant_ch in MODEL_FIELD_PAIRS:
+        brand_box = model_boxes.get(brand_ch)
+        variant_box = model_boxes.get(variant_ch)
+        if brand_box is None or variant_box is None:
+            problems.append(
+                f"ch{brand_ch}/ch{variant_ch}: a model field pair is missing its widget"
+            )
+            continue
+        seam = brand_box[0] + brand_box[2]
+        if variant_box[0] != seam:
+            problems.append(
+                f"ch{variant_ch}: variant box starts at x={variant_box[0]}, not on the "
+                f"ch{brand_ch} seam at x={seam} -- the halves of a model name would not meet"
+            )
+        if variant_box[1] != brand_box[1]:
+            problems.append(
+                f"ch{variant_ch}: variant box top y={variant_box[1]} != "
+                f"ch{brand_ch} top y={brand_box[1]} -- the halves would not share a baseline"
+            )
 
     # -- geometry: on-screen, and number boxes must not overlap anything ---
     boxed = [(record, _record_box(record)) for record in records]
@@ -1534,6 +1733,8 @@ def main() -> int:
         widget.sensor.fast_sensor for widget in bundle.theme.widgets if widget.widget_type == 5
     ]
     result = validate(data, expected_channels)
+    result["problems"] += check_swift_sync()
+    swift_check = "OK" if SWIFT_PANEL.exists() else f"SKIPPED ({SWIFT_PANEL} not found)"
 
     print()
     print(f"img.dat         : {OUT_IMGDAT}  ({len(data):,} bytes, "
@@ -1580,6 +1781,7 @@ def main() -> int:
             print(f"    - {problem}")
         return 1
     print("validation      : OK")
+    print(f"app cross-check : {swift_check}")
     return 0
 
 

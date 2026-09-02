@@ -141,6 +141,12 @@ on screen with no error anywhere.
 | 4 | Jean-Luc GPU watts | 8 | Kathryn GPU watts |
 | 9 | actively-generating agent sessions, both nodes | | |
 
+With 21 channels the map no longer fits one 64-byte report (`[type][count]`
+plus 20 × `[channel][u16]`), so `PanelDriver.sendSensors` splits a push across
+reports. There is no begin/commit around a sensor write — the firmware applies
+each pair as it arrives — so the only effect is that the last fields land a
+fraction of a millisecond after the first.
+
 The two session rows show the **most recently active** sessions across both
 Sparks, row 1 above row 2:
 
@@ -159,34 +165,60 @@ Status enum — send exactly these integers:
 | 1 | WORKING | 4 | IDLE |
 | 2 | STALLED | 5…9 | UNKNOWN (never send these) |
 
-The resident model per machine rides on each node's heading line:
+The resident model per machine rides on each node's heading line, as **two**
+fields drawn flush against each other — a brand and a variant:
 
-| Ch | Meaning |
-| --- | --- |
-| 18 | Jean-Luc resident model |
-| 19 | Kathryn resident model |
-
-Model enum — send exactly these integers. These are model **families**, not
-full member names: a single decimal digit only indexes ten atlas cells, and the
-roster has 26 members across 12 families, so 1–4 are the everyday residents,
-5–8 the tensor-parallel ones, and 9 the catch-all.
-
-| Value | Word | Value | Word |
+| Ch | Meaning | Ch | Meaning |
 | --- | --- | --- | --- |
-| 0 | — (nothing resident) | 5 | QWEN3.5 |
-| 1 | GEMMA4 | 6 | QWEN235B |
-| 2 | QWEN3.6 | 7 | NEMOTRON |
-| 3 | QWEN3.8 | 8 | MINIMAX |
-| 4 | NEMCASC | 9 | OTHER |
+| 18 | Jean-Luc model brand | 19 | Jean-Luc model variant |
+| 20 | Kathryn model brand | 21 | Kathryn model variant |
+
+Two fields rather than one because **an atlas has twelve cells and a plain
+integer reaches ten of them** — fewer than the roster has families, which is
+why an earlier single-field version collapsed most of the roster to `OTHER`.
+Two fields *multiply* where one could only enumerate: 10 brands × 10 variants
+covers all 28 members. They cannot be the two **digits** of one field, because
+both digits index the *same* atlas — `QWEN` and `3.6` would have to be cells of
+one ten-cell set, and the brands alone fill it.
+
+Brand cells rasterise flush **right** and variant cells flush **left**, so the
+two always meet at the seam between the boxes with `WORD_CELL_PAD` of gap:
+`QWEN` + `3.6` reads as one word, and a brand needing no qualifier just ends at
+the seam. `build_theme.py` asserts that abutment against the compiled record
+geometry, so the halves cannot drift apart unnoticed.
+
+| Value | Brand (ch18/20) | Variant (ch19/21) |
+| --- | --- | --- |
+| 0 | — (nothing resident) | *(blank — an unqualified brand)* |
+| 1 | QWEN | 3.5 |
+| 2 | GEMMA4 | 3.6 |
+| 3 | NEM | 3.8 |
+| 4 | MINIMAX | 235B |
+| 5 | DEEPSEEK | 3VL |
+| 6 | GLM5.3 | CASC |
+| 7 | HUNYUAN | OTRON |
+| 8 | AUX (embeddings / imagegen) | 31B |
+| 9 | OTHER | TP2 |
+
+Between them these cover **every** member of the current 28-model roster —
+`OTHER` is a tripwire for a family added to llama-swap and not yet added to
+`PanelModel`, not a bucket anything currently falls into.
+
+⚠️ The app selects a cell *by index* while this file decides what is drawn *in*
+it, so the two agree only by position. `check_swift_sync()` cross-checks
+`PanelController.swift`'s `Brand`/`Variant` raw values and the four channel
+constants on every build, because inserting a brand on one side alone fails
+nowhere — it just draws the wrong word for everything after it.
 
 ### How a number widget draws a *word*
 
-The status fields are ordinary number widgets (record `0x92`). A number widget
+The status and model fields are ordinary number widgets (record `0x92`). A number widget
 renders a value by splitting it into decimal digits and blitting one bitmap per
 digit out of a 12-cell glyph atlas — and nothing requires those cells to contain
 digits. The status atlas holds **words** in cells 0…4, so a channel value of
-`1` draws the cell that contains `WORKING`; the model atlas uses all ten cells
-the same way.
+`1` draws the cell that contains `WORKING`; the brand and variant atlases use
+all ten cells the same way (the variant atlas's cell 0 is blank by design —
+it is what an unqualified brand selects).
 
 Two things keep that honest rather than fragile:
 
@@ -200,8 +232,9 @@ Two things keep that honest rather than fragile:
 
 `build_theme.py` verifies this offline: it decodes each atlas back out of the
 compiled `img.dat` and checks the cell bytes against a fresh rasterisation of
-each word, plus per-cell ink bounding boxes. Values above 4 land on `UNKNOWN`
-cells rather than on garbage.
+each word, plus per-cell ink bounding boxes. On the status fields, values above
+4 land on `UNKNOWN` cells rather than on garbage; the brand and variant atlases
+define all ten, so there is nothing out of range to land on.
 
 ## Text rendering — don't let the library binarise it
 

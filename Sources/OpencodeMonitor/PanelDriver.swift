@@ -16,6 +16,9 @@ final class PanelDriver {
     static let vendorID = 0x0483
     static let productID = 0x0065
     private static let reportSize = 64
+    /// A 64-byte report holds `[type][count]` plus 20 x `[channel][u16]`, and
+    /// the firmware caps a sensor report at 20 pairs for the same reason.
+    private static let maxPairsPerReport = 20
 
     private enum ReportType: UInt8 {
         case widget = 0x00
@@ -96,7 +99,7 @@ final class PanelDriver {
     /// The firmware accepts at most 20 pairs, which is also what fits in 64 bytes.
     @discardableResult
     private func writePairs(_ type: ReportType, _ pairs: [(UInt8, UInt16)]) -> Bool {
-        precondition(pairs.count <= 20, "at most 20 pairs per report")
+        precondition(pairs.count <= Self.maxPairsPerReport, "at most 20 pairs per report")
         var payload: [UInt8] = [type.rawValue, UInt8(pairs.count)]
         for (channel, value) in pairs {
             payload.append(channel)
@@ -109,9 +112,23 @@ final class PanelDriver {
     /// Pushes live values. Channel ids are arbitrary numeric slots -- the loaded
     /// theme decides where each is drawn and what it is labelled, so the
     /// firmware's own names for them (cpu_temperature etc.) are irrelevant.
+    ///
+    /// The theme has more channels than one report can carry, so a full push is
+    /// split across reports. There is no begin/commit around a sensor write --
+    /// the firmware applies each pair as it arrives -- so the only consequence
+    /// is that the last fields land a fraction of a millisecond after the
+    /// first, which is invisible at a 2s cadence.
     @discardableResult
     func sendSensors(_ values: [UInt8: UInt16]) -> Bool {
-        writePairs(.sensor, values.sorted { $0.key < $1.key }.map { ($0.key, $0.value) })
+        let pairs = values.sorted { $0.key < $1.key }.map { ($0.key, $0.value) }
+        guard !pairs.isEmpty else { return true }
+        for start in stride(from: 0, to: pairs.count, by: Self.maxPairsPerReport) {
+            let end = min(start + Self.maxPairsPerReport, pairs.count)
+            // Bail on the first failure: write() has already closed the handle,
+            // so the rest would only queue up writes into a dead device.
+            guard writePairs(.sensor, Array(pairs[start..<end])) else { return false }
+        }
+        return true
     }
 
     /// Also carries the backlight setting, which is the one field that works
