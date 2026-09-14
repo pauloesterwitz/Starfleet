@@ -21,3 +21,6 @@ panel-theme/theme_assets/starfleet_bg.bmp
 
 # macOS
 .DS_Store
+
+# Machine-local: which theme contract is flashed on THIS panel (written by upload_theme.py)
+panel-theme/.flashed-contract.json

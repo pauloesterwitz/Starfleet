@@ -87,6 +87,16 @@ Takes ~90 s for 343 blocks. **Quit Starfleet Command first** (or untick "Send to
 USB panel") so the app isn't writing to the device mid-flash. The panel
 re-enumerates afterwards; give it ~10 s before expecting it back.
 
+`upload_theme.py` **refuses to flash** a theme whose panel contract — channels
+18–21 and the brand / variant / status atlases — differs from the one
+`package.sh` stamped into the installed `Starfleet Command.app`. Without that
+check the flash succeeds and the app keeps writing the old layout, so the panel
+shows wrong words with no error anywhere (2026-09-14: GLM-5.3 rendered as
+"OTHER TP2"). Rebuild the app with `./package.sh` first. `--check-only` runs the
+check without touching the panel; `--force` flashes anyway. `package.sh` in turn
+fails the build if `PanelController.swift` and `build_theme.py` disagree, and
+warns when the panel was last flashed with a different contract.
+
 Flashing writes the **theme** region only — `upload_theme` never enters the
 bootloader, only a *firmware* upload would. A bad theme is re-flashable.
 

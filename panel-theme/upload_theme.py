@@ -26,6 +26,8 @@ from pathlib import Path
 
 import hid
 
+import panel_contract  # sibling module: the app/theme contract (also used by package.sh)
+
 VID, PID = 0x0483, 0x0065
 REPORT = 64
 SOH, STX, EOT, ACK, NAK = 0x01, 0x02, 0x04, 0x06, 0x15
@@ -167,7 +169,30 @@ class Uploader:
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("theme", nargs="?", default="img.dat")
+    ap.add_argument("--force", action="store_true",
+                    help="flash even if the installed Starfleet Command app was built for "
+                         "a different panel contract")
+    ap.add_argument("--check-only", action="store_true",
+                    help="run the app/theme contract check and exit, without touching the panel")
     args = ap.parse_args()
+
+    # Before the device is opened: a theme the installed app was not built for flashes
+    # fine and then silently shows the wrong words -- 2026-09-14, GLM-5.3 as "OTHER TP2".
+    try:
+        blockers, warnings = panel_contract.verify_flash(args.theme)
+    except panel_contract.ContractError as exc:
+        blockers, warnings = [f"cannot read the panel contract: {exc}"], []
+    for w in warnings:
+        print(f"warning: {w}", file=sys.stderr)
+    for b in blockers:
+        print(f"{'overridden by --force' if args.force else 'REFUSING'}: {b}", file=sys.stderr)
+    if args.check_only:
+        print("contract check: " + ("OK" if not blockers else "FAILED"))
+        raise SystemExit(1 if blockers else 0)
+    if blockers and not args.force:
+        print("Nothing was flashed.", file=sys.stderr)
+        raise SystemExit(2)
+
     up = Uploader()
     try:
         up.upload(Path(args.theme))
@@ -178,6 +203,11 @@ def main():
         raise SystemExit(1)
     finally:
         up.close()
+    try:
+        panel_contract.record_flash(args.theme)   # only reached after a successful upload
+    except OSError as exc:
+        print(f"warning: flashed OK, but could not record which contract is on the "
+              f"panel: {exc}", file=sys.stderr)
 
 
 if __name__ == "__main__":

@@ -4,6 +4,15 @@
 set -euo pipefail
 
 APP="Starfleet Command.app"
+
+# Panel contract, checked BEFORE building. The app writes numbers into the panel's
+# channels and the theme flashed onto it (panel-theme/img.dat, via upload_theme.py)
+# decides what each number looks like -- when the two disagree the panel draws the
+# wrong words with no error anywhere (2026-09-14: GLM-5.3 rendered as "OTHER TP2").
+# Fails the build if PanelController.swift and build_theme.py disagree; warns if the
+# theme last flashed onto the panel is not the one this build speaks.
+python3 panel-theme/panel_contract.py check
+
 swift build -c release
 
 rm -rf "$APP"
@@ -14,6 +23,9 @@ cp .build/release/OpencodeMonitor "$APP/Contents/MacOS/StarfleetCommand"
 # Dock icon). Built from the Starfleet delta mark via assets/gen-icon.sh;
 # regenerate that script's output if the mark or badge design ever changes.
 cp assets/app-icon.icns "$APP/Contents/Resources/app-icon.icns"
+# Stamp the contract this build speaks into the bundle, so upload_theme.py can refuse
+# to flash a theme this app would drive wrong. Before codesign: it is a sealed resource.
+python3 panel-theme/panel_contract.py stamp "$APP/Contents/Resources/panel-contract.json"
 codesign --force --sign - "$APP" >/dev/null
 
 echo "Built $APP. Move it to /Applications (or ~/Applications) and open it,"
