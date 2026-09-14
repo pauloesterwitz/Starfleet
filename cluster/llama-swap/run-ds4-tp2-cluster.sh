@@ -115,8 +115,14 @@ esac
 # to that path and watches it for fast-fail markers.
 RUN_LOG="${RUN_LOG:-$HOME/llama-swap/logs/run-${MODEL_SUBDIR}.log}"
 mkdir -p "$(dirname "$RUN_LOG")"
-ln -sfn "$RUN_LOG" "$HOME/llama-swap/ds4-tp2-test.log" 2>/dev/null || true
-exec > >(tee "$RUN_LOG") 2>&1
+# Not under DRYRUN: the plan below is a read-only self-check, and Fleet runs it to learn
+# each member's checkpoint and context. Opening the log first made every such probe
+# truncate the last REAL run's log and re-point the symlink -- on 2026-09-14 it wiped
+# ds4's 2026-09-07 run log, and Kathryn's hourly mirror held the only surviving copy.
+if [ -z "${DRYRUN:-}" ]; then
+  ln -sfn "$RUN_LOG" "$HOME/llama-swap/ds4-tp2-test.log" 2>/dev/null || true
+  exec > >(tee "$RUN_LOG") 2>&1
+fi
 
 # Shared docker flags. Values are space-free by construction, so a plain word-split string works both
 # locally (head) and embedded in the ssh command (worker) — one definition, no array/ssh serialization.

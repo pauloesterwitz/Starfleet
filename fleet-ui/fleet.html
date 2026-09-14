@@ -266,6 +266,9 @@ function ctxTitle(m){
   if(m.ctx_native&&m.ctx_pool&&m.ctx_pool<m.ctx_native)
     parts.push(`limited by the measured KV pool (checkpoint allows ${m.ctx_native})`);
   else if(m.ctx_pool) parts.push(`checkpoint max; KV pool holds ${m.ctx_pool}`);
+  else if(m.ctx_native&&m.ctx_deployed&&m.ctx_deployed<m.ctx_native)
+    parts.push(`capped at the launcher's configured ${m.ctx_deployed} until one load has `+
+               `measured the KV pool (checkpoint allows ${m.ctx_native})`);
   else parts.push("checkpoint max; KV pool not measured yet");
   return parts.join(" — ");
 }

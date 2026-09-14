@@ -321,7 +321,10 @@ MML="${MML_OVERRIDE:-$MML}"
 export MODEL_SUBDIR="$SUB" SERVED_NAME="${KEY}-starfleet" TP=2 PP=1 USE_ROCE=1 \
        NEED_MB="$NEED" GPU_UTIL="$UTIL" MAX_MODEL_LEN="${MML:-32768}" MODEL_FLAGS="$FLAGS" PORT="$PORT"
 
+# ctx= is the context this member starts with when no override is set; Fleet reads it to
+# cap "Max" until the model's KV pool has been measured once (same field serve-sglang.sh
+# and serve-nemcascade.sh print).
 if [ "${DRYRUN:-0}" = 1 ]; then
-  echo "key=$KEY sub=$SUB need=${NEED}MB util=$UTIL port=$PORT served=${KEY}-starfleet flags=[$FLAGS]"; exit 0
+  echo "key=$KEY sub=$SUB need=${NEED}MB util=$UTIL ctx=${MML:-32768} port=$PORT served=${KEY}-starfleet flags=[$FLAGS]"; exit 0
 fi
 exec "$LS/run-ds4-tp2-cluster.sh"

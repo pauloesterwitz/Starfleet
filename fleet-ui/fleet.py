@@ -242,6 +242,7 @@ _ctx_native = {}       # member -> the checkpoint's own max_position_embeddings
 _ctx_sub = {}          # member -> model subdirectory, for locating its logs
 _ctx_pool = {}         # member -> {"pool": tokens the KV pool holds, "at_ctx": context measured at}
 _ctx_vision = {}       # member -> "on" | "off" | None (no vision tower / not resolvable)
+_ctx_deployed = {}     # member -> context its launcher starts it with when no override is set
 _ctx_max_lock = threading.Lock()
 
 
@@ -349,9 +350,8 @@ def observe_pools():
             if prev.get("pool") == pool and prev.get("at_ctx") == ctx:
                 continue
             _ctx_pool[member] = {"pool": pool, "at_ctx": ctx}
-            native = _ctx_native.get(member)
-            # Whichever binds first: the checkpoint's window, or the pool holding it.
-            _ctx_max[member] = min(native, pool) if native else pool
+            _ctx_max[member] = _usable_max(_ctx_native.get(member), pool,
+                                           _ctx_deployed.get(member))
         changed = True
     if changed:
         save_pool_cache()
@@ -454,6 +454,35 @@ def _vision_from(argv, has_tower):
     return "on"
 
 
+def _deployed_ctx(argv):
+    """The context a launcher starts its model with when no override is set, from its
+    own DRYRUN output: `ctx=N` (serve-sglang, serve-starfleet, serve-nemcascade) or
+    `--max-model-len N` (serve-vllm-dflash's docker run, the ds4 cluster plan).
+    None when the launcher does not report one."""
+    flat = (argv or "").replace("\\", "").replace('"', "")
+    m = re.search(r"\bctx=(\d+)", flat) or re.search(r"--max-model-len[=\s]+(\d+)", flat)
+    return int(m.group(1)) if m else None
+
+
+def _usable_max(native, pool, deployed):
+    """The largest context worth offering as "Max".
+
+    min(checkpoint window, measured KV pool) once the pool is known -- vLLM refuses at
+    startup any max_model_len its pool cannot hold, so the pool is the real ceiling.
+    Until then the launcher's configured context stands in for the pool, because the
+    checkpoint's own number can be far beyond what fits: DeepSeek-V4-Flash declares
+    1048576, and run-ds4-tp2-cluster.sh ships 32768 precisely because "a 1M KV cache
+    OOMs instantly". The model's first load measures its pool and lifts this cap.
+    """
+    if not native:
+        return pool            # no checkpoint number: only a measurement can say
+    if pool:
+        return min(native, pool)
+    if deployed:
+        return min(native, deployed)
+    return native
+
+
 def _native_max(subdir):
     """max_position_embeddings from the checkpoint's config.json.
 
@@ -515,34 +544,35 @@ def resolve_ctx_max():
             if _ctx_sub.get(model) and _ctx_native.get(model):
                 continue
         launcher, key = _launcher_and_key(cmd)
-        val = sub_ = vis = None
+        val = sub_ = vis = dep = None
         if launcher:
-            # One probe, both answers: the same DRYRUN argv names the checkpoint AND
-            # carries the multimodal limit the member will actually be started with.
+            # One probe, every answer: the same DRYRUN argv names the checkpoint, the
+            # context the member is started with, and its multimodal limit.
             sub_, argv = _model_subdir(launcher, key)
+            dep = _deployed_ctx(argv)
             if sub_:
                 val = _native_max(sub_)
                 vis = _vision_from(argv, _has_vision_tower(sub_))
         if val and key:
-            by_key[key] = (val, sub_, vis)
-        pending[model] = (key, val, sub_, vis)
+            by_key[key] = (val, sub_, vis, dep)
+        pending[model] = (key, val, sub_, vis, dep)
 
     # serve-kathryn.sh and pick-node.sh only delegate -- to the other node, or to
     # whichever node is free -- so their DRYRUN names no checkpoint locally and they
     # resolve to None. They serve the SAME launcher key as their Jean-Luc twin
     # (gemma4-26b-ct, qwen3.6-35b-mtp4, ...), and the key IS the model identity, so
     # borrow that twin's answer rather than leaving half the roster without a Max.
-    for model, (key, val, sub_, vis) in pending.items():
+    for model, (key, val, sub_, vis, dep) in pending.items():
         if not val and key and key in by_key:
-            val, sub_, vis = by_key[key]
+            val, sub_, vis, dep = by_key[key]
         with _ctx_max_lock:
             _ctx_native[model] = val
             _ctx_vision[model] = vis
+            _ctx_deployed[model] = dep
             if sub_:
                 _ctx_sub[model] = sub_
             pool = (_ctx_pool.get(model) or {}).get("pool")
-            # min(): whichever binds first, the checkpoint window or the KV pool.
-            _ctx_max[model] = min(val, pool) if (val and pool) else (val or pool)
+            _ctx_max[model] = _usable_max(val, pool, dep)
         if val:
             changed = True
     if changed:
@@ -564,8 +594,10 @@ def ctx_max_worker():
     updates its usable max on its own."""
     with _ctx_max_lock:
         _ctx_native.update(load_ctx_max_cache())
-        _ctx_max.update(_ctx_native)
         _ctx_pool.update(load_pool_cache())
+        # _ctx_max deliberately NOT seeded from the cache: until the first resolve has
+        # read each launcher's configured context, that would briefly offer the raw
+        # checkpoint window as Max -- 1048576 on ds4.
     while True:
         try:
             resolve_ctx_max()
@@ -1004,6 +1036,7 @@ class Handler(BaseHTTPRequestHandler):
             with _ctx_max_lock:
                 maxes, natives, pools = dict(_ctx_max), dict(_ctx_native), dict(_ctx_pool)
                 visions = dict(_ctx_vision)
+                deployeds = dict(_ctx_deployed)
             snap["models"] = [
                 {
                     "id": m,
@@ -1016,6 +1049,7 @@ class Handler(BaseHTTPRequestHandler):
                     "ctx_capable": m in wired,
                     "ctx_max": maxes.get(m),
                     "ctx_native": natives.get(m),
+                    "ctx_deployed": deployeds.get(m),
                     "vision": visions.get(m),
                     "effort": read_effort(m),
                     "effort_options": [o["label"] for o in (_effort_opts.get(m) or [])],
@@ -1193,6 +1227,17 @@ def selfcheck():
     assert _vision_from('--limit-mm-per-prompt \\{\\"image\\":0,\\"video\\":0\\}', True) == "off"
     assert _vision_from("--kv-cache-dtype fp8", True) == "on"      # no flag -> engine default
     assert _vision_from("--kv-cache-dtype fp8", False) is None     # no tower -> nothing to say
+    # Max before any KV measurement is the launcher's configured context, never the raw
+    # checkpoint window: ds4 declares 1048576 and ships 32768 because 1M OOMs.
+    assert _usable_max(1048576, None, 32768) == 32768
+    assert _usable_max(1048576, 409536, 32768) == 409536       # a measured pool wins
+    assert _usable_max(262144, 409536, 16384) == 262144        # never past the checkpoint
+    assert _usable_max(262144, None, None) == 262144
+    assert _usable_max(None, None, 409600) is None             # no checkpoint number
+    assert _deployed_ctx("key=q sub=S need=1MB ctx=16384 port=1") == 16384
+    assert _deployed_ctx('docker run x --max-model-len "32768" --tp 2') == 32768
+    assert _deployed_ctx("--max-model-len 262144 --max-num-seqs 4") == 262144
+    assert _deployed_ctx("key=q sub=S flags=[--kv-cache-dtype fp8]") is None
     assert _launcher_and_key("/x/ctx-env.sh m /x/ds4-tp2-proxy-guard.sh") == (
         "/x/ds4-tp2-proxy-guard.sh", "")
     assert _launcher_and_key("/x/ctx-env.sh m /x/render-guard.sh /x/memcheck.sh 1 /x/serve-ds4.sh --port 1") == (
