@@ -1,0 +1,12 @@
+[Unit]
+Description=Fleet — llama-swap UI + Starfleet cluster resources
+After=llama-swap.service
+Wants=llama-swap.service
+
+[Service]
+ExecStart=/usr/bin/python3 -u /home/pauloesterwitz/fleet-ui/fleet.py --port 8090
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

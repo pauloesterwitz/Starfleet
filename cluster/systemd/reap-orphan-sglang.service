@@ -1,0 +1,6 @@
+[Unit]
+Description=Reap orphaned sglang-tp2 containers whose launcher died
+
+[Service]
+Type=oneshot
+ExecStart=/home/pauloesterwitz/llama-swap/reap-orphan-sglang.sh

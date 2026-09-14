@@ -1,0 +1,61 @@
+# Files this repo deploys to the cluster:   <repo path>   <host path>   <nodes...>
+#
+# Deploy and verify with cluster/sync-hosts.sh (check | pull | push).
+#
+# Jean-Luc is the cluster's source of truth. kathryn-sync.timer mirrors ~/llama-swap
+# and ~/ds4 from Jean-Luc to Kathryn hourly with --delete, so those files are listed
+# for jean-luc only -- pushing them to Kathryn directly would be overwritten anyway.
+# ~/bin is NOT mirrored, hence both nodes for the status tools the app runs over ssh.
+#
+# The boundary is "everything the running fleet executes": the closure of what
+# config.yaml, ctxproxy, fleet.py and the systemd timers invoke. Deliberately not
+# tracked: the llama-swap binary, the ~40 bench / retest / diag one-offs, run logs,
+# result tables and notes in ~/llama-swap, and obsolete launchers (m3ar, minimax-tp2,
+# ollama) that no member uses.
+
+# ---- Fleet UI (served by fleet-ui.service)
+fleet-ui/fleet.py                               ~/fleet-ui/fleet.py                            jean-luc
+fleet-ui/fleet.html                             ~/fleet-ui/fleet.html                          jean-luc
+
+# ---- status tools the Mac app runs on each node over ssh
+cluster/opencode-status.py                      ~/bin/opencode-status.py                       jean-luc kathryn
+cluster/opencode-export-tail.py                 ~/bin/opencode-export-tail.py                  jean-luc kathryn
+
+# ---- opencode integration
+cluster/opencode-sync-model-limits.py           ~/bin/opencode-sync-model-limits.py            jean-luc
+cluster/opencode/merge-system-llamaswap.mjs     ~/.config/opencode/merge-system-llamaswap.mjs  jean-luc
+
+# ---- llama-swap: config, request proxy, and every launcher a member's cmd runs
+cluster/llama-swap/config.yaml                  ~/llama-swap/config.yaml                       jean-luc
+cluster/llama-swap/ctxproxy.py                  ~/llama-swap/ctxproxy.py                       jean-luc
+cluster/llama-swap/ctx-env.sh                   ~/llama-swap/ctx-env.sh                        jean-luc
+cluster/llama-swap/memcheck.sh                  ~/llama-swap/memcheck.sh                       jean-luc
+cluster/llama-swap/render-guard.sh              ~/llama-swap/render-guard.sh                   jean-luc
+cluster/llama-swap/reclaim-dflash.sh            ~/llama-swap/reclaim-dflash.sh                 jean-luc
+cluster/llama-swap/reap-orphan-sglang.sh        ~/llama-swap/reap-orphan-sglang.sh             jean-luc
+cluster/llama-swap/pick-node.sh                 ~/llama-swap/pick-node.sh                      jean-luc
+cluster/llama-swap/gpujob-run                   ~/llama-swap/gpujob-run                        jean-luc
+cluster/llama-swap/serve-vllm-dflash.sh         ~/llama-swap/serve-vllm-dflash.sh              jean-luc
+cluster/llama-swap/serve-starfleet.sh           ~/llama-swap/serve-starfleet.sh                jean-luc
+cluster/llama-swap/serve-sglang.sh              ~/llama-swap/serve-sglang.sh                   jean-luc
+cluster/llama-swap/serve-nemcascade.sh          ~/llama-swap/serve-nemcascade.sh               jean-luc
+cluster/llama-swap/serve-kathryn.sh             ~/llama-swap/serve-kathryn.sh                  jean-luc
+cluster/llama-swap/serve-kathryn-nemcascade.sh  ~/llama-swap/serve-kathryn-nemcascade.sh       jean-luc
+cluster/llama-swap/serve-embed.sh               ~/llama-swap/serve-embed.sh                    jean-luc
+cluster/llama-swap/ds4-tp2-proxy-guard.sh       ~/llama-swap/ds4-tp2-proxy-guard.sh            jean-luc
+cluster/llama-swap/run-single-node.sh           ~/llama-swap/run-single-node.sh                jean-luc
+cluster/llama-swap/run-sglang-tp2-cluster.sh    ~/llama-swap/run-sglang-tp2-cluster.sh         jean-luc
+cluster/llama-swap/run-ds4-tp2-cluster.sh       ~/llama-swap/run-ds4-tp2-cluster.sh            jean-luc
+cluster/ds4/serve-ds4.sh                        ~/ds4/serve-ds4.sh                             jean-luc
+
+# ---- Jean-Luc -> Kathryn mirror
+cluster/kathryn-sync.sh                         ~/.local/bin/kathryn-sync.sh                   jean-luc
+
+# ---- systemd user units (after pushing one: systemctl --user daemon-reload)
+cluster/systemd/llama-swap.service              ~/.config/systemd/user/llama-swap.service          jean-luc
+cluster/systemd/llama-swap-ctxproxy.service     ~/.config/systemd/user/llama-swap-ctxproxy.service jean-luc
+cluster/systemd/fleet-ui.service                ~/.config/systemd/user/fleet-ui.service            jean-luc
+cluster/systemd/reap-orphan-sglang.service      ~/.config/systemd/user/reap-orphan-sglang.service  jean-luc
+cluster/systemd/reap-orphan-sglang.timer        ~/.config/systemd/user/reap-orphan-sglang.timer    jean-luc
+cluster/systemd/kathryn-sync.service            ~/.config/systemd/user/kathryn-sync.service        jean-luc
+cluster/systemd/kathryn-sync.timer              ~/.config/systemd/user/kathryn-sync.timer          jean-luc

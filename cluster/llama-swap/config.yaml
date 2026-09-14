@@ -1,0 +1,716 @@
+# llama-swap — DGX Spark GB10 (121 GiB unified pool)
+# One OpenAI-compatible endpoint arbitrating the GB10 pool between:
+#   - spark-big  (ds4 + the 80-86GB ollama models qwen3.5-122b / mistral-medium-3.5 /
+#     nemotron-3-super): EXCLUSIVE, one at a time — never co-resident with anything.
+#   - spark-small (qwen3.6-35b-dflash, gemma4-26b-dflash, small ollama models): CO-RESIDENT up to memory.
+#     memcheck refuses a load that won't fit (clean error, never OOM); idle vLLM models unload via ttl.
+#
+# Start:  ~/llama-swap/llama-swap -config ~/llama-swap/config.yaml -watch-config
+# Use:    curl http://127.0.0.1:28080/v1/chat/completions -d '{"model":"deepseek-v4-flash",...}'
+#         curl http://127.0.0.1:28080/v1/chat/completions -d '{"model":"gemma4:26b",...}'
+#
+# DYNAMIC CONTEXT SIZE (2026-08-21). Every member's cmd is prefixed with
+#   ctx-env.sh <member>
+# which reads ~/.gb10/ctx/<member> and exports MML_OVERRIDE / MAX_MODEL_LEN before exec'ing the
+# rest of the chain. Callers set that file by going through ctxproxy.py on :28081 instead of
+# :28080 and suffixing the model with @<tokens> (or sending an X-Context-Size header):
+#         curl http://127.0.0.1:28081/v1/chat/completions \
+#              -d '{"model":"qwen3.6-35b-85tps-mtp4-jean-luc@32768",...}'
+# A DIFFERENT size than last time unloads the member so it reloads at the new context, i.e. it
+# costs a cold load. The same size restarts nothing. Requests without a size, and everything
+# still pointed at :28080, behave exactly as before.
+# util / need_mb are NOT recomputed for the new context: a bigger KV cache comes out of the same
+# tuned pool, and vLLM fails at startup (clean, not an OOM) if it does not fit.
+# ADDING A MEMBER: put `ctx-env.sh <its own name>` first in its cmd, or ctxproxy 400s the @size
+# for it. Skipped on purpose: nomic-embed-text, embeddinggemma, imagegen.
+
+# ds4 loads ~81GB into the GB10 pool on first request; give startup plenty of time.
+# (healthCheckTimeout is a GLOBAL setting in llama-swap, not per-model.)
+# RAISED 1200 -> 2400 on 2026-08-10: 1200s was not enough for the big TP=2 members and hy3
+# could never load at all. MEASURED cold loads that day: qwen3.5-122b 1150s, qwen3-235b 1218s
+# (i.e. already AT the old ceiling), and hy3 at 168 GiB blew straight through it -> llama-swap
+# killed it with 'health check timed out after 20m0s'. Do not lower this back without
+# re-measuring the largest member's cold load.
+healthCheckTimeout: 2400
+
+# HTTP proxy timeouts. responseHeader is time to first byte from upstream — set to 0
+# (unlimited) so 256K-context prefills (~776s on GB10) don't return 502 Bad Gateway.
+# idleConn controls idle keep-alive connections.
+timeouts:
+  responseHeader: 0
+  idle: 0
+  idleConn: 120
+
+models:
+  # REACTIVATED 2026-08-26 (Paul): wanted DeepSeek V4 Flash back. Was DEPRECATED 2026-07-27 only
+  # because the ollama backend it sat next to got turned off, not because ds4 itself broke.
+  # antirez ds4 engine, IQ2_XXS routed-expert quant on CUDA/GB10. ds4flash.gguf is the
+  # symlink download_model.sh created -> the 80.8 GiB chat-v2-imatrix GGUF.
+  # serve-ds4.sh evicts any loaded Ollama models first (airtight exclusivity), then
+  # exec's ds4-server with the flags below baked in. ${PORT} is assigned by llama-swap.
+  # memcheck.sh refuses (exit 1 -> llama-swap errors) if ds4 won't fit the pool
+  # right now, instead of loading ~108GB into it and OOM-killing the box. It
+  # counts ollama as reclaimable (serve-ds4.sh evicts it, harmless no-op now that ollama
+  # is gone entirely) and subtracts any live image/video reservation (gate.py).
+  # reclaim-dflash.sh force-removes a leaked DFlash vLLM container (exclusive group) before
+  # memcheck, so an orphaned container can't block/OOM ds4. exec chain preserves the PID.
+  # EXCLUSIVE (spark-big, below): loading this evicts whatever else is on Jean-Luc's pool
+  # (spark-small), and vice versa — 80.8 GiB doesn't leave room to co-reside with anything.
+  deepseek-v4-flash:
+    cmd: /home/pauloesterwitz/llama-swap/ctx-env.sh deepseek-v4-flash /home/pauloesterwitz/llama-swap/render-guard.sh /home/pauloesterwitz/llama-swap/reclaim-dflash.sh /usr/bin/env MEMCHECK_RECLAIM_OLLAMA=1 /home/pauloesterwitz/llama-swap/memcheck.sh 108000 /home/pauloesterwitz/ds4/serve-ds4.sh --port ${PORT}
+    proxy: http://127.0.0.1:${PORT}
+    # ds4-server has NO /health endpoint; point llama-swap's readiness probe at
+    # /v1/models, which returns 200 exactly when ds4 has finished loading and can serve.
+    checkEndpoint: /v1/models
+    # ponytail: idle-unload after 15 min so a stray vane/opencode trigger can't squat 81 GiB
+    # indefinitely. Drop this to pin ds4 resident if you're running a long ds4-only session.
+    ttl: 900
+    # Strip OpenAI parameters ds4-server doesn't support (avoids 400 errors from opencode).
+    filters:
+      stripParams: "store,metadata,service_tier,parallel_tool_calls,user,presence_penalty,frequency_penalty,logit_bias,logprobs,top_logprobs,n"
+
+  # DEPRECATED 2026-07-27 (Paul): ollama backend off — vLLM only
+  # ollama:
+    # Proxy to the EXISTING `ollama serve` daemon on :11434 (started outside llama-swap,
+    # 5-day uptime; other tools hit it directly). llama-swap requires every group member to
+    # have a cmd, so we give it a harmless placeholder process and point `proxy`/`checkEndpoint`
+    # at the real daemon. Killing the placeholder on swap-out costs nothing; switching to an
+    # Ollama model still evicts ds4 via the exclusive group. (llama-swap can't evict Ollama's
+    # OWN loaded models — for airtight "never co-resident" see the ds4 wrapper option in chat.)
+    # CO-RESIDENT with the vLLM DFlash models now (same spark-small group), so we must NOT evict
+    # their containers — just a harmless placeholder. ollama's own daemon is memory-aware and won't
+    # over-commit against resident vLLM VRAM. Loading ds4 (spark-big, exclusive) still evicts ollama.
+  #   cmd: /home/pauloesterwitz/llama-swap/render-guard.sh sleep infinity
+  #   proxy: http://127.0.0.1:11434
+  #   checkEndpoint: /api/tags
+    # Requested model name passes straight through to the daemon (no useModelName).
+    # (qwen3.5:122b, mistral-medium-3.5, nemotron-3-super moved to their own EXCLUSIVE spark-big
+    #  members above — they're 80-86GB and must never co-reside. Small ollama models stay here.)
+  #   aliases:
+  #     - qwen3.6:35b-a3b-q8_0
+  #     - qwen3-vl:32b
+  #     - nemotron-3-nano:30b
+  #     - gpt-oss:120b
+  #     - gpt-oss:20b
+  #     - qwen3-coder-next:q4_K_M
+  #     - gemma4:31b
+  #     - gemma4:26b
+  #     - gemma4:e4b
+  #     - nemotron-cascade-2:latest
+  #     - llava:latest
+  #     - nomic-embed-text:latest
+  #     - embeddinggemma:latest
+  #     - qwen3-vl:8b
+  #     - qwen3-vl-wiki:latest
+
+  # gemma4-26b-dflash RETIRED 2026-07-20: it was the DFlash speculative-decoding member, and DFlash is
+  # being dropped ("not working well for agentic coding") — its draft weights are deleted. It was also
+  # strictly superseded: gemma4-26b-54tps-jean-luc serves the SAME base model at 54.0 tok/s vs 27.7.
+  # The nvidia NVFP4 weights + the `gemma4-26b` KEY remain, so it can be re-added draft-free if wanted.
+
+  # ── qwen3.6-35b NVFP4 — Paul's fast default, SINGLE-NODE, node SELECTABLE (JL here / Kathryn below) ──
+  # MEASURED 2026-07-17: single-node 27.1 tok/s BEATS TP=2's 23.6 — only ~3B active params/token, so
+  # there is almost nothing for tensor-parallel to split and the per-token cross-node all-reduce is pure
+  # loss. So it runs on ONE Spark; pick the node by requesting -jl or -kathryn. (ds4-tp2-vs-pp-results.md)
+  # Only the MTP spec-4 recipe (57.1 tok/s, FINAL-results-table.md row 1) is served — the plain 27.1
+  # non-MTP members were REMOVED 2026-07-27 as strictly-slower duplicates of the same weights.
+
+  # Jean-Luc's pool, co-resident (spark-small). need_mb 43000 tracks util 0.35 (~42 GiB = ~22 GiB
+  # weights + fp8 KV). nightly image (v0.21 lacks Qwen3_5MoeForConditionalGeneration). ttl unloads idle.
+  qwen3.6-35b-85tps-mtp4-jean-luc:
+    cmd: /home/pauloesterwitz/llama-swap/ctx-env.sh qwen3.6-35b-85tps-mtp4-jean-luc /home/pauloesterwitz/llama-swap/render-guard.sh /home/pauloesterwitz/llama-swap/memcheck.sh 43000 /home/pauloesterwitz/llama-swap/serve-vllm-dflash.sh qwen3.6-35b-mtp4 --port ${PORT}
+    proxy: http://127.0.0.1:${PORT}
+    ttl: 600
+    checkEndpoint: /health
+    useModelName: qwen3.6-35b-mtp4-nvfp4
+
+  # ── Qwen3.8-27B NVFP4 — DENSE hybrid (48/64 linear-attn + 16 full), MTP K=3, wired 2026-08-18 ──
+  # 13.6 tok/s MEASURED AS SERVED (CUDA graphs on, MTP K=3, 262144 ctx, util 0.45) — not the sweep's
+  # 12.9, which was eager at ctx 32768. SINGLE-NODE on purpose: see the measured TP=2 post-mortem
+  # further down (it is both slower and unstable at these settings). MTP K=3 is the sweep optimum —
+  # K=1 11.1, K=2 11.5, K=3 12.9, K=4 11.9, K=5 11.7 — a genuine peak, and acceptance is 2.12 of a
+  # possible 4.0.
+  # CONCURRENCY: 201.6 tok/s aggregate at 32 in flight (per-request still 6.8). That needed
+  # --max-num-seqs 32 in serve-vllm-dflash.sh — the shared default of 4 was capping aggregate at
+  # ~48 and the earlier "~47 aggregate" note was measuring that cap, not the hardware. Weights are
+  # read once per forward pass regardless of batch size on a bandwidth-bound box, so batching is
+  # nearly free: prefer ONE llama-swap endpoint with many concurrent requests over serialising them.
+  # Ceiling note: per-decode read is 12.76 GiB body + 2.37 GiB BF16 lm_head = 15.13 GiB, so at the
+  # GB10's 273 GB/s the no-MTP roofline is ~16.8 tok/s. Quantizing lm_head to NVFP4 would cut 2.07
+  # GiB/step and lift that to ~19.5 — the biggest remaining win, and a checkpoint job, not a flag.
+  # need_mb 55000 tracks util 0.45 (~54.8 GiB) — see the fit math in serve-vllm-dflash.sh.
+  qwen3.8-27b-19tps-jean-luc:
+    cmd: /home/pauloesterwitz/llama-swap/ctx-env.sh qwen3.8-27b-19tps-jean-luc /home/pauloesterwitz/llama-swap/render-guard.sh /home/pauloesterwitz/llama-swap/memcheck.sh 55000 /home/pauloesterwitz/llama-swap/serve-vllm-dflash.sh qwen3.8-27b --port ${PORT}
+    proxy: http://127.0.0.1:${PORT}
+    ttl: 600
+    checkEndpoint: /health
+    useModelName: qwen3.8-27b-nvfp4
+    aliases:
+      - qwen3.8-27b
+      - Qwen3.8-27B-NVFP4
+
+  # SAME checkpoint and tuning as the member above, with the vision encoder ENABLED (image:1).
+  # Added 2026-08-20 on Paul's instruction ("we will also use the vision tower"). Reasoning stays
+  # on here too. UNMEASURED: the vision encoder reserves activation memory the text-only rows never
+  # paid for, so the 13.6 tok/s figure does NOT apply — re-bench before quoting a number, and
+  # re-check need_mb 55000, which was sized for the text-only path.
+  # Same two-member pattern as qwen3vl32 / qwen3vl32-vision in the starfleet group: keep the fast
+  # text-only member as the default and reach for this one only when images are actually involved.
+  qwen3.8-27b-vision-jean-luc:
+    cmd: /home/pauloesterwitz/llama-swap/ctx-env.sh qwen3.8-27b-vision-jean-luc /home/pauloesterwitz/llama-swap/render-guard.sh /home/pauloesterwitz/llama-swap/memcheck.sh 55000 /home/pauloesterwitz/llama-swap/serve-vllm-dflash.sh qwen3.8-27b-vision --port ${PORT}
+    proxy: http://127.0.0.1:${PORT}
+    ttl: 600
+    checkEndpoint: /health
+    useModelName: qwen3.8-27b-vision-nvfp4
+    aliases:
+      - qwen3.8-27b-vision
+
+  # Same weights/flags on Kathryn. 13.6 is the JEAN-LUC number (identical GB10 hardware) — this
+  # member is UNMEASURED, because Kathryn's LAN interface was down when it was wired.
+  qwen3.8-27b-20tps-kathryn:
+    cmd: /home/pauloesterwitz/llama-swap/ctx-env.sh qwen3.8-27b-20tps-kathryn /home/pauloesterwitz/llama-swap/serve-kathryn.sh qwen3.8-27b 55000 --port ${PORT}
+    proxy: http://127.0.0.1:${PORT}
+    ttl: 600
+    checkEndpoint: /health
+    useModelName: qwen3.8-27b-nvfp4
+
+  # Kathryn twin of qwen3.8-27b-vision-jean-luc — same weights/flags, key already dispatched by
+  # serve-vllm-dflash.sh's shared qwen3.8-27b|qwen3.8-27b-vision case, so serve-kathryn.sh needs no
+  # changes. Added 2026-08-26 so the vision member isn't Jean-Luc-only like every other single-node
+  # model in this fleet. UNMEASURED (inherits the vision member's own UNMEASURED caveat).
+  qwen3.8-27b-vision-kathryn:
+    cmd: /home/pauloesterwitz/llama-swap/ctx-env.sh qwen3.8-27b-vision-kathryn /home/pauloesterwitz/llama-swap/serve-kathryn.sh qwen3.8-27b-vision 55000 --port ${PORT}
+    proxy: http://127.0.0.1:${PORT}
+    ttl: 600
+    checkEndpoint: /health
+    useModelName: qwen3.8-27b-vision-nvfp4
+
+  # ── KATHRYN's pool (the second Spark) — reached over ssh, arbitrated by HER memcheck ──
+  # serve-kathryn.sh ssh's to kathryn.fritz.box, runs HER memcheck.sh against HER 121GB pool, starts
+  # the container there, and tunnels her loopback port back here. Jean-Luc's memcheck deliberately
+  # does NOT gate these: the memory is on the other machine. See the `kathryn` group below —
+  # exclusive:false, so loading this NEVER evicts ds4/nemotron here, and they never evict it.
+  # REMOVED 2026-07-27: gemma4-31b-nvfp4-kathryn (10.4 tok/s single) — the TP=2 member
+  # gemma4-31b-19tps-starfleet serves the same weights at 18.6 (FINAL-results-table.md row 10)
+  # and now carries the Gemma-4-31B-IT-NVFP4 alias.
+  # SAME model on KATHRYN alone — selecting this member vs the -jean-luc one chooses the node. serve-
+  # kathryn.sh ssh's over, runs HER memcheck (gates HER pool) + serve-vllm-dflash.sh, and tunnels the
+  # loopback port back here. kathryn group is exclusive:false (never evicts Jean-Luc) + swap:true.
+  # Native MTP spec=4 (Paul 2026-07-22): 57.1 tok/s single-node, the fast one.
+  qwen3.6-35b-87tps-mtp4-kathryn:
+    cmd: /home/pauloesterwitz/llama-swap/ctx-env.sh qwen3.6-35b-87tps-mtp4-kathryn /home/pauloesterwitz/llama-swap/serve-kathryn.sh qwen3.6-35b-mtp4 43000 --port ${PORT}
+    proxy: http://127.0.0.1:${PORT}
+    checkEndpoint: /health
+    ttl: 600
+    useModelName: qwen3.6-35b-mtp4-nvfp4
+
+  # Same dynamic node pick, but the MTP spec-4 recipe — 57.1 tok/s instead of 27.1. Added
+  # 2026-07-27: the auto-node convenience member only existed in the SLOW non-MTP flavour,
+  # so anything that wanted "just give me qwen3.6-35b on whichever Spark is free" silently
+  # got half the throughput. Both serve scripts already accept the qwen3.6-35b-mtp4 key.
+  qwen3.6-35b-86tps-mtp4-fastest-node:
+    cmd: /home/pauloesterwitz/llama-swap/ctx-env.sh qwen3.6-35b-86tps-mtp4-fastest-node /home/pauloesterwitz/llama-swap/pick-node.sh qwen3.6-35b-mtp4 43000 --port ${PORT}
+    proxy: http://127.0.0.1:${PORT}
+    checkEndpoint: /health
+    ttl: 600
+    useModelName: qwen3.6-35b-mtp4-nvfp4
+
+  # ══ gemma-4-26B-A4B (prithiv compressed-tensors NVFP4A16) — THE ONE FASTEST-ONLY EXCEPTION ══
+  # MEASURED 2026-07-20: 46.2 tok/s single-node / 48.2 TP=2 (agg@16: 331.7 single vs 453.8 TP=2).
+  # Every OTHER model in this config is served in its single fastest configuration only. gemma-4-26B
+  # keeps all four (Paul, 2026-07-27): TP=2 buys just +2 tok/s (+4%) but costs BOTH Sparks, so the
+  # node choice is worth more than the win. Pick by member name:
+  #   -fastest-node  = whichever Spark has the most free memory right now (the sane default)
+  #   -jean-luc / -kathryn = force a node (keep the other Spark free for something else)
+  #   -48tps-starfleet     = TP=2 across both, for the +2 tok/s / 453.8 aggregate @16 concurrent
+  gemma4-26b-56tps-fastest-node:
+    cmd: /home/pauloesterwitz/llama-swap/ctx-env.sh gemma4-26b-56tps-fastest-node /home/pauloesterwitz/llama-swap/pick-node.sh gemma4-26b-ct 50000 --port ${PORT}
+    proxy: http://127.0.0.1:${PORT}
+    ttl: 600
+    checkEndpoint: /health
+    useModelName: gemma4-26b-ct-nvfp4
+
+  gemma4-26b-54tps-jean-luc:
+    cmd: /home/pauloesterwitz/llama-swap/ctx-env.sh gemma4-26b-54tps-jean-luc /home/pauloesterwitz/llama-swap/render-guard.sh /home/pauloesterwitz/llama-swap/memcheck.sh 50000 /home/pauloesterwitz/llama-swap/serve-vllm-dflash.sh gemma4-26b-ct --port ${PORT}
+    proxy: http://127.0.0.1:${PORT}
+    ttl: 600
+    checkEndpoint: /health
+    useModelName: gemma4-26b-ct-nvfp4
+
+  gemma4-26b-57tps-kathryn:
+    cmd: /home/pauloesterwitz/llama-swap/ctx-env.sh gemma4-26b-57tps-kathryn /home/pauloesterwitz/llama-swap/serve-kathryn.sh gemma4-26b-ct 50000 --port ${PORT}
+    proxy: http://127.0.0.1:${PORT}
+    ttl: 600
+    checkEndpoint: /health
+    useModelName: gemma4-26b-ct-nvfp4
+
+  # ── Big ollama models — EXCLUSIVE (spark-big): 80-86GB each, never co-resident with anything ──
+  # Each is its own llama-swap member (can't group individual ollama tags otherwise). The wrapper
+  # evicts all other ollama models on load and on swap-out; memcheck (RECLAIM_OLLAMA=1) gates the
+  # fit -> clean error, never OOM; reclaim-dflash clears any leaked vLLM container first.
+  # DEPRECATED 2026-07-27 (Paul): ollama backend off — vLLM only
+  # qwen3.5-122b:
+  #   cmd: /home/pauloesterwitz/llama-swap/render-guard.sh /home/pauloesterwitz/llama-swap/reclaim-dflash.sh /usr/bin/env MEMCHECK_RECLAIM_OLLAMA=1 /home/pauloesterwitz/llama-swap/memcheck.sh 85000 /home/pauloesterwitz/llama-swap/serve-ollama-exclusive.sh
+  #   proxy: http://127.0.0.1:11434
+  #   checkEndpoint: /api/tags
+  #   ttl: 1800
+    # Rewrite the upstream model name to the real ollama tag, so requesting the
+    # MEMBER name (qwen3.5-122b) also resolves — not just the tag aliases.
+  #   useModelName: qwen3.5:122b
+  #   aliases:
+  #     - qwen3.5:122b
+  #     - qwen3.5:122b-a10b-q4_K_M
+
+  # DEPRECATED 2026-07-27 (Paul): ollama backend off — vLLM only
+  # mistral-medium-3.5:
+  #   cmd: /home/pauloesterwitz/llama-swap/render-guard.sh /home/pauloesterwitz/llama-swap/reclaim-dflash.sh /usr/bin/env MEMCHECK_RECLAIM_OLLAMA=1 /home/pauloesterwitz/llama-swap/memcheck.sh 84000 /home/pauloesterwitz/llama-swap/serve-ollama-exclusive.sh
+  #   proxy: http://127.0.0.1:11434
+  #   checkEndpoint: /api/tags
+  #   ttl: 1800
+  #   useModelName: mistral-medium-3.5:latest
+  #   aliases:
+  #     - mistral-medium-3.5:latest
+
+  # DEPRECATED 2026-07-27 (Paul): ollama backend off — vLLM only
+  # nemotron-3-super:
+  #   cmd: /home/pauloesterwitz/llama-swap/render-guard.sh /home/pauloesterwitz/llama-swap/reclaim-dflash.sh /usr/bin/env MEMCHECK_RECLAIM_OLLAMA=1 /home/pauloesterwitz/llama-swap/memcheck.sh 90000 /home/pauloesterwitz/llama-swap/serve-ollama-exclusive.sh
+  #   proxy: http://127.0.0.1:11434
+  #   checkEndpoint: /api/tags
+  #   ttl: 1800
+  #   useModelName: nemotron-3-super:latest
+  #   aliases:
+  #     - nemotron-3-super:latest
+  #     - nemotron-3-super:120b
+
+  # ── DeepSeek-V4-Flash-NVFP4, TP=2 across BOTH Sparks (vLLM + Ray + RoCE) — PROXY ONLY ──
+  # The cluster is started OUT OF BAND:  systemctl --user start ds4-tp2   (~14min cold load; it owns
+  # BOTH Sparks, ~98G Jean-Luc + ~95G Kathryn; Kathryn's worker is started automatically over ssh).
+  # llama-swap does NOT lifecycle-manage it: a 2-node Ray cluster is too fragile to hot-swap, and a
+  # 14-minute load would hang any client long before it answered. Same placeholder trick as `ollama`
+  # above. ds4-tp2-proxy-guard.sh fast-fails with a hint if the cluster isn't up — otherwise llama-swap
+  # would sit on the failing checkEndpoint for the whole 2400s healthCheckTimeout and look hung.
+  # DISTINCT from `deepseek-v4-flash` above (antirez ds4 engine, IQ2_XXS GGUF, single-node) — same
+  # model family, different engine + quant. MEASURED 2026-07-17: 18.5 tok/s single-stream, 105.4 agg
+  # @16 concurrent; beats PP=2 on every axis. Details: ~/llama-swap/ds4-tp2-vs-pp-results.md
+  # REACTIVATED 2026-08-26 (Paul), and now FULLY llama-swap-managed (was proxy-only).
+  # Selecting it in opencode STARTS the cluster; no `systemctl --user start ds4-tp2` needed.
+  # ds4-tp2-proxy-guard.sh parks-and-proxies if a cluster is already up (systemd preload stays
+  # respected) and otherwise launches one it owns, so eviction and ttl free both Sparks.
+  # Moved into the `starfleet` group below: like every other member there it occupies BOTH Sparks,
+  # so swap:true must evict the previous cluster model on switch. It sat in its own group only
+  # because systemd, not llama-swap, used to own its lifecycle.
+  # MEASURED 2026-08-26: 18.6 tok/s single-stream, 106.1 aggregate @16, cold load 931s.
+  ds4-nvfp4-tp2:
+    cmd: /home/pauloesterwitz/llama-swap/ctx-env.sh ds4-nvfp4-tp2 /home/pauloesterwitz/llama-swap/ds4-tp2-proxy-guard.sh
+    proxy: http://127.0.0.1:8000
+    checkEndpoint: /v1/models
+    # ttl 3600, NOT the starfleet-standard 900. RULE: never set a ttl shorter than the cold load.
+    # This model takes 931s to load, so a 900s idle-unload would spend more wall clock loading than
+    # serving and re-load on the next stray request. Pin it resident with ttl: 0 for a long session.
+    ttl: 3600
+    aliases:
+      - deepseek-v4-19tps-starfleet   # descriptive legacy name; real measured figure is 18.6 tok/s
+
+  # gemma4-26b-48tps-starfleet REMOVED 2026-08-26 (Paul): TP=2 is now SLOWER than single-node
+  # for this model — 43.5 tok/s across both Sparks vs 54-57 on one. CUDA graphs are worth
+  # +17..52% single-node but break TP=2 on this hardware (vllm#41530/#40969, every graph mode
+  # either crashes or is slower — retested 2026-08-25 on a healthy GPU). So two Sparks buy
+  # nothing here. Use gemma4-26b-46tps-{jean-luc,kathryn,fastest-node} instead.
+
+  # REMOVED 2026-07-27: qwen3.5-122b-21tps-starfleet (21 tok/s, no MTP) — superseded by the
+  # MTP spec-3 member below at 40.3 (FINAL-results-table.md row 4).
+
+  # ── The fleet's FIRST SGLang member. Everything else here is vLLM. ────────────────────────
+  # Qwen3.8-Flash-Next (125B total / 6B active MoE + a 51B-param PLE n-gram table), TP=2 across
+  # BOTH Sparks. 37.4 tok/s untuned (2026-08-28) -> 49.4 tok/s with MTP K=3 (2026-08-29 sweep,
+  # see serve-sglang.sh for the full table) — ahead of nemotron-120b-mtp3 (36.1) and
+  # minimax-awq (36.8).
+  # REAL-WORLD, from 248 decode samples of a live 2026-09-02 session at ~254K context
+  # (~170K tokens resident): throughput p25 32.0 / median 37.9 / p75 50.2 tok/s, and acceptance
+  # p25 1.90 / median 2.38 / max 4.00. Two things worth knowing from that: 49.4 is the SHORT-
+  # CONTEXT best case, and speculation actually works BETTER on real text than on the benchmark
+  # prompts (acceptance 2.38 vs 1.75) — the throughput you lose at long context is the KV cache,
+  # not worse drafting.
+  # WHY SGLANG AND NOT vLLM: vLLM cannot fit this model on two Sparks, structurally. It expands
+  # the PLE table to BF16 (~95GB) on rank 0 and OOM'd at ~116/121GB across five configurations
+  # and three different quants. SGLang keeps the table in fp8 AND shards it across the TP group
+  # (VocabParallelEmbedding), so the load is balanced: peaks JL 102GB / KA 97GB, no OOM.
+  # IMAGE (HISTORICAL — RETIRED 2026-09-07, this build corrupts decode on GB10; now serving
+  # lmsysorg/sglang:dev-qwen38-next-local unpatched):
+  # IMAGE: sglang-qwen38fn-gb10:local — the stock lmsysorg/sglang:qwen38flashnext plus a ONE-LINE
+  # GB10 patch (~/vllm-ray-build/Dockerfile.sglang-gb10). Upstream gates its fast QSA decode on
+  # is_sm100_supported(); GB10 is sm_121, so it fell through to an FA4 cute kernel that cannot
+  # JIT-compile here (MLIRError). The patch lets sm_12x take the trtllm-gen path. Without it this
+  # model does not serve at all on this hardware — see run-sglang-tp2-cluster.sh for the full story.
+  # PARSERS: reasoning=qwen3-thinking (NOT plain qwen3 — this model emits a closing </think> with
+  # no opening tag, and the qwen3 parser then leaks raw chain-of-thought into content, the same
+  # bug the Qwen3-VL members hit), tool-call=qwen3_coder for opencode's tool_choice:"auto".
+  # Occupies BOTH Sparks, so it belongs to the starfleet group and evicts other cluster members.
+  # SUPERSEDED 2026-09-07 evening — MTP IS BACK ON, and the real culprit was our own image.
+  # The corruption came from Dockerfile.sglang-gb10 widening _resolve_trtllm_sparse_decode() to
+  # sm_121; upstream now ships a native GB10 kernel (qwen38_qsa_sm121_varlen) and warns in-code
+  # against exactly that widening. Now serving lmsysorg/sglang:dev-qwen38-next-local UNPATCHED
+  # with MTP K=1. MEASURED on the production path: 0 collapses in 80 samples, 0 bad long-context
+  # stages (2k->100k), tool calls 3/3, 48.9 tok/s (was 37-38). Losslessness is unprovable here --
+  # see serve-sglang.sh. The stale note below is kept because its measurements were real ON THE
+  # PATCHED IMAGE:
+  # MTP REMOVED 2026-09-07 — IT CORRUPTED OUTPUT. With --speculative-algorithm NEXTN, 6 of 10
+  # reasoning-heavy requests degenerated into a run of "!" (token id 0: NaN logits, and every
+  # comparison against NaN is false, so argmax returns index 0). Without it: 0 of 10.
+  # SPEED IS NOT THE TRADE-OFF IT LOOKED LIKE: median 26.2 tok/s with MTP vs 36.9 without, because
+  # on long generations speculation dies mid-stream (server log: "accept rate: 0.00", never
+  # recovers) and pays the draft cost for nothing. The +35%/49.4 tok/s in the tuning table is real
+  # only for SHORT benchmark prompts. VERIFIED ON THIS PATH: 0/10 collapses, 35.4 tok/s, tool
+  # calls 3/3. Full reasoning in serve-sglang.sh under the qwen38fn key.
+  qwen38fn-sglang-tp2-starfleet:
+    cmd: /home/pauloesterwitz/llama-swap/ctx-env.sh qwen38fn-sglang-tp2-starfleet /home/pauloesterwitz/llama-swap/serve-sglang.sh qwen38fn --port ${PORT}
+    proxy: http://127.0.0.1:${PORT}
+    checkEndpoint: /health
+    # cmdStop ADDED 2026-09-11. Without it llama-swap falls back to signalling the process on
+    # TTL unload, and that signal does NOT produce a teardown here: MEASURED, the containers on
+    # BOTH nodes were left running with a dead owner after every unload (reaper caught orphans
+    # aged 2364s, 1936s, 4398s). Backgrounding the log follow so the trap could fire (2026-09-10)
+    # fixed a DIRECT SIGTERM in testing but did NOT fix llama-swap's actual unload path.
+    # An explicit stop command removes the guesswork: llama-swap runs this and waits for it.
+    # reap-orphan-sglang.timer stays as the backstop.
+    # TESTED 2026-09-11 01:09 on llama-swap's OWN unload path (the one that leaked, not a
+    # hand-sent signal): both nodes clean in 3s, reaper not needed. The 2026-09-10 trap fix
+    # RE-TESTED 2026-09-11 13:25 on a REAL 900s TTL expiry (not the /unload endpoint): both
+    # nodes clean in 10s with reaper_fired=0, so cmdStop did the work and the backstop was
+    # not masking a continuing leak. This is the production path that was failing.
+    # passed a DIRECT-SIGTERM test and still left this path leaking -- test the real path.
+    cmdStop: /home/pauloesterwitz/llama-swap/run-sglang-tp2-cluster.sh down
+    ttl: 900
+    useModelName: qwen38fn-sglang-tp2
+    aliases:
+      - Qwen3.8-Flash-Next
+      - qwen3.8-flash-next
+
+  # ── GLM-5.3-Flash NVFP4 (LibertAI), TP=2 across BOTH Sparks — the fleet's SECOND SGLang member ──
+  # 320B total / 18B active MoE, natively multimodal, 181.3 GiB = ~90.5 GiB of weights per Spark.
+  # The BIGGEST member on this fleet (hy3 is 168 GiB), and TP=2-forced: it does not fit one node.
+  # Notable as the first GLM to combine sparse (11 DeepSeek-sparse layers) and linear (34 KDA)
+  # attention; the full flag rationale lives in serve-sglang.sh under the glm53flash key.
+  #
+  # SGLANG, NOT vLLM, and for a different reason than qwen38fn. vLLM on sm_121 DOES work now, but
+  # only via Libertai/glm53-flash-vllm-gb10, which needs a hand-written sparse-MLA CUDA kernel (no
+  # vLLM MLA backend accepts this model's NoPE dims on sm_121: the sparse decode path asserts
+  # pe_dim == 64 and GLM-5.3-Flash has qk_rope_head_dim = 0) PLUS a plugin for vLLM's
+  # uninitialised NVFP4 MoE activation scale — without which every expert is multiplied by zero
+  # and the model emits one token forever, with no error and no warning. SGLang needs neither.
+  #
+  # CONCURRENCY: ONE request at a time. The 34 KDA layers each need a per-request recurrent
+  # state, so --max-running-requests is pinned at 2 (8 @ 131072 ctx fails outright). Context and
+  # concurrency compete for the same pool, which is why ctx is 65536 and not the spec'd 1M.
+  #
+  # ttl 3600, NOT the starfleet-standard 900 — same rule as ds4-nvfp4-tp2: never set a ttl
+  # shorter than the cold load, and a 320B MoE takes well past 900s to load.
+  # UNMEASURED: no throughput figure published by LibertAI or measured here yet.
+  glm53-flash-sglang-tp2-starfleet:
+    cmd: /home/pauloesterwitz/llama-swap/ctx-env.sh glm53-flash-sglang-tp2-starfleet /home/pauloesterwitz/llama-swap/serve-sglang.sh glm53flash --port ${PORT}
+    proxy: http://127.0.0.1:${PORT}
+    checkEndpoint: /health
+    ttl: 3600
+    useModelName: glm53-flash-sglang-tp2
+    aliases:
+      - GLM-5.3-Flash
+      - glm-5.3-flash
+
+  # ── GLM-5.3-Flash AWQ (KDA attention INT8, experts INT4) — the FAST GLM member ──────────────
+  # MEASURED 2026-09-09: 31.3 tok/s single-stream, 31.3 agg@8, with NEXTN MTP K=2 (acceptance
+  # 2.38). The NVFP4 member below does 14.5, so this is 2.16x. Without MTP the same checkpoint
+  # does 22.3/31.1, so K=2 is strictly better: identical aggregate, +40% single-stream.
+  # +54%, from quantizing the 9.17 GiB of KDA attention that NVFP4 structurally could not touch
+  # (per-tensor weight_scale_2 cannot survive QKVParallelLinear's merge; AWQ's group-wise scales
+  # can). Per-token read drops 20.33 -> ~12.9 GiB, and decode here is 68% bandwidth-bound.
+  # ctx 32768, not 65536: prefill runs ~98 tok/s, so a full 65k context is ~11 minutes to first
+  # token. 32768 is the honest usable setting and it leaves room for the KDA state cache.
+  # MTP K=2 IS the served config. K is a genuine peak, not a ceiling: acceptance keeps rising
+  # (K=1 1.77, K=2 2.38, K=3 2.75) but throughput falls after K=2, because each extra draft
+  # position must be advanced through the KDA recurrent state and rolled back on rejection.
+  # GLM-5.3 follows qwen3.8-27b (K=2), NOT qwen38fn (K=3). Do not raise K. K=4 is impossible.
+  # CUDA graphs measured 1.49x here (31.3 vs 15.0 with --disable-cuda-graph) — never disable.
+  # Checkpoint config.json carries six local fixes (documented in serve-sglang.sh); .bak files
+  # sit beside it. Do NOT re-download the repo over it without re-applying them.
+  glm53-awq-sglang-tp2-starfleet:
+    cmd: /home/pauloesterwitz/llama-swap/ctx-env.sh glm53-awq-sglang-tp2-starfleet /home/pauloesterwitz/llama-swap/serve-sglang.sh glm53awq --port ${PORT}
+    proxy: http://127.0.0.1:${PORT}
+    checkEndpoint: /health
+    ttl: 3600
+    useModelName: glm53-awq-sglang-tp2
+    aliases:
+      - GLM-5.3-Flash-AWQ
+      - glm-5.3-flash-awq
+
+  # 122B on Starfleet, + native MTP spec=3 (Paul 2026-07-22, eval grading). MTP VERIFIED working
+  # (weights load ~2min, spec engages, 40.3 tok/s in the velocity bench). ttl 28800 (8h) so it does NOT
+  # idle-unload during the hackathon (Paul: "protect it, nothing kills it until 19:00"). Cold load ~4min
+  # through the cluster - do NOT poke the Ray cluster (docker exec / ray.init) while it starts.
+  qwen3.5-122b-mtp3-starfleet:
+    cmd: /home/pauloesterwitz/llama-swap/ctx-env.sh qwen3.5-122b-mtp3-starfleet /home/pauloesterwitz/llama-swap/serve-starfleet.sh qwen3.5-122b-mtp3 --port ${PORT}
+    proxy: http://127.0.0.1:${PORT}
+    checkEndpoint: /health
+    ttl: 28800
+    useModelName: qwen3.5-122b-mtp3-starfleet
+
+  # REMOVED 2026-07-27: nemotron-120b-19tps-starfleet (19 tok/s, no MTP) — superseded by
+  # nemotron-120b-mtp3-starfleet at 36.1 (FINAL-results-table.md row 6).
+
+  qwen3-235b-20tps-starfleet:
+    # 124.9 GiB — does NOT fit one Spark, so TP=2 is capacity-forced (no single-node option exists).
+    cmd: /home/pauloesterwitz/llama-swap/ctx-env.sh qwen3-235b-20tps-starfleet /home/pauloesterwitz/llama-swap/serve-starfleet.sh qwen3-235b --port ${PORT}
+    proxy: http://127.0.0.1:${PORT}
+    checkEndpoint: /health
+    ttl: 900
+    useModelName: qwen3-235b-starfleet
+
+  minimax-awq-35tps-starfleet:
+    # cyankiwi AWQ int4 (122 GiB): 36.8 tok/s TP=2, +45% vs nvidia NVFP4 (25.4). AWQ int4 kernels
+    # are mature on GB10 sm_121 while NVFP4 falls back to Marlin. Replaces NVFP4 (Paul: use AWQ instead).
+    cmd: /home/pauloesterwitz/llama-swap/ctx-env.sh minimax-awq-35tps-starfleet /home/pauloesterwitz/llama-swap/serve-starfleet.sh minimaxawq --port ${PORT}
+    proxy: http://127.0.0.1:${PORT}
+    checkEndpoint: /health
+    ttl: 900
+    useModelName: minimaxawq-starfleet
+
+
+  gemma4-31b-19tps-starfleet:
+    # prithiv compressed-tensors, dense — big TP=2 win (18.6 vs 10.4 single), so this is the ONLY
+    # gemma-4-31B member served. Carries the alias the removed Kathryn member used to answer to.
+    cmd: /home/pauloesterwitz/llama-swap/ctx-env.sh gemma4-31b-19tps-starfleet /home/pauloesterwitz/llama-swap/serve-starfleet.sh gemma4-31b-ct --port ${PORT}
+    proxy: http://127.0.0.1:${PORT}
+    checkEndpoint: /health
+    ttl: 900
+    useModelName: gemma4-31b-ct-starfleet
+    aliases:
+      - Gemma-4-31B-IT-NVFP4
+
+  qwen3vl32-19tps-starfleet:
+    # Qwen3-VL-32B (vision-language) — 18.9 tok/s TP=2 (vs 10.6 single). Candidate to replace the ollama
+    # qwen3-vl:32b visual-QA path (plot/pptx MCP), but repointing those MCPs is a separate step.
+    cmd: /home/pauloesterwitz/llama-swap/ctx-env.sh qwen3vl32-19tps-starfleet /home/pauloesterwitz/llama-swap/serve-starfleet.sh qwen3vl32 --port ${PORT}
+    proxy: http://127.0.0.1:${PORT}
+    checkEndpoint: /health
+    ttl: 900
+    useModelName: qwen3vl32-starfleet
+
+  qwen3vl32-vision-starfleet:
+    # Qwen3-VL-32B NVFP4 TP=2 with the VISION encoder enabled — the visual-QA endpoint for
+    # pptx / imagegen / paperbanana now that ollama is gone. Same model+hardware as
+    # qwen3vl32-19tps-starfleet; that member stays text-only so its measured 18.9 tok/s row
+    # is untouched. Throughput here is UNMEASURED.
+    cmd: /home/pauloesterwitz/llama-swap/ctx-env.sh qwen3vl32-vision-starfleet /home/pauloesterwitz/llama-swap/serve-starfleet.sh qwen3vl32-vision --port ${PORT}
+    proxy: http://127.0.0.1:${PORT}
+    checkEndpoint: /health
+    ttl: 900
+    useModelName: qwen3vl32-vision-starfleet
+
+  nemotron-120b-mtp3-starfleet:
+    # Nemotron-3-Super-120B + MTP spec-3: 36.1 tok/s TP=2 (vs 19.0 non-MTP).
+    cmd: /home/pauloesterwitz/llama-swap/ctx-env.sh nemotron-120b-mtp3-starfleet /home/pauloesterwitz/llama-swap/serve-starfleet.sh nemotron-120b-mtp3 --port ${PORT}
+    proxy: http://127.0.0.1:${PORT}
+    checkEndpoint: /health
+    ttl: 900
+    useModelName: nemotron-120b-mtp3-starfleet
+
+  qwenvl235-vision-starfleet:
+    # Qwen3-VL-235B MLPerf NVFP4 TP=2 with the VISION encoder enabled — the heavier
+    # visual-QA option next to qwen3vl32-vision-starfleet. The text-only member below
+    # keeps its measured 16.7 tok/s row; throughput HERE is UNMEASURED.
+    cmd: /home/pauloesterwitz/llama-swap/ctx-env.sh qwenvl235-vision-starfleet /home/pauloesterwitz/llama-swap/serve-starfleet.sh qwenvl235-vision --port ${PORT}
+    proxy: http://127.0.0.1:${PORT}
+    checkEndpoint: /health
+    ttl: 900
+    useModelName: qwenvl235-vision-starfleet
+
+  # qwenvl235-16tps-starfleet REMOVED 2026-08-25: it served the VL-235B checkpoint with
+  # --limit-mm-per-prompt {"image":0}, i.e. a vision-language model with its vision disabled.
+  # That is just a slow text model — 17.0 tok/s, where qwen3.6-35b does 85.1 single-node.
+  # The vision variant qwenvl235-vision-starfleet keeps the checkpoint and the capability.
+
+  # DISABLED 2026-08-28: CANNOT SERVE on either available image, and not fixable by config.
+  #   ValidationError: model type `qwen4_exp` but Transformers does not recognize this architecture
+  # VERIFIED: transformers 5.14.0 (vllm-nightly-ray:local) and 5.15.0 (vllm/vllm-openai:v0.27.1-aarch64)
+  # both lack qwen4_exp; the checkpoint ships NO auto_map and NO .py files, so the --trust-remote-code
+  # this launcher already passes has nothing to load. Its config.json was written against
+  # transformers 5.8.0.dev0. v0.27.1 is also a dead end regardless: it has NO ray, so it cannot do
+  # cross-node TP=2 at all, and this model is TP=2-forced (178 GiB on disk).
+  # UNBLOCK: a ray-enabled image whose transformers knows qwen4_exp. Re-test with
+  #   DRYRUN=0 serve-starfleet.sh qwen38flashnext --port 9999
+  # then uncomment this member and re-add it to opencode.json + ~/.config/litellm/config.yaml.
+  # qwen38flashnext-nvfp4-starfleet:
+  #   # Qwen3.8-Flash-Next (125B/6B-active MoE, released 2026-08-26), Inferact NVFP4 (170.19 GiB
+  #   # per model.safetensors.index.json — routed experts only in 4-bit; attention/vision/n-gram/
+  #   # MTP stay BF16/FP8, so it's barely smaller than the official FP8 at 172.78 GiB). TP=2-forced:
+  #   # doesn't fit one Spark even alone. UNMEASURED — community same-day quant, vLLM compat
+  #   # unverified, tok/s unknown, n-gram-table TP-sharding undocumented (memcheck gate is
+  #   # deliberately an OPTIMISTIC-sharding estimate, not worst-case — see serve-starfleet.sh's
+  #   # qwen38flashnext case for the full sizing/parser-provenance notes and why).
+  #   cmd: /home/pauloesterwitz/llama-swap/ctx-env.sh qwen38flashnext-nvfp4-starfleet /home/pauloesterwitz/llama-swap/serve-starfleet.sh qwen38flashnext --port ${PORT}
+  #   proxy: http://127.0.0.1:${PORT}
+  #   checkEndpoint: /health
+  #   ttl: 900
+  #   # useModelName MUST be <key>-starfleet (what serve-starfleet.sh's SERVED_NAME exports),
+  #   # NOT the member name — fixed 2026-08-28, was qwen38flashnext-nvfp4-starfleet (would 404).
+  #   useModelName: qwen38flashnext-starfleet
+  #   aliases:
+  #     - Qwen3.8-Flash-Next
+  #     - Qwen3.8-Flash-Next-NVFP4
+  # 
+  # # NO Qwen3.8-27B starfleet member, and that is a MEASURED decision, not an omission.
+  # # The 2026-08-18 sweep made TP=2 look like the winner (14.9 tok/s vs 12.9 single-node), but both
+  # # of those were eager-mode at max-model-len 32768. Re-measured at the settings this fleet actually
+  # # serves (262144 ctx, util 0.45, prefix caching) TP=2 does NOT reproduce that:
+  # #   TP=2 + CUDA graphs : 7.1 tok/s, engine killed by "TimeoutError: RPC call to sample_tokens
+  # #                        timed out" — speculative sampling across the node boundary stalls once
+  # #                        graphs are captured; MTP acceptance collapses 2.12 -> 1.50 (max 4.0).
+  # #   TP=2 eager         : 12.0 tok/s, and STILL dies with HTTP 500 at N=8 concurrency.
+  # #   single-node        : 13.6 tok/s, stable through the whole sweep.
+  # # So TP=2 is slower than single-node AND unstable, while costing the second Spark. The serve-
+  # # starfleet.sh `qwen38mtp3` key is kept so this is one command to re-test after a vLLM bump —
+  # # it just isn't wired as a member. Re-add only if a rerun beats 13.6 without the 500s.
+  # #
+  # # Nemotron-Cascade-2-30B-A3B NVFP4 (NemotronH hybrid, ~3B active) - 49.1 tok/s single-node on Jean-Luc,
+  # # beats TP=2 (40.9). vLLM via serve-nemcascade.sh -> run-single-node.sh (nightly). Wired 2026-07-24 by Paul.
+  nemcascade-61tps-jean-luc:
+    cmd: /home/pauloesterwitz/llama-swap/ctx-env.sh nemcascade-61tps-jean-luc /home/pauloesterwitz/llama-swap/serve-nemcascade.sh --port ${PORT}
+    proxy: http://127.0.0.1:${PORT}
+    ttl: 600
+    checkEndpoint: /health
+    useModelName: nemcascade-single
+
+  # Kathryn twin, added 2026-08-26. serve-nemcascade.sh is self-contained + host-relative (own
+  # NEED_MB/util baked in, gates via $HOME/llama-swap/memcheck.sh on whichever machine runs it) and
+  # already mirrored onto Kathryn by kathryn-sync.sh, so serve-kathryn-nemcascade.sh just ssh's over
+  # and runs it there — same tunnel pattern as serve-kathryn.sh, no <key>/<need_mb> args needed.
+  # UNMEASURED on Kathryn; 49.1 tok/s is the Jean-Luc number (identical hardware).
+  nemcascade-49tps-kathryn:
+    cmd: /home/pauloesterwitz/llama-swap/ctx-env.sh nemcascade-49tps-kathryn /home/pauloesterwitz/llama-swap/serve-kathryn-nemcascade.sh --port ${PORT}
+    proxy: http://127.0.0.1:${PORT}
+    ttl: 600
+    checkEndpoint: /health
+    useModelName: nemcascade-single
+
+  # ── EMBEDDINGS (vLLM pooling runner) — added 2026-07-27 ──────────────────────────────
+  # Closes the gap left by turning the ollama backend off: nomic-embed-text and embeddinggemma
+  # were `ollama` member aliases, so every local RAG embedding path lost its endpoint and had no
+  # vLLM replacement. Weights in ~/models (523MB / 1.2GB), served by serve-embed.sh.
+  # Both are 768-dim and L2-NORMALISED (--pooler-config use_activation:true), matching what ollama
+  # returned, so RAG_EMBED_DIM=768 and any cosine-via-dot-product caller keeps working unchanged.
+  # Own co-resident group below (exclusive:false): ~1GB each, they must never evict an LLM member
+  # nor be evicted by one. ttl 3600 keeps them warm across a RAG run (cold start ~40-50s).
+  nomic-embed-text:
+    cmd: /home/pauloesterwitz/llama-swap/serve-embed.sh nomic-embed-text --port ${PORT}
+    proxy: http://127.0.0.1:${PORT}
+    checkEndpoint: /health
+    ttl: 3600
+
+  embeddinggemma:
+    cmd: /home/pauloesterwitz/llama-swap/serve-embed.sh embeddinggemma --port ${PORT}
+    proxy: http://127.0.0.1:${PORT}
+    checkEndpoint: /health
+    ttl: 3600
+
+  # ── ComfyUI image backend, moved off the always-on systemd unit and under llama-swap ──
+  # so it idle-unloads instead of sitting resident forever (Paul asked for 2h auto-pause,
+  # 2026-07-20). Own group below (own container, doesn't compete for GB10 pool with LLMs).
+  imagegen:
+    cmd: /home/pauloesterwitz/Speech-to-Image/comfyui/run-comfyui.sh
+    proxy: http://127.0.0.1:8188
+    checkEndpoint: /system_stats
+    ttl: 7200
+
+routing:
+  router:
+    use: group
+    settings:
+      groups:
+        # ds4 is huge (~108GB) — EXCLUSIVE: loading it clears spark-small; loading any spark-small
+        # member clears ds4. So the big model is never co-resident with anything.
+        # REACTIVATED 2026-08-26 (Paul): deepseek-v4-flash only — qwen3.5-122b/mistral-medium-3.5/
+        # nemotron-3-super stay deprecated (ollama-backed, and ollama is gone entirely now; their
+        # NVFP4 successors live in the starfleet group instead: qwen3.5-122b-mtp3-starfleet,
+        # nemotron-120b-mtp3-starfleet).
+        spark-big:
+          swap: true
+          exclusive: true
+          members:
+            - deepseek-v4-flash
+        # Small models CO-RESIDE: swap:false = run in parallel, don't evict each other. exclusive:true
+        # only clears the OTHER group (ds4) when one loads — it does NOT evict siblings in this group.
+        # Fit is gated per-model by memcheck (clean error if full); idle vLLM models unload via ttl.
+        spark-small:
+          swap: false
+          exclusive: true
+          members:
+            # qwen3.6-35b-dflash removed — disabled member (see comment above), re-add on re-enable
+            - qwen3.6-35b-85tps-mtp4-jean-luc
+            - nemcascade-61tps-jean-luc
+            - gemma4-26b-54tps-jean-luc
+            - qwen3.8-27b-19tps-jean-luc
+            - qwen3.8-27b-vision-jean-luc
+            # - ollama
+        # KATHRYN's pool — a DIFFERENT machine's 121GB. exclusive:false is the whole point: these
+        # members must never evict spark-big/spark-small and must never be evicted by them, because
+        # loading a model over there frees nothing over here. Fit is gated by Kathryn's own memcheck
+        # inside the ssh. swap:true = one Kathryn model at a time (31b needs 64GB of her 121GB).
+        kathryn:
+          swap: true
+          exclusive: false
+          members:
+            - qwen3.6-35b-87tps-mtp4-kathryn
+            - gemma4-26b-57tps-kathryn
+            - qwen3.8-27b-20tps-kathryn
+            - qwen3.8-27b-vision-kathryn
+            - nemcascade-49tps-kathryn
+        # ds4-tp2 GROUP REMOVED 2026-08-26: ds4-nvfp4-tp2 moved into `starfleet` below. That group
+        # existed only because systemd, not llama-swap, owned the cluster's lifecycle, so llama-swap
+        # had to be told never to evict it (exclusive:false + swap:false). Now that llama-swap starts
+        # and stops it like any other member, it belongs with its peers: every starfleet member
+        # occupies BOTH Sparks, so swap:true correctly evicts the previous cluster model on switch.
+        # DYNAMIC members: node chosen at runtime by pick-node.sh, so they can't sit in a fixed-node
+        # group. Own group, exclusive:false + swap:false — the chosen node's memcheck is the fit
+        # authority (same "memcheck is the backstop" pattern the starfleet group uses).
+        dyn-node:
+          swap: false
+          exclusive: false
+          members:
+            - qwen3.6-35b-86tps-mtp4-fastest-node
+            - gemma4-26b-56tps-fastest-node
+        # STARFLEET — each member occupies BOTH Sparks, so only ONE can be resident: swap:true evicts
+        # the previous cluster model on switch (its teardown trap frees both nodes). exclusive:false +
+        # memcheck is the backstop for the single-node members, exactly as the ds4-tp2 group does —
+        # while a cluster model is up, MemAvailable drops and JL/Kathryn loads refuse cleanly.
+        starfleet:
+          swap: true
+          exclusive: false
+          members:
+            - qwen3.5-122b-mtp3-starfleet
+            - qwen3-235b-20tps-starfleet
+            - minimax-awq-35tps-starfleet
+            - gemma4-31b-19tps-starfleet
+            - qwen3vl32-19tps-starfleet
+            - qwen3vl32-vision-starfleet
+            - nemotron-120b-mtp3-starfleet
+            - qwenvl235-vision-starfleet
+            - ds4-nvfp4-tp2   # moved here 2026-08-26 when llama-swap took over its lifecycle
+            - qwen38fn-sglang-tp2-starfleet   # 2026-08-28: SGLang, not vLLM — occupies both Sparks
+            - glm53-flash-sglang-tp2-starfleet   # 2026-08-29: SGLang TP=2, 181 GiB — the largest member here
+            - glm53-awq-sglang-tp2-starfleet   # 2026-09-09: AWQ INT8 attention, 22.3 tok/s — the fast GLM
+            # - qwen38flashnext-nvfp4-starfleet   # DISABLED 2026-08-28: qwen4_exp unsupported by both images (see member comment above)
+        # ComfyUI's own container — exclusive:false + swap:false, same "isolated, never evicts
+        # / never evicted" pattern as ds4-tp2 and qwen-dyn above. It's a different memory
+        # subsystem (docker --gpus all container, not an llama-swap-launched vLLM/ollama proc).
+        # Tiny (~1GB each) and co-resident with everything: swap:false so both can be up at once,
+        # exclusive:false so an embedding call never clears an LLM group (and vice versa).
+        embeddings:
+          swap: false
+          exclusive: false
+          members:
+            - nomic-embed-text
+            - embeddinggemma
+        imagegen:
+          swap: false
+          exclusive: false
+          members:
+            - imagegen

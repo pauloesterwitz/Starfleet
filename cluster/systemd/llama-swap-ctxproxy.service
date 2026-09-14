@@ -1,0 +1,13 @@
+[Unit]
+Description=llama-swap ctxproxy on :28081, per-request context size in front of :28080
+After=llama-swap.service
+Wants=llama-swap.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /home/pauloesterwitz/llama-swap/ctxproxy.py
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

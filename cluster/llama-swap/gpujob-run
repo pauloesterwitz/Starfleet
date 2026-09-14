@@ -1,0 +1,139 @@
+#!/usr/bin/env python3
+"""gpujob-run — run ONE heavy GPU job on THIS node, after the LLMs go quiet.
+
+Invoked as a pueue task (see ~/.local/bin/gpujob). Runs locally on Jean-Luc, and
+on Kathryn via ssh — either way it reads the LOCAL /proc/meminfo, nvidia-smi and
+~/.gb10/reservations, so each machine gates its own pool. Same split as
+serve-kathryn.sh.
+
+Two waits, in order:
+  1. sustained idle — GPU util must stay <= --util-max for --idle-s straight.
+     gate.py only checks util *instantaneously*; "idle for a while" is this.
+  2. gate.job_slot() — the existing flock queue + memory fit + reservation, so
+     memcheck.sh / render-guard.sh see this job and refuse to load a model on top
+     of it. That is what stops an LLM from being evicted (and vice versa).
+
+ponytail: no scheduler daemon of its own — pueue owns the queue and the clock,
+this only owns "is it safe to start yet".
+"""
+import argparse
+import os
+import subprocess
+import sys
+import time
+
+HERE = os.path.expanduser("~/Speech-to-Image")
+sys.path.insert(0, HERE)
+
+p = argparse.ArgumentParser()
+p.add_argument("--need-mb", type=int, default=20000, help="memory this job will hold")
+p.add_argument("--idle-s", type=int, default=600, help="GPU must stay quiet this long")
+p.add_argument("--util-max", type=int, default=30, help="percent GPU util counted as idle")
+p.add_argument("--timeout-s", type=int, default=8 * 3600, help="give up waiting after this")
+p.add_argument("--poll-s", type=float, default=15.0)
+p.add_argument("--now", action="store_true",
+               help="run on request: no idle wait, tolerate a busy GPU. Still queues "
+                    "one-at-a-time, still checks the memory fits, still reserves.")
+p.add_argument("--selfcheck", action="store_true", help="assert the idle logic, run nothing")
+p.add_argument("cmd", nargs=argparse.REMAINDER)
+a = p.parse_args()
+
+cmd = a.cmd[1:] if a.cmd and a.cmd[0] == "--" else a.cmd
+if not cmd and not a.selfcheck:
+    sys.exit("gpujob-run: no command given (use `-- cmd ...`)")
+
+# gate.py reads these at import time.
+os.environ.setdefault("GATE_TIMEOUT_S", str(a.timeout_s))
+os.environ.setdefault("GATE_UTIL_MAX", str(a.util_max))
+# gate defaults to a flat 20GB floor for every job (IMAGE_VRAM_MIN_MB) and admits
+# on max(need_mb, floor). Here --need-mb IS the job's size, so make it the floor
+# too — otherwise a 4GB job waits for 20GB and a 60GB job would admit on 60GB
+# anyway. One knob, no hidden second threshold.
+os.environ.setdefault("IMAGE_VRAM_MIN_MB", str(a.need_mb))
+if a.now:
+    # coexist: still waits for the memory to fit, does not wait for the GPU to be
+    # quiet. This is the "run it because I asked" path, not a bypass — the flock,
+    # the fit check and the reservation all still apply.
+    os.environ["GATE_MODE"] = "coexist"
+    a.idle_s = 0
+import gate  # noqa: E402
+
+
+def log(msg):
+    print(f"[gpujob {time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def wait_sustained_idle():
+    """Block until GPU util has been <= util_max for idle_s CONSECUTIVE seconds.
+
+    A single low sample is not idleness: an LLM between two tokens reads 0%. The
+    run of consecutive quiet samples is what distinguishes "session finished" from
+    "session thinking". Any busy sample resets the run to zero.
+    """
+    if a.idle_s <= 0:
+        return
+    deadline = time.monotonic() + a.timeout_s
+    quiet_since = None
+    while True:
+        util = gate.gpu_util()
+        now = time.monotonic()
+        if util <= a.util_max:
+            if quiet_since is None:
+                quiet_since = now
+                log(f"GPU quiet (util={util}%) — need {a.idle_s}s of it")
+            if now - quiet_since >= a.idle_s:
+                log(f"idle for {int(now - quiet_since)}s — proceeding")
+                return
+        elif quiet_since is not None:
+            log(f"GPU busy again (util={util}%) — idle timer reset")
+            quiet_since = None
+        if now >= deadline:
+            sys.exit(f"gpujob-run: GPU never idled for {a.idle_s}s within "
+                     f"{a.timeout_s}s (last util={util}%)")
+        time.sleep(a.poll_s)
+
+
+def _selfcheck():
+    """Patch gpu_util and assert the two things the loop must get right: a busy
+    GPU resets the run, and only a CONSECUTIVE quiet run of idle_s returns."""
+    a.poll_s, a.idle_s, a.util_max, a.timeout_s = 0.01, 0.05, 30, 5
+    samples = [90, 0, 0, 95, 0, 0, 0, 0, 0, 0, 0, 0]          # busy at index 3 resets
+    seen = []
+
+    def fake():
+        v = samples[len(seen)] if len(seen) < len(samples) else 0
+        seen.append(v)
+        return v
+
+    gate.gpu_util = fake
+    wait_sustained_idle()
+    assert len(seen) > 4, f"returned before the reset at index 3 ({len(seen)} samples)"
+
+    # Never idle -> must give up, not spin forever.
+    seen.clear()
+    gate.gpu_util = lambda: 99
+    try:
+        wait_sustained_idle()
+    except SystemExit as e:
+        assert "never idled" in str(e), e
+    else:
+        raise AssertionError("busy GPU should have timed out")
+
+    # idle_s=0 -> return immediately, no probe at all.
+    a.idle_s = 0
+    gate.gpu_util = lambda: (_ for _ in ()).throw(AssertionError("probed with idle_s=0"))
+    wait_sustained_idle()
+    print("gpujob-run self-check OK")
+
+
+if a.selfcheck:
+    _selfcheck()
+    sys.exit(0)
+
+log(f"queued on {os.uname().nodename}: {' '.join(cmd)}")
+wait_sustained_idle()
+with gate.job_slot(need_mb=a.need_mb, log=log):
+    log(f"slot acquired, {gate.mem_available_mb()}MB free — running")
+    rc = subprocess.run(cmd).returncode
+log(f"done rc={rc}")
+sys.exit(rc)

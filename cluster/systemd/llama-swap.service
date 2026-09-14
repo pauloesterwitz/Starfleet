@@ -1,0 +1,16 @@
+[Unit]
+Description=llama-swap — DeepSeek-V4-Flash (ds4) + Ollama orchestrator on :28080
+Documentation=https://github.com/mostlygeek/llama-swap
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/home/pauloesterwitz/llama-swap/llama-swap -config /home/pauloesterwitz/llama-swap/config.yaml -listen localhost:28080 -watch-config
+Restart=on-failure
+RestartSec=3
+# Give a slow ds4 cold-load (one-time CUDA JIT) room before systemd considers it failed
+TimeoutStartSec=0
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,8 @@
+[Unit]
+Description=Mirror AI-stack folders (llama-swap, Speech-to-Image, ds4, models, comfyui-data) from Jean-Luc to Kathryn
+# Jean-Luc is the source of truth; --delete makes Kathryn an exact mirror.
+# Edit these folders here, never on Kathryn — local edits there are overwritten.
+
+[Service]
+Type=oneshot
+ExecStart=/home/pauloesterwitz/.local/bin/kathryn-sync.sh
