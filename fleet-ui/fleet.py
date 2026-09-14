@@ -49,6 +49,11 @@ MIN_COLD_LOAD = 5.0  # seconds; below this a "cold" touch was really a ttl refre
 CTX_DIR = os.path.join(os.environ.get("GB10_STATE_DIR") or os.path.expanduser("~/.gb10"), "ctx")
 SWAP_CONFIG = os.path.expanduser("~/llama-swap/config.yaml")
 MIN_CTX, MAX_CTX = 256, 1048576  # the bounds ctx-env.sh and ctxproxy both enforce
+MODELS_DIR = os.path.expanduser("~/models")
+LS_DIR = os.path.expanduser("~/llama-swap")
+CTX_MAX_FILE = os.path.expanduser("~/.config/fleet-ui/ctx-max.json")
+CTX_POOL_FILE = os.path.expanduser("~/.config/fleet-ui/ctx-pool.json")
+LS_LOGS = os.path.expanduser("~/llama-swap/logs")
 NODE_POLL = 5        # seconds between resource probes
 KEEPALIVE = 240      # seconds between ttl-refresh touches of a resident pin (shortest ttl is 600)
 RECHECK = 5           # seconds between checks for a pin that isn't currently running
@@ -225,6 +230,480 @@ def read_all_ctx():
     except OSError:
         return {}
     return {n: c for n in names for c in [read_ctx(n)] if c is not None}
+
+
+# ---------------------------------------------------- per-model MAX context
+
+# member -> native max context (from the checkpoint's own config.json), or None
+# when it could not be resolved. Cached: resolving means running a launcher in
+# DRYRUN mode and reading a file, far too costly for the 3s /api/state poll.
+_ctx_max = {}          # member -> usable max = min(checkpoint max, measured KV pool)
+_ctx_native = {}       # member -> the checkpoint's own max_position_embeddings
+_ctx_sub = {}          # member -> model subdirectory, for locating its logs
+_ctx_pool = {}         # member -> {"pool": tokens the KV pool holds, "at_ctx": context measured at}
+_ctx_vision = {}       # member -> "on" | "off" | None (no vision tower / not resolvable)
+_ctx_max_lock = threading.Lock()
+
+
+def _pool_from_vllm_log(path):
+    """(pool_tokens, context) from a vLLM run log; last occurrence wins.
+
+    vLLM prints 'GPU KV cache size: 467,200 tokens' and 'Maximum concurrency for
+    262,144 tokens' -- the latter is the context it was started with.
+    """
+    pool = ctx = None
+    try:
+        with open(path, errors="replace") as fh:
+            for line in fh:
+                m = re.search(r"GPU KV cache size:\s*([\d,]+)\s*tokens", line)
+                if m:
+                    pool = int(m.group(1).replace(",", ""))
+                m = re.search(r"Maximum concurrency for\s*([\d,]+)\s*tokens", line)
+                if m:
+                    ctx = int(m.group(1).replace(",", ""))
+    except OSError:
+        return None, None
+    return pool, ctx
+
+
+def _pool_from_sglang_text(text):
+    """(pool_tokens, context) from SGLang's summary line; last occurrence wins."""
+    pool = ctx = None
+    for m in re.finditer(r"max_total_num_tokens=(\d+).*?context_len=(\d+)", text):
+        pool, ctx = int(m.group(1)), int(m.group(2))
+    return pool, ctx
+
+
+def _sglang_container_text():
+    """SGLang's numbers exist only in its container log -- the wrapper log under
+    ~/llama-swap/logs holds launcher output only. Read it while the container is
+    still there; the observation is cached so it outlives the container."""
+    try:
+        r = subprocess.run(["docker", "logs", "sglang-tp2-head"],
+                           capture_output=True, text=True, timeout=30)
+        return (r.stdout or "") + (r.stderr or "")
+    except (subprocess.SubprocessError, OSError):
+        return ""
+
+
+def load_pool_cache():
+    try:
+        with open(CTX_POOL_FILE) as fh:
+            return {k: v for k, v in json.load(fh).items() if isinstance(v, dict)}
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
+def save_pool_cache():
+    try:
+        os.makedirs(os.path.dirname(CTX_POOL_FILE), exist_ok=True)
+        tmp = CTX_POOL_FILE + ".tmp"
+        with _ctx_max_lock:
+            snap = dict(_ctx_pool)
+        with open(tmp, "w") as fh:
+            json.dump(snap, fh, indent=2, sort_keys=True)
+        os.replace(tmp, CTX_POOL_FILE)
+    except OSError:
+        pass
+
+
+def observe_pools():
+    """Record how many tokens each model's KV pool actually holds.
+
+    A model can be started with a context LARGER than its pool: Qwen3.8-Flash-Next
+    at 262144 came up with a 253952-token pool, so the top ~8k of the advertised
+    window had no KV behind it. Measuring this is what lets `Max` mean "the largest
+    context this model can really serve" rather than merely what the checkpoint allows.
+
+    Engines report it differently: vLLM into ~/llama-swap/logs/run-<sub>.log,
+    SGLang only into its container's log.
+    """
+    with _ctx_max_lock:
+        subs = dict(_ctx_sub)
+    if not subs:
+        return
+    sgl_text = _sglang_container_text()
+    sgl_pool, sgl_ctx = _pool_from_sglang_text(sgl_text) if sgl_text else (None, None)
+    # SGLang echoes its args as server_args=ServerArgs(model_path='/models/X', ...),
+    # NOT as the --model-path form the docker cmd uses. Match both.
+    m = re.search(r"model[_-]path[=\s]+['\"]?/models/([A-Za-z0-9._-]+)", sgl_text or "")
+    sgl_sub = m.group(1) if m else None
+
+    changed = False
+    for member, sub_ in subs.items():
+        pool = ctx = None
+        if sgl_sub and sub_ == sgl_sub and sgl_pool:
+            pool, ctx = sgl_pool, sgl_ctx
+        else:
+            for name in (f"run-{sub_}.log", f"sglang-{sub_}.log"):
+                pth = os.path.join(LS_LOGS, name)
+                if os.path.exists(pth):
+                    p2, c2 = _pool_from_vllm_log(pth)
+                    if p2:
+                        pool, ctx = p2, c2
+                        break
+        if not pool:
+            continue
+        with _ctx_max_lock:
+            prev = _ctx_pool.get(member) or {}
+            if prev.get("pool") == pool and prev.get("at_ctx") == ctx:
+                continue
+            _ctx_pool[member] = {"pool": pool, "at_ctx": ctx}
+            native = _ctx_native.get(member)
+            # Whichever binds first: the checkpoint's window, or the pool holding it.
+            _ctx_max[member] = min(native, pool) if native else pool
+        changed = True
+    if changed:
+        save_pool_cache()
+
+
+def _launcher_and_key(cmd):
+    """(abs launcher path, key) from a member's llama-swap cmd, or (None, None).
+
+    The key is the first bare token after the launcher; members whose launcher
+    takes no key (serve-nemcascade.sh, ds4) yield an empty key, which is fine --
+    the launcher still reports its model in DRYRUN.
+    """
+    parts = cmd.split()
+    for i, tok in enumerate(parts):
+        # "ds4-" covers ds4-tp2-proxy-guard.sh, which is the member's real entry point
+        # even though it is not named serve-*. The other shims in a cmd chain
+        # (ctx-env.sh, render-guard.sh, reclaim-dflash.sh, memcheck.sh) must NOT match.
+        if tok.endswith(".sh") and os.path.basename(tok).startswith(
+                ("serve-", "run-", "pick-", "ds4-")):
+            launcher, key = tok, ""
+            if i + 1 < len(parts) and not parts[i + 1].startswith("-"):
+                key = parts[i + 1]
+            return launcher, key
+    return None, None
+
+
+def _supports_dryrun(launcher):
+    """Whether a launcher implements DRYRUN, i.e. whether probing it is READ-ONLY.
+
+    serve-kathryn.sh, serve-kathryn-nemcascade.sh and pick-node.sh do NOT: running
+    them ignores DRYRUN and actually launches, opening an ssh tunnel and starting a
+    model on the other node. Observed doing exactly that on 2026-09-02 -- a probe
+    must never start a server. Those members get their max from their Jean-Luc twin
+    via the launcher-key fallback below, so nothing is lost by skipping them.
+    """
+    try:
+        with open(launcher, errors="replace") as fh:
+            return "DRYRUN" in fh.read()
+    except OSError:
+        return False
+
+
+def _model_subdir(launcher, key):
+    """Ask the launcher itself, via its own DRYRUN path, which checkpoint it serves.
+
+    DRYRUN beats re-parsing each script's case block: they do not write it the same
+    way (serve-vllm-dflash.sh has no SUB= at all, it prints a whole docker run) and
+    a key's checkpoint can change without this needing to know.
+    """
+    if not _supports_dryrun(launcher):
+        return None, ""
+    try:
+        r = subprocess.run([launcher] + ([key] if key else []) + ["--port", "1"],
+                           capture_output=True, text=True, timeout=20,
+                           env=dict(os.environ, DRYRUN="1"))
+    except (subprocess.SubprocessError, OSError):
+        return None, ""
+    out = (r.stdout or "") + (r.returncode and (r.stderr or "") or "")
+    m = re.search(r"\bsub=([A-Za-z0-9._-]+)", out)          # serve-sglang / serve-starfleet
+    if not m:
+        m = re.search(r"/models/([A-Za-z0-9._-]+)", out)     # serve-vllm-dflash's docker run
+    return (m.group(1) if m else None), out
+
+
+def _has_vision_tower(subdir):
+    try:
+        with open(os.path.join(MODELS_DIR, subdir, "config.json")) as fh:
+            cfg = json.load(fh)
+    except (OSError, ValueError):
+        return False
+    return "vision_config" in cfg or "vision_config" in (cfg.get("text_config") or {})
+
+
+def _vision_from(argv, has_tower):
+    """'on' | 'off' | None -- does this member actually SERVE images?
+
+    A different question from "does the checkpoint have a vision tower". Most of this
+    fleet carries one and is deliberately started text-only, so the tower alone would
+    be a misleading flag.
+
+      --limit-mm-per-prompt {"image":0}   -> off (deliberately disabled)
+      --limit-mm-per-prompt {"image":N>0} -> on
+      no such flag, tower present         -> on: vLLM defaults an unspecified modality
+                                             to 999 (config/multimodal.py), and SGLang's
+                                             enable_multimodal=None means auto-detect
+      no tower                            -> None, nothing to report
+
+    serve-vllm-dflash.sh prints its argv through printf %q, so the JSON arrives escaped
+    as \\{\\"image\\":0\\}; flatten it before matching or every dflash member reads as
+    "no flag" when it in fact has one.
+    """
+    if not has_tower:
+        return None
+    flat = (argv or "").replace("\\", "")
+    m = re.search(r'limit[-_]mm[-_]per[-_]prompt\s*\S*?"?image"?\s*:\s*(\d+)', flat)
+    if m:
+        return "on" if int(m.group(1)) > 0 else "off"
+    if re.search(r"language[-_]model[-_]only", flat):
+        return "off"
+    return "on"
+
+
+def _native_max(subdir):
+    """max_position_embeddings from the checkpoint's config.json.
+
+    text_config wins for the multimodal checkpoints: their vision tower carries a
+    smaller one (gemma-4-31B: text 262144, vision 131072) and the text window is
+    what a context request actually sets.
+    """
+    try:
+        with open(os.path.join(MODELS_DIR, subdir, "config.json")) as fh:
+            cfg = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    for holder in (cfg.get("text_config") or {}, cfg):
+        v = holder.get("max_position_embeddings")
+        if isinstance(v, int) and MIN_CTX <= v <= MAX_CTX:
+            return v
+    return None
+
+
+def load_ctx_max_cache():
+    try:
+        with open(CTX_MAX_FILE) as fh:
+            return {k: v for k, v in json.load(fh).items() if isinstance(v, int)}
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
+def member_cmds(path=SWAP_CONFIG):
+    """member -> its llama-swap cmd line, from config.yaml.
+
+    Not from /running: that only carries a cmd for models that are LOADED, and the
+    max context matters most for one that is not.
+    """
+    cmds, current = {}, None
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                key = re.match(r"^  ([A-Za-z0-9._:-]+):\s*$", line)
+                if key:
+                    current = key.group(1)
+                elif current and line.strip().startswith("cmd:"):
+                    cmds[current] = line.strip()[4:].strip()
+                    current = None
+    except OSError:
+        pass
+    return cmds
+
+
+def resolve_ctx_max():
+    """Fill _ctx_max for every member. Runs off-thread; never blocks a request."""
+    cmds = member_cmds()
+    if not cmds:
+        return
+    changed = False
+    by_key = {}          # launcher key -> (native max, subdir, vision), for the delegates
+    pending = {}
+    for model, cmd in cmds.items():
+        with _ctx_max_lock:
+            if _ctx_sub.get(model) and _ctx_native.get(model):
+                continue
+        launcher, key = _launcher_and_key(cmd)
+        val = sub_ = vis = None
+        if launcher:
+            # One probe, both answers: the same DRYRUN argv names the checkpoint AND
+            # carries the multimodal limit the member will actually be started with.
+            sub_, argv = _model_subdir(launcher, key)
+            if sub_:
+                val = _native_max(sub_)
+                vis = _vision_from(argv, _has_vision_tower(sub_))
+        if val and key:
+            by_key[key] = (val, sub_, vis)
+        pending[model] = (key, val, sub_, vis)
+
+    # serve-kathryn.sh and pick-node.sh only delegate -- to the other node, or to
+    # whichever node is free -- so their DRYRUN names no checkpoint locally and they
+    # resolve to None. They serve the SAME launcher key as their Jean-Luc twin
+    # (gemma4-26b-ct, qwen3.6-35b-mtp4, ...), and the key IS the model identity, so
+    # borrow that twin's answer rather than leaving half the roster without a Max.
+    for model, (key, val, sub_, vis) in pending.items():
+        if not val and key and key in by_key:
+            val, sub_, vis = by_key[key]
+        with _ctx_max_lock:
+            _ctx_native[model] = val
+            _ctx_vision[model] = vis
+            if sub_:
+                _ctx_sub[model] = sub_
+            pool = (_ctx_pool.get(model) or {}).get("pool")
+            # min(): whichever binds first, the checkpoint window or the KV pool.
+            _ctx_max[model] = min(val, pool) if (val and pool) else (val or pool)
+        if val:
+            changed = True
+    if changed:
+        try:
+            os.makedirs(os.path.dirname(CTX_MAX_FILE), exist_ok=True)
+            tmp = CTX_MAX_FILE + ".tmp"
+            with _ctx_max_lock:
+                snap = {k: v for k, v in _ctx_max.items() if v}
+            with open(tmp, "w") as fh:
+                json.dump(snap, fh, indent=2, sort_keys=True)
+            os.replace(tmp, CTX_MAX_FILE)
+        except OSError:
+            pass
+
+
+def ctx_max_worker():
+    """Resolve lazily: checkpoints do not change under a running fleet, but the KV
+    pool is re-measured every pass so a model that has just loaded at a new context
+    updates its usable max on its own."""
+    with _ctx_max_lock:
+        _ctx_native.update(load_ctx_max_cache())
+        _ctx_max.update(_ctx_native)
+        _ctx_pool.update(load_pool_cache())
+    while True:
+        try:
+            resolve_ctx_max()
+            resolve_effort_options()
+            observe_pools()
+        except Exception:                       # never take the server down for this
+            pass
+        time.sleep(120)
+
+
+# ------------------------------------------------ per-model thinking effort
+
+# The chat template is the contract: whatever variable it branches on is what a
+# caller -- or a load-time default -- can actually set. Anything else is guesswork,
+# and Qwen3.8's template raises outright on an unsupported reasoning_effort.
+EFFORT_DIR = os.path.join(os.environ.get("GB10_STATE_DIR") or os.path.expanduser("~/.gb10"), "effort")
+_effort_opts = {}      # member -> [{"label": str, "kwargs": dict|None}]
+
+
+def _chat_template(subdir):
+    t = ""
+    d = os.path.join(MODELS_DIR, subdir)
+    for name in ("chat_template.jinja", "chat_template.json", "tokenizer_config.json"):
+        p = os.path.join(d, name)
+        if not os.path.exists(p):
+            continue
+        try:
+            raw = open(p, errors="replace").read()
+        except OSError:
+            continue
+        if name.endswith(".json"):
+            try:
+                v = json.loads(raw).get("chat_template")
+                raw = v if isinstance(v, str) else (json.dumps(v) if v else "")
+            except ValueError:
+                raw = ""
+        t += raw or ""
+    return t
+
+
+def effort_options_for(subdir):
+    """Options this checkpoint actually accepts. [] when it exposes no control -- the
+    UI then shows nothing to pick, rather than a setting the model would reject."""
+    return _opts_from_text(_chat_template(subdir))
+
+
+def _opts_from_text(t):
+    """Split out from effort_options_for so selfcheck can exercise the parsing without
+    a checkpoint on disk."""
+    if not t:
+        return []
+    opts = [{"label": "Default", "kwargs": None}]
+
+    # Graded reasoning_effort. Take the literal set the template validates against so
+    # we can never offer a value it would refuse (Qwen3.8: xhigh|medium|low; GLM: low|high).
+    vals = []
+    for grp in re.findall(r"reasoning_effort\s*(?:not\s+)?in\s*[\(\[]([^\)\]]+)", t):
+        vals += re.findall(r"['\"]([a-z]+)['\"]", grp)
+    if vals:
+        for v in sorted(set(vals)):
+            opts.append({"label": v, "kwargs": {"reasoning_effort": v}})
+        return opts
+
+    if re.search(r"low_effort", t):                       # Nemotron-3-Super: binary
+        opts.append({"label": "low", "kwargs": {"low_effort": True}})
+        return opts
+
+    if re.search(r"[\{\(\s\.]enable_thinking\b", t):
+        opts.append({"label": "thinking on", "kwargs": {"enable_thinking": True}})
+        opts.append({"label": "thinking off", "kwargs": {"enable_thinking": False}})
+        if re.search(r"reasoning_budget|thinking_budget", t):   # Nemotron-Cascade
+            key = "reasoning_budget" if "reasoning_budget" in t else "thinking_budget"
+            for n in (256, 1024, 4096):
+                opts.append({"label": f"budget {n}", "kwargs": {"enable_thinking": True, key: n}})
+        return opts
+    return []
+
+
+def resolve_effort_options():
+    with _ctx_max_lock:
+        subs = dict(_ctx_sub)
+    for member, sub_ in subs.items():
+        if member in _effort_opts:
+            continue
+        try:
+            _effort_opts[member] = effort_options_for(sub_)
+        except Exception:
+            _effort_opts[member] = []
+
+
+def read_effort(member):
+    """The label currently set, or None. Matched back from the stored kwargs so the
+    UI shows the same option the user picked."""
+    try:
+        with open(os.path.join(EFFORT_DIR, member)) as fh:
+            raw = fh.read().strip()
+        cur = json.loads(raw)
+    except (OSError, ValueError):
+        return None
+    for o in _effort_opts.get(member) or []:
+        if o["kwargs"] == cur:
+            return o["label"]
+    return raw[:40]        # set by hand / no longer offered -- show it rather than lie
+
+
+def apply_effort(model, label):
+    """Record the chat-template kwargs for `label` and evict the model if resident, so
+    it comes back with the new default. Returns True if a running model was unloaded.
+
+    Written COMPACT: ctx-env.sh appends the JSON to MODEL_FLAGS_EXTRA, which the
+    launchers word-split, so a single space would split it into two arguments.
+    """
+    opts = _effort_opts.get(model) or []
+    match = next((o for o in opts if o["label"] == label), None) if label else \
+        {"label": "Default", "kwargs": None}
+    if match is None:
+        raise ValueError(f"{model} does not accept effort {label!r}")
+    path = os.path.join(EFFORT_DIR, model)
+    with _ctx_lock:
+        if match["kwargs"] is None:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        else:
+            os.makedirs(EFFORT_DIR, exist_ok=True)
+            blob = json.dumps(match["kwargs"], separators=(",", ":"))
+            assert " " not in blob, "kwargs JSON must be compact"
+            tmp = path + ".tmp"
+            with open(tmp, "w") as fh:
+                fh.write(blob + "\n")
+            os.replace(tmp, path)
+        with LOCK:
+            resident = any(r.get("model") == model for r in STATE["running"])
+        if not resident:
+            return False
+        swap_get("/unload?model=" + urllib.parse.quote(model, safe=""))
+        return True
 
 
 def apply_ctx(model, ctx):
@@ -522,6 +1001,9 @@ class Handler(BaseHTTPRequestHandler):
             snap["pins"] = load_pins()
             times = load_times()  # read once, not once per model
             ctxs, wired = read_all_ctx(), wired_members()
+            with _ctx_max_lock:
+                maxes, natives, pools = dict(_ctx_max), dict(_ctx_native), dict(_ctx_pool)
+                visions = dict(_ctx_vision)
             snap["models"] = [
                 {
                     "id": m,
@@ -532,6 +1014,12 @@ class Handler(BaseHTTPRequestHandler):
                     "load_eta": eta_for(m, times),
                     "ctx": ctxs.get(m),
                     "ctx_capable": m in wired,
+                    "ctx_max": maxes.get(m),
+                    "ctx_native": natives.get(m),
+                    "vision": visions.get(m),
+                    "effort": read_effort(m),
+                    "effort_options": [o["label"] for o in (_effort_opts.get(m) or [])],
+                    "ctx_pool": (pools.get(m) or {}).get("pool"),
                 }
                 for m in snap["models"]
             ]
@@ -566,6 +1054,20 @@ class Handler(BaseHTTPRequestHandler):
                 pins.discard(model)
                 save_pins(pins)
             return self._send(200, '{"ok":true}', "application/json")
+
+        if self.path == "/api/effort":
+            label = body.get("effort")
+            if label is not None and not isinstance(label, str):
+                return self._send(400, '{"error":"effort must be a string or null"}',
+                                  "application/json")
+            try:
+                reloaded = apply_effort(model, label)
+            except ValueError as e:
+                return self._send(400, json.dumps({"error": str(e)}), "application/json")
+            except OSError as e:
+                return self._send(500, json.dumps({"error": str(e)[:200]}), "application/json")
+            return self._send(200, json.dumps({"ok": True, "reloaded": reloaded}),
+                              "application/json")
 
         if self.path == "/api/ctx":
             raw = body.get("ctx")
@@ -640,6 +1142,61 @@ def selfcheck():
     # members read as "no override" rather than as a bogus size.
     assert (MIN_CTX, MAX_CTX) == (256, 1048576)
     assert read_ctx("definitely-not-a-member") is None
+    # ctx-env.sh is a prefix shim, not the launcher -- the key belongs to the real one.
+    assert _launcher_and_key("/x/ctx-env.sh m /x/serve-sglang.sh qwen38fn --port 1") == (
+        "/x/serve-sglang.sh", "qwen38fn")
+    # a launcher that takes no key must not swallow its own flag as one
+    assert _launcher_and_key("/x/ctx-env.sh m /x/serve-nemcascade.sh --port 1") == (
+        "/x/serve-nemcascade.sh", "")
+    assert _launcher_and_key("no launcher here") == (None, None)
+    # A launcher without DRYRUN must never be executed by the probe.
+    assert _supports_dryrun("/nonexistent/serve-nope.sh") is False
+    # Both spellings of the model path must resolve -- SGLang logs the second one.
+    for _t in ("--model-path /models/Some-Model-NVFP4 --tp-size 2",
+               "server_args=ServerArgs(model_path='/models/Some-Model-NVFP4', tp_size=2)"):
+        assert re.search(r"model[_-]path[=\s]+['\"]?/models/([A-Za-z0-9._-]+)", _t).group(1) == \
+            "Some-Model-NVFP4"
+    # Effort options must come from the template, never from a fixed list: Qwen3.8
+    # accepts low/medium/xhigh and raises on anything else, GLM accepts low/high.
+    # Verbatim shape from Qwen3.8-Flash-Next: the validated name is a LONGER identifier
+    # containing reasoning_effort, which is exactly what the matcher has to cope with.
+    _q = ("{%- set resolved_reasoning_effort = reasoning_effort|default('xhigh') %}"
+          "{%- if resolved_reasoning_effort not in ('xhigh', 'medium', 'low') %}")
+    assert [o["label"] for o in _opts_from_text(_q)] == ["Default", "low", "medium", "xhigh"]
+    _g = "{%- set e = reasoning_effort if reasoning_effort in ['low','high'] else 'max' -%}"
+    assert [o["label"] for o in _opts_from_text(_g)] == ["Default", "high", "low"]
+    _t = "{%- set enable_thinking = enable_thinking if enable_thinking is defined else True %}"
+    assert [o["label"] for o in _opts_from_text(_t)] == ["Default", "thinking on", "thinking off"]
+    assert _opts_from_text("no controls here at all") == []
+    # every offered kwargs must serialise without whitespace -- ctx-env.sh word-splits it
+    for _o in _opts_from_text(_q) + _opts_from_text(_t):
+        if _o["kwargs"]:
+            assert " " not in json.dumps(_o["kwargs"], separators=(",", ":"))
+
+    assert _pool_from_sglang_text(
+        "max_total_num_tokens=409536, chunked=8192, context_len=253952") == (409536, 253952)
+    # serve-kathryn.sh still ignores DRYRUN and would launch for real over ssh, so the
+    # guard MUST keep excluding it. Not listed here, deliberately: pick-node.sh and
+    # serve-kathryn-nemcascade.sh both implement DRYRUN read-only (the former echoes the
+    # chosen node, the latter defers to the local serve-nemcascade.sh instead of ssh-ing),
+    # so probing those is safe.
+    for _l in ("serve-kathryn.sh",):
+        _p = os.path.join(LS_DIR, _l)
+        if os.path.exists(_p):
+            assert not _supports_dryrun(_p), f"{_l} now claims DRYRUN; re-verify it is read-only"
+    # The ds4 entry point is not named serve-*; the matcher must still find it, and the
+    # generic shims in a cmd chain must still be ignored.
+    # Vision reflects what the member is STARTED with, not merely what the checkpoint
+    # could do -- and the dflash argv arrives printf %q-escaped.
+    assert _vision_from('--limit-mm-per-prompt {"image":0,"video":0}', True) == "off"
+    assert _vision_from('--limit-mm-per-prompt {"image":1,"video":0}', True) == "on"
+    assert _vision_from('--limit-mm-per-prompt \\{\\"image\\":0,\\"video\\":0\\}', True) == "off"
+    assert _vision_from("--kv-cache-dtype fp8", True) == "on"      # no flag -> engine default
+    assert _vision_from("--kv-cache-dtype fp8", False) is None     # no tower -> nothing to say
+    assert _launcher_and_key("/x/ctx-env.sh m /x/ds4-tp2-proxy-guard.sh") == (
+        "/x/ds4-tp2-proxy-guard.sh", "")
+    assert _launcher_and_key("/x/ctx-env.sh m /x/render-guard.sh /x/memcheck.sh 1 /x/serve-ds4.sh --port 1") == (
+        "/x/serve-ds4.sh", "")
     if os.path.exists(SWAP_CONFIG):
         assert wired_members(), f"no ctx-env.sh-wired members found in {SWAP_CONFIG}"
 
@@ -715,7 +1272,7 @@ def main():
         return selfcheck()
 
     host = a.host or default_host()
-    for fn in (poll_nodes, poll_swap, keepalive):
+    for fn in (poll_nodes, poll_swap, keepalive, ctx_max_worker):
         threading.Thread(target=fn, daemon=True).start()
     pins = load_pins()
     print(f"Fleet on http://{host}:{a.port}   (llama-swap {SWAP})", flush=True)

@@ -126,9 +126,20 @@ tr.live td:first-child{border-left-color:var(--blue)}
 .act button:disabled{opacity:.32;cursor:default;background:var(--grid);color:var(--dim)}
 .ctx select{font-family:var(--lcars);font-size:12px;font-weight:600;letter-spacing:.06em;
   border:0;border-radius:11px;padding:3px 8px;background:var(--grid);color:var(--text);
-  cursor:pointer}
+  cursor:pointer;font-variant-numeric:tabular-nums}
 .ctx select:disabled{opacity:.32;cursor:default;color:var(--dim)}
 .ctx select.set{background:var(--blue);color:#000}
+.ctx select.atmax{background:var(--peach);color:#000}
+.eff select{font-family:var(--lcars);font-size:12px;font-weight:600;letter-spacing:.06em;
+  border:0;border-radius:11px;padding:3px 8px;background:var(--grid);color:var(--text);
+  cursor:pointer}
+.eff select:disabled{opacity:.32;cursor:default;color:var(--dim)}
+.eff select.set{background:var(--mauve);color:#000}
+/* vision flag: reflects what the member is STARTED with, not what the checkpoint could do */
+.vis{display:inline-block;margin-left:7px;padding:1px 7px;border-radius:9px;font-size:10px;
+  font-weight:700;letter-spacing:.1em;vertical-align:1px}
+.vis.on{background:var(--blue);color:#000}
+.vis.off{background:var(--grid);color:var(--dim)}
 .err{color:var(--red);font-size:12px;margin-top:3px;white-space:pre-wrap;word-break:break-word;
   letter-spacing:.03em}
 #banner{display:none;background:var(--red);color:#000;padding:7px 16px;border-radius:14px;
@@ -167,10 +178,11 @@ tr.live td:first-child{border-left-color:var(--blue)}
       <button class="pill" data-f="dynamic">Auto</button>
       <button class="pill" data-f="live">Resident</button>
       <button class="pill" data-f="pinned">Pinned</button>
+      <button class="pill" data-f="vision">Vision</button>
       <span class="count" id="count"></span>
     </div>
-    <table><thead><tr><th>Model</th><th>Node</th><th>Speed</th><th>Context</th><th>State</th>
-      <th>TTL</th><th class="act">Persistent</th></tr></thead>
+    <table><thead><tr><th>Model</th><th>Node</th><th>Speed</th><th>Context</th><th>Effort</th>
+      <th>State</th><th>TTL</th><th class="act">Persistent</th></tr></thead>
       <tbody id="rows"></tbody></table>
   </div>
 </div>
@@ -179,7 +191,7 @@ tr.live td:first-child{border-left-color:var(--blue)}
 const TAG={"jean-luc":["jl","JEAN-LUC"],"kathryn":["ka","KATHRYN"],"dynamic":["dy","AUTO"]};
 const gb=kb=>(kb/1048576).toFixed(1);
 const busy=new Set();
-const FILTERS=["all","jean-luc","kathryn","starfleet","dynamic","live","pinned"];
+const FILTERS=["all","jean-luc","kathryn","starfleet","dynamic","live","pinned","vision"];
 /* the hash makes a view bookmarkable — open #kathryn to land straight on her models */
 let filter=FILTERS.includes(location.hash.slice(1))?location.hash.slice(1):"all";
 let query="", last={nodes:{},models:[],running:[],pins:[],errors:{},loading:[]};
@@ -207,6 +219,7 @@ function keep(m,run){
     case "all": return true;
     case "live": return !!run[m.id];
     case "pinned": return m.pinned;
+    case "vision": return m.vision==="on";
     case "starfleet": return m.nodes.length>1;
     default: return m.nodes.includes(filter) && m.nodes.length===1;
   }
@@ -241,34 +254,89 @@ function nodeCard(name,n){
       `<u class="${ctrClass(c)}">${c}</u>`).join("")||"<u>no containers</u>"}</div></div>`;
 }
 
-/* The ladder ctxproxy's docs recommend sticking to -- every change is a cold
-   reload, so a handful of sizes beats a free-text box. "" = deployed default. */
-const CTX_CHOICES=[["","Default"],["8192","8K"],["16384","16K"],["32768","32K"],
-                   ["65536","64K"],["131072","128K"],["262144","256K"]];
+const CTX_LADDER=[8192,16384,32768,65536,131072,262144];
 
-function ctxOptions(cur){
-  const opts=CTX_CHOICES.slice();
-  /* a size set elsewhere (ctxproxy, or by hand) may not be on the ladder --
-     show it rather than silently rendering the wrong selection */
-  if(cur&&!opts.some(([v])=>v===String(cur))) opts.push([String(cur),String(cur)]);
-  return opts.map(([v,l])=>
-    `<option value="${v}"${String(cur||"")===v?" selected":""}>${l}</option>`).join("");
+/* Max is whichever binds first: the checkpoint's own window, or the KV pool that
+   has to hold it. Those are not the same -- Qwen3.8-Flash-Next at 262144 came up
+   with a 253952-token pool, leaving the top ~8k of the advertised window with no
+   KV behind it. Spell out which one is the limit. */
+function ctxTitle(m){
+  if(!m.ctx_max) return "Maximum not measured yet";
+  const parts=[`Max ${m.ctx_max} tokens`];
+  if(m.ctx_native&&m.ctx_pool&&m.ctx_pool<m.ctx_native)
+    parts.push(`limited by the measured KV pool (checkpoint allows ${m.ctx_native})`);
+  else if(m.ctx_pool) parts.push(`checkpoint max; KV pool holds ${m.ctx_pool}`);
+  else parts.push("checkpoint max; KV pool not measured yet");
+  return parts.join(" — ");
 }
 
-async function setCtx(model,val,resident){
-  /* vLLM sizes its KV pool at startup: there is no live resize, so this costs a
-     cold load. Only worth warning about when something is actually loaded. */
-  if(resident&&!confirm(`Change the context window for ${model}?\n\n`+
-      `vLLM allocates its KV pool at startup, so this unloads the model and `+
-      `reloads it at the new size -- a cold load of several minutes.`)){
+/* "" = the deployed default, "max" = whatever THIS model's checkpoint allows
+   (config.json max_position_embeddings, resolved server-side) -- the maximum is
+   per-model, so it cannot be a fixed entry: 262144 for Qwen3.8-Flash-Next but
+   only 40960 for Qwen3-235B. */
+function ctxOptions(m){
+  const cur=m.ctx, max=m.ctx_max, opts=[["","Default"]];
+  for(const v of CTX_LADDER){
+    if(max&&v>=max) break;            /* at or past the max: "Max" already covers it */
+    opts.push([String(v), v%1024===0?(v/1024)+"K":String(v)]);
+  }
+  if(max) opts.push(["max",`Max (${max})`]);
+  /* a size set elsewhere (ctxproxy, or by hand) may be off the ladder -- show it
+     rather than silently rendering the wrong selection */
+  if(cur&&cur!==max&&!opts.some(([v])=>v===String(cur))) opts.push([String(cur),String(cur)]);
+  const sel=cur==null?"":(max&&cur===max?"max":String(cur));
+  return opts.map(([v,l])=>
+    `<option value="${v}"${v===sel?" selected":""}>${l}</option>`).join("");
+}
+
+/* Options come from the model's own chat template, resolved server-side -- they are
+   NOT a fixed list. Qwen3.8 accepts low/medium/xhigh and its template raises on
+   anything else; GLM accepts low/high; most others are only thinking on/off. */
+function effortOptions(m){
+  const cur=m.effort||"Default";
+  const opts=(m.effort_options||[]).slice();
+  /* a value set by hand, or one no longer offered, still shows rather than
+     silently rendering the wrong selection */
+  if(cur!=="Default"&&!opts.includes(cur)) opts.push(cur);
+  return opts.map(v=>
+    `<option value="${v==="Default"?"":v}"${v===cur?" selected":""}>${v}</option>`).join("");
+}
+
+async function setEffort(model,val,resident){
+  /* Same cost model as context: this is a LOAD-TIME default, baked into the server's
+     --default-chat-template-kwargs, so changing it on a live model means a cold load. */
+  if(resident&&!confirm(
+      `Change the thinking default for ${model} to ${val||"Default"}?\n\n`+
+      `This is applied when the model starts, so it unloads and reloads -- `+
+      `a cold load of several minutes.`)){
+    render(last); return;
+  }
+  busy.add(model); render(last);
+  try{
+    const r=await fetch("/api/effort",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({model,effort:val||null})});
+    if(!r.ok) alert((await r.json()).error||"failed");
+  }catch(err){ alert(err.message); }
+  busy.delete(model); refresh();
+}
+
+async function setCtx(model,val,resident,max){
+  const n = val===""?null : (val==="max"?max:Number(val));
+  if(val==="max"&&!max){ alert("This model's maximum has not been resolved yet."); return; }
+  /* The KV pool is sized at startup -- there is no live resize, so changing a
+     loaded model costs a full cold load. Only worth warning about when one is up. */
+  if(resident&&!confirm(
+      `Change the context window for ${model} to ${n===null?"the deployed default":n+" tokens"}?\n\n`+
+      `The KV pool is allocated at startup, so this unloads the model and reloads `+
+      `it at the new size -- a cold load of several minutes.`)){
     render(last); return;
   }
   busy.add(model); render(last);
   try{
     const r=await fetch("/api/ctx",{method:"POST",headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({model,ctx:val?Number(val):null})});
+      body:JSON.stringify({model,ctx:n})});
     if(!r.ok) alert((await r.json()).error||"failed");
-  }catch(e){ alert(e.message); }
+  }catch(err){ alert(err.message); }
   busy.delete(model); refresh();
 }
 
@@ -338,15 +406,32 @@ function render(s){
     (c.pinned-a.pinned)||((run[c.id]?1:0)-(run[a.id]?1:0))||a.id.localeCompare(c.id));
   document.getElementById("count").textContent=`${shown.length} of ${s.models.length}`;
 
-  document.getElementById("rows").innerHTML = shown.length ? shown.map(m=>{
+  /* Never replace the table while a context dropdown has focus: the 3s poll would
+     close it mid-choice. Everything else on the page still updates. */
+  const _ae=document.activeElement;
+  const _picking=!!(_ae&&_ae.classList&&(_ae.classList.contains("ctxsel")||
+                                          _ae.classList.contains("effsel")));
+
+  if(!_picking) document.getElementById("rows").innerHTML = shown.length ? shown.map(m=>{
     const r=run[m.id], working=busy.has(m.id), loading=loadingIds.has(m.id),
           st=loading?"loading":working?"working":(r?r.state:"stopped");
     return `<tr class="${m.pinned?"pinned":r?"live":""}">
-      <td><div class="mid">${m.id}</div>${m.error?`<div class="err">${m.error}</div>`:""}</td>
+      <td><div class="mid">${m.id}${m.vision?`<span class="vis ${m.vision}" title="${
+        m.vision==="on"?"Vision tower ACTIVE — this member accepts images"
+        :"Has a vision tower, but started text-only (--limit-mm-per-prompt image:0)"
+        }">IMG${m.vision==="off"?" OFF":""}</span>`:""}</div>${
+        m.error?`<div class="err">${m.error}</div>`:""}</td>
       <td>${m.nodes.map(n=>`<span class="tag ${TAG[n][0]}">${TAG[n][1]}</span>`).join("")}</td>
       <td class="mid">${m.tps?m.tps+" T/S":"&mdash;"}</td>
-      <td class="ctx">${m.ctx_capable?`<select class="${m.ctx?"set":""}" ${working?"disabled":""}
-        onchange="setCtx('${m.id}',this.value,${!!r})">${ctxOptions(m.ctx)}</select>`:"&mdash;"}</td>
+      <td class="ctx">${m.ctx_capable?`<select class="ctxsel${m.ctx?(m.ctx===m.ctx_max?" atmax":" set"):""}"
+        ${working?"disabled":""} title="${ctxTitle(m)}"
+        onchange="setCtx('${m.id}',this.value,${!!r},${m.ctx_max||"null"})"
+        >${ctxOptions(m)}</select>`:"&mdash;"}</td>
+      <td class="eff">${(m.effort_options||[]).length?`<select class="effsel${
+        m.effort&&m.effort!=="Default"?" set":""}" ${working?"disabled":""}
+        title="Thinking default applied at load time (a request may still override it)"
+        onchange="setEffort('${m.id}',this.value,${!!r})">${effortOptions(m)}</select>`
+        :"&mdash;"}</td>
       <td><span class="st ${st}">${st}</span></td>
       <td class="mid">${r&&r.ttl?Math.round(r.ttl/60)+" MIN":"&mdash;"}</td>
       <td class="act">
@@ -354,7 +439,7 @@ function render(s){
           onclick="act('/api/pin','${m.id}',${!m.pinned})">${m.pinned?"Pinned":"Pin"}</button>
         <button ${working||!r?"disabled":""}
           onclick="act('/api/unload','${m.id}')">Unload</button></td></tr>`;
-  }).join("") : `<tr><td colspan="7" class="empty">No models match this filter</td></tr>`;
+  }).join("") : `<tr><td colspan="8" class="empty">No models match this filter</td></tr>`;
 
   document.getElementById("clock").textContent=new Date().toLocaleTimeString();
 }
