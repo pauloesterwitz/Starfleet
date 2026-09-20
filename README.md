@@ -86,6 +86,46 @@ gemma4-31b-19tps-starfleet    tensor-parallel across BOTH
 The embedded tok/s figure is the measured single-stream throughput of that exact
 configuration, so the fastest option is obvious from the name alone.
 
+### Memory-aware admission control: memcheck.sh
+
+llama-swap has no built-in idea how much memory a host actually has free before
+starting a model — there's an open ask for exactly that
+([mostlygeek/llama-swap#158](https://github.com/mostlygeek/llama-swap/issues/158)),
+closed `not_planned`. With 28 models sharing ~121 GiB per node, an unguarded
+`cmd:` means the failure mode is an OOM kill mid-load, not a clean refusal.
+
+Every member's `cmd:` in [`config.yaml`](cluster/llama-swap/config.yaml) runs
+through [`memcheck.sh`](cluster/llama-swap/memcheck.sh) first — a pure
+preflight gate, read-only, that never evicts anything:
+
+```
+MemAvailable + reclaimable_ollama - live_reservations  >=  need_mb
+```
+
+`live_reservations` reads a ledger shared with the image/video generation
+pipeline, so an LLM load and a ComfyUI render never blind-collide for the same
+unified memory pool. Two more things it does before that arithmetic, both
+earned by real incidents: drops page cache before a big load (`MemAvailable`
+counts reclaimable cache that a large burst allocation can't reclaim fast
+enough on its own — this caused two OOMs while the check reported 114 GiB
+free), and reaps orphaned two-node TP clusters (`ds4-tp2`, `sglang-tp2`) that
+survive their own teardown trap and silently strand ~90–100 GiB each,
+otherwise invisible to everything else. The orphan check requires two
+independent signals to agree — llama-swap's own `/running` list *and* a
+launcher-pid ownership label on the container — because a fully healthy,
+fully responsive orphan once held memory for two hours before this existed.
+
+The `ds4-nvfp4-tp2` member (a two-Spark Ray cluster, not a single process)
+adds [`ds4-tp2-proxy-guard.sh`](cluster/llama-swap/ds4-tp2-proxy-guard.sh) on
+top: a liveness probe decides whether to launch the cluster (llama-swap owns
+it, tears it down on evict) or park with `sleep infinity` and proxy to a
+cluster already running outside llama-swap's control (started by hand or a
+systemd unit) — so llama-swap never thinks it owns something it didn't start.
+
+Full write-up, incident-by-incident: see the source comments in
+[`memcheck.sh`](cluster/llama-swap/memcheck.sh) and
+[`ds4-tp2-proxy-guard.sh`](cluster/llama-swap/ds4-tp2-proxy-guard.sh).
+
 ---
 
 ## Why tensor parallelism matters here
