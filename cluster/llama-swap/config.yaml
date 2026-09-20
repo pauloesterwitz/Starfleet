@@ -611,6 +611,55 @@ models:
     checkEndpoint: /health
     ttl: 3600
 
+  # Kathryn twin of embeddinggemma, added 2026-09-18: serve-kathryn-embed.sh has documented
+  # embeddinggemma support since 2026-09-14 (weights + serve-embed.sh already on Kathryn,
+  # verified that day) but no config.yaml member ever used it — same gap the nomic-embed-text
+  # and bge-reranker-v2-m3 twins below already closed. Same ssh/tunnel pattern.
+  embeddinggemma-kathryn:
+    cmd: /home/pauloesterwitz/llama-swap/serve-kathryn-embed.sh embeddinggemma --port ${PORT}
+    proxy: http://127.0.0.1:${PORT}
+    checkEndpoint: /health
+    ttl: 3600
+    useModelName: embeddinggemma
+
+  # Kathryn twin of nomic-embed-text, added 2026-09-14: Jean-Luc's own pool can run razor-thin
+  # when a big local member is resident (observed: a plain nomic-embed-text load CUDA-OOM'd here
+  # against qwen38fn-sglang-tp2-starfleet even though it only needs ~1GB). Kathryn's memcheck
+  # passed cleanly for the same 4000MB requirement despite hosting that same model's TP1 shard —
+  # verified end-to-end (768-dim, L2-normalised, ~770MB actual usage, no disturbance to either
+  # TP shard). Uses serve-kathryn-embed.sh, not serve-kathryn.sh (embeddings aren't
+  # serve-vllm-dflash.sh-dispatched — see that script's header). Same co-resident semantics as
+  # its Jean-Luc sibling, so it belongs in the `embeddings` group below, NOT the `kathryn` group
+  # (that one's swap:true is for the big single-node-selectable LLM variants, wrong here).
+  nomic-embed-text-kathryn:
+    cmd: /home/pauloesterwitz/llama-swap/serve-kathryn-embed.sh nomic-embed-text --port ${PORT}
+    proxy: http://127.0.0.1:${PORT}
+    checkEndpoint: /health
+    ttl: 3600
+    # serve-embed.sh's --served-model-name is the KEY passed to it above (nomic-embed-text,
+    # not this member's own name) — without this, vLLM 404s any request naming the member
+    # (same bug class already fixed once in this file for qwen38flashnext-starfleet, see its
+    # useModelName comment).
+    useModelName: nomic-embed-text
+
+  # Cross-encoder reranker (BAAI/bge-reranker-v2-m3, XLMRobertaForSequenceClassification),
+  # added 2026-09-17. Same co-resident tiny-model pattern as the embedders above: served by
+  # serve-embed.sh's vLLM pooling runner, gated by its own internal memcheck. Exposes
+  # /v1/rerank and /v1/score once up.
+  bge-reranker-v2-m3:
+    cmd: /home/pauloesterwitz/llama-swap/serve-embed.sh bge-reranker-v2-m3 --port ${PORT}
+    proxy: http://127.0.0.1:${PORT}
+    checkEndpoint: /health
+    ttl: 3600
+
+  # Kathryn twin, same ssh/tunnel pattern as nomic-embed-text-kathryn above.
+  bge-reranker-v2-m3-kathryn:
+    cmd: /home/pauloesterwitz/llama-swap/serve-kathryn-embed.sh bge-reranker-v2-m3 --port ${PORT}
+    proxy: http://127.0.0.1:${PORT}
+    checkEndpoint: /health
+    ttl: 3600
+    useModelName: bge-reranker-v2-m3
+
   # ── ComfyUI image backend, moved off the always-on systemd unit and under llama-swap ──
   # so it idle-unloads instead of sitting resident forever (Paul asked for 2h auto-pause,
   # 2026-07-20). Own group below (own container, doesn't compete for GB10 pool with LLMs).
@@ -709,6 +758,10 @@ routing:
           members:
             - nomic-embed-text
             - embeddinggemma
+            - nomic-embed-text-kathryn
+            - embeddinggemma-kathryn
+            - bge-reranker-v2-m3
+            - bge-reranker-v2-m3-kathryn
         imagegen:
           swap: false
           exclusive: false

@@ -179,6 +179,7 @@ tr.live td:first-child{border-left-color:var(--blue)}
       <button class="pill" data-f="live">Resident</button>
       <button class="pill" data-f="pinned">Pinned</button>
       <button class="pill" data-f="vision">Vision</button>
+      <button class="pill" data-f="embed">Embeddings</button>
       <span class="count" id="count"></span>
     </div>
     <table><thead><tr><th>Model</th><th>Node</th><th>Speed</th><th>Context</th><th>Effort</th>
@@ -191,7 +192,7 @@ tr.live td:first-child{border-left-color:var(--blue)}
 const TAG={"jean-luc":["jl","JEAN-LUC"],"kathryn":["ka","KATHRYN"],"dynamic":["dy","AUTO"]};
 const gb=kb=>(kb/1048576).toFixed(1);
 const busy=new Set();
-const FILTERS=["all","jean-luc","kathryn","starfleet","dynamic","live","pinned","vision"];
+const FILTERS=["all","jean-luc","kathryn","starfleet","dynamic","live","pinned","vision","embed"];
 /* the hash makes a view bookmarkable — open #kathryn to land straight on her models */
 let filter=FILTERS.includes(location.hash.slice(1))?location.hash.slice(1):"all";
 let query="", last={nodes:{},models:[],running:[],pins:[],errors:{},loading:[]};
@@ -221,6 +222,7 @@ function keep(m,run){
     case "pinned": return m.pinned;
     case "vision": return m.vision==="on";
     case "starfleet": return m.nodes.length>1;
+    case "embed": return /embed|rerank/i.test(m.id);
     default: return m.nodes.includes(filter) && m.nodes.length===1;
   }
 }
