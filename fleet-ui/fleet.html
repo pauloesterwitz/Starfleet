@@ -222,59 +222,84 @@ function isImg(m){ return !!(m.kind && m.kind!=="llm"); }
 
 const KINDLBL={image:"Image",video:"Video",judge:"Visual QA"};
 
-/* Same base model deployed separately on each node (e.g. foo-jean-luc / foo-kathryn)
-   shows up in /api/state as two independent rows -- they really are two separate
-   llama-swap catalog members, each already bound to one machine. Collapse such a
-   pair into one row with a Machine picker so the table isn't full of near-duplicates;
-   picking a machine just switches which of the two already-existing deployments this
-   row displays/controls, it does not move anything. A model that only exists on one
-   node (or is -starfleet/-fastest-node, which are their own single deployment) is
-   left alone -- there is nothing to pick between, so nothing is offered.
-   ponytail: base name = id with the trailing -jean-luc/-kathryn stripped. If that
-   heuristic ever misfires (two unrelated models sharing a prefix), give families an
-   explicit id from the backend instead of inferring one from the name. */
-function familyBase(id){
-  const m=/^(.*)-(jean-luc|kathryn)$/.exec(id);
-  return m?m[1]:null;
+/* One logical model deployed on each node separately is several independent llama-swap
+   members -- qwen3.6-35b-85tps-mtp4-jean-luc, -87tps-mtp4-kathryn, -86tps-mtp4-fastest-node
+   are one model, three catalog entries, three near-duplicate rows. Collapse them into one
+   row with a Machine picker; picking switches which of the already-existing deployments
+   this row displays and controls, it does not move anything.
+
+   The base name has to survive TWO node-specific things in the id: the node suffix, and
+   the MEASURED throughput baked into the name, which differs per node precisely because
+   it was measured there (85 vs 87 tps for the same weights). Strip both. A member with no
+   suffix at all is Jean-Luc's -- node_of() says so, and that is how nomic-embed-text pairs
+   with nomic-embed-text-kathryn.
+
+   TP=2 members span both nodes by definition, so there is no machine to pick: they are
+   excluded, along with anything else that isn't on exactly one node.
+   ponytail: the family is inferred from the naming convention, same convention node_of()
+   already parses. If it ever misfires, have the backend declare a family id instead. */
+const TPS_IN_NAME=/-\d+(?:\.\d+)?tps(?=-|$)/;
+function familyBase(m){
+  if(isImg(m)||m.nodes.length!==1||/-tp2(?=-|$)|-starfleet$/.test(m.id)) return null;
+  return m.id.replace(/-(jean-luc|kathryn|fastest-node)$/,"").replace(TPS_IN_NAME,"");
 }
-const machineSel={};   // base name -> sticky "jean-luc"/"kathryn" pick across renders
-const MACHINE_ORDER=["jean-luc","kathryn"];
+const machineSel={};   // base name -> sticky machine pick across renders
+const MACHINE_ORDER=["jean-luc","kathryn","dynamic"];
 function setMachine(base,node){ machineSel[base]=node; render(last); }
 
 function groupModels(models,run){
   const byBase={}, out=[];
   for(const m of models){
-    const base=!isImg(m)&&familyBase(m.id);
+    const base=familyBase(m);
     if(base){ (byBase[base]=byBase[base]||[]).push(m); } else out.push(m);
   }
   for(const base in byBase){
     const variants=byBase[base];
-    if(variants.length<2){ out.push(variants[0]); continue; }
-    variants.sort((a,c)=>MACHINE_ORDER.indexOf(a.nodes[0])-MACHINE_ORDER.indexOf(c.nodes[0]));
-    const byMachine={}; variants.forEach(v=>byMachine[v.nodes[0]]=v);
+    const byMachine={};
+    let ambiguous=false;
+    for(const v of variants){
+      /* Two members claiming the same machine means the base name lost something that
+         really distinguishes them. Merging would hide a row, so don't: list them all. */
+      if(byMachine[v.nodes[0]]) ambiguous=true; else byMachine[v.nodes[0]]=v;
+    }
+    if(ambiguous||variants.length<2){ out.push(...variants); continue; }
     const pick =
-      (filter==="jean-luc"||filter==="kathryn")&&byMachine[filter] ? filter :
+      byMachine[filter] ? filter :
       byMachine[machineSel[base]] ? machineSel[base] :
       variants.find(v=>run[v.id]) ? variants.find(v=>run[v.id]).nodes[0] :
       variants.find(v=>v.pinned) ? variants.find(v=>v.pinned).nodes[0] :
-      variants[0].nodes[0];
+      MACHINE_ORDER.find(n=>byMachine[n]);
     machineSel[base]=pick;
-    out.push(Object.assign({},byMachine[pick],{_base:base,_family:Object.keys(byMachine)}));
+    out.push(Object.assign({},byMachine[pick],
+      {_base:base,_family:MACHINE_ORDER.filter(n=>byMachine[n])}));
   }
   return out;
 }
 (function selfCheck(){
+  const llm=(id,node,extra)=>Object.assign({id,kind:"llm",nodes:[node],pinned:false},extra);
   const g=groupModels([
-    {id:"foo-jean-luc",kind:"llm",nodes:["jean-luc"],pinned:false},
-    {id:"foo-kathryn",kind:"llm",nodes:["kathryn"],pinned:false},
-    {id:"bar-jean-luc",kind:"llm",nodes:["jean-luc"],pinned:false},
+    /* the real shapes: per-node tps in the name, an unsuffixed Jean-Luc twin, a
+       fastest-node third member, a lone model, and a TP=2 member */
+    llm("qwen3.6-35b-85tps-mtp4-jean-luc","jean-luc"),
+    llm("qwen3.6-35b-87tps-mtp4-kathryn","kathryn"),
+    llm("qwen3.6-35b-86tps-mtp4-fastest-node","dynamic"),
+    llm("nomic-embed-text","jean-luc"),
+    llm("nomic-embed-text-kathryn","kathryn"),
+    llm("qwen3.8-27b-19tps-jean-luc","jean-luc"),
+    llm("qwen3.8-27b-vision-jean-luc","jean-luc"),
+    llm("deepseek-v4-flash","jean-luc"),
+    {id:"qwen38fn-sglang-tp2-starfleet",kind:"llm",nodes:["jean-luc","kathryn"],pinned:false},
   ],{});
-  console.assert(g.length===2,"groupModels: expected 1 merged family + 1 lone row",g);
-  const fam=g.find(m=>m._family);
-  console.assert(fam&&fam._family.length===2&&fam._family.includes("jean-luc")&&fam._family.includes("kathryn"),
-    "groupModels: family must offer exactly the machines that exist",fam);
-  const lone=g.find(m=>!m._family);
-  console.assert(lone&&lone.id==="bar-jean-luc","groupModels: lone deployment stays ungrouped",lone);
+  const fam=b=>g.find(m=>m._base===b);
+  console.assert(fam("qwen3.6-35b-mtp4")&&fam("qwen3.6-35b-mtp4")._family.join()==="jean-luc,kathryn,dynamic",
+    "groupModels: per-node tps must not split a family",fam("qwen3.6-35b-mtp4"));
+  console.assert(fam("nomic-embed-text")&&fam("nomic-embed-text")._family.join()==="jean-luc,kathryn",
+    "groupModels: an unsuffixed member is Jean-Luc's half of the pair",fam("nomic-embed-text"));
+  console.assert(!fam("qwen3.8-27b")&&!fam("qwen3.8-27b-vision"),
+    "groupModels: lone deployments stay ungrouped, and vision is its own model");
+  console.assert(g.some(m=>m.id==="qwen38fn-sglang-tp2-starfleet"&&!m._family),
+    "groupModels: TP=2 members are never given a machine picker");
+  console.assert(g.length===6,"groupModels: 9 members -> 2 families + 4 lone rows",g.map(m=>m.id));
 })();
 
 /* Image/video models share the registry table but fill it differently: they are not
