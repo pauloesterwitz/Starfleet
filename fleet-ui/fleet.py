@@ -23,6 +23,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -47,6 +48,7 @@ MIN_COLD_LOAD = 5.0  # seconds; below this a "cold" touch was really a ttl refre
 # llama-swap/ctxproxy.py. Writing it here is the documented contract; ctxproxy
 # is a pure request relay with no control endpoint to call instead.
 CTX_DIR = os.path.join(os.environ.get("GB10_STATE_DIR") or os.path.expanduser("~/.gb10"), "ctx")
+CTX_MAX_DIR = os.path.join(os.environ.get("GB10_STATE_DIR") or os.path.expanduser("~/.gb10"), "ctxmax")
 SWAP_CONFIG = os.path.expanduser("~/llama-swap/config.yaml")
 MIN_CTX, MAX_CTX = 256, 1048576  # the bounds ctx-env.sh and ctxproxy both enforce
 MODELS_DIR = os.path.expanduser("~/models")
@@ -78,6 +80,169 @@ LOCK = threading.Lock()
 
 # ---------------------------------------------------------------- helpers
 
+# Where ComfyUI actually runs. The `imagegen` member is STARTED by Jean-Luc's llama-swap
+# but the container, and therefore every byte of image/video memory, lives on the node
+# this URL points at -- for a long time this UI reported it as jean-luc, which was simply
+# wrong. Fabric IPs follow the cluster convention (run-sglang-tp2-cluster.sh).
+COMFYUI_URL = os.environ.get("FLEET_COMFYUI_URL", "http://10.100.0.1:8188")
+_FABRIC_NODES = {"10.100.0.1": "kathryn", "10.100.1.1": "kathryn",
+                 "10.100.0.2": "jean-luc", "10.100.1.2": "jean-luc",
+                 "127.0.0.1": "jean-luc", "localhost": "jean-luc"}
+
+
+def comfyui_node():
+    """Node name ComfyUI runs on, for the Image Creation rows."""
+    host = urllib.parse.urlparse(COMFYUI_URL).hostname or "127.0.0.1"
+    return _FABRIC_NODES.get(host, host)
+
+
+# ---- Image Creation catalog -------------------------------------------------------
+# The image/video models live in Speech-to-Image's presets.FLEET_MODELS, not in
+# llama-swap's config.yaml: llama-swap sees exactly ONE member here (`imagegen`, the
+# ComfyUI container) and cannot tell which model is loaded inside it. Reading that table
+# is what lets this UI show a real footprint per image/video model instead of one opaque
+# row. Cached on mtime so editing the catalog needs no fleet-ui restart.
+IMAGEGEN_REPO = os.environ.get("FLEET_IMAGEGEN_REPO",
+                               os.path.expanduser("~/Speech-to-Image"))
+
+# Where each image/video model should run, and what we last warmed there:
+#   {"<model id>": {"node": "kathryn", "loaded_at": 1234567890.0}}
+# Speech-to-Image reads the same file to route a render, so this one choice decides
+# both what the UI shows and where the job actually goes.
+IMG_NODE_FILE = os.path.expanduser("~/.config/fleet-ui/image-nodes.json")
+
+# Every node that can run a render, and how to reach its ComfyUI. Fabric IPs, never the
+# LAN or tailnet: ComfyUI has no auth (see run-comfyui.sh).
+COMFY_ENDPOINTS = {"jean-luc": "http://10.100.0.2:8188",
+                   "kathryn":  "http://10.100.0.1:8188"}
+DEFAULT_IMG_NODE = os.environ.get("FLEET_DEFAULT_IMAGE_NODE", "kathryn")
+_img_cache = {"mtime": None, "models": []}
+
+
+def image_models():
+    """[{id, kind, need_mb, note}] from the imagegen catalog. [] if it isn't there --
+    fleet-ui must still start on a box without the image stack."""
+    path = os.path.join(IMAGEGEN_REPO, "presets.py")
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return []
+    if mtime == _img_cache["mtime"]:
+        return _img_cache["models"]
+    models = []
+    try:
+        if IMAGEGEN_REPO not in sys.path:
+            sys.path.insert(0, IMAGEGEN_REPO)
+        import importlib
+        import presets
+        importlib.reload(presets)
+        models = [dict(id=k, **v) for k, v in presets.FLEET_MODELS.items()]
+    except Exception as e:
+        print(f"fleet: image catalog unreadable: {e}", flush=True)
+    _img_cache.update(mtime=mtime, models=models)
+    return models
+
+
+def load_img_nodes():
+    try:
+        with open(IMG_NODE_FILE) as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_img_nodes(d):
+    os.makedirs(os.path.dirname(IMG_NODE_FILE), exist_ok=True)
+    with open(IMG_NODE_FILE, "w") as f:
+        json.dump(d, f, indent=2, sort_keys=True)
+
+
+def img_node(model, prefs=None):
+    """Node this image model is assigned to."""
+    prefs = load_img_nodes() if prefs is None else prefs
+    n = (prefs.get(model) or {}).get("node")
+    return n if n in COMFY_ENDPOINTS else DEFAULT_IMG_NODE
+
+
+def _warm_workflow(model):
+    """A deliberately tiny render that forces ComfyUI to load the model's weights.
+
+    ComfyUI has no "load model" API -- weights arrive lazily on the first prompt that
+    needs them, and only nodes feeding an output actually execute. So the cheapest
+    honest warm-up is a real render at the smallest size the model tolerates, with the
+    fewest steps. 256px / 1 step costs a couple of seconds once the weights are read.
+    Returns None for a model we have no warm graph for.
+    """
+    if model == "qwen-image-2.1":
+        return {
+            "1": {"class_type": "UNETLoader",
+                  "inputs": {"unet_name": "qwen_image_2.1_bf16.safetensors",
+                             "weight_dtype": "default"}},
+            "2": {"class_type": "CLIPLoader",
+                  "inputs": {"clip_name": "qwen3vl_8b_bf16.safetensors",
+                             "type": "qwen_image"}},
+            "3": {"class_type": "VAELoader",
+                  "inputs": {"vae_name": "qwen_image_2.1_vae_bf16.safetensors"}},
+            "4": {"class_type": "TextEncodeQwenImage21",
+                  "inputs": {"clip": ["2", 0], "prompt": "warmup",
+                             "negative_prompt": "", "resolution": 256, "images": {}}},
+            "5": {"class_type": "EmptyLatentImage",
+                  "inputs": {"width": 256, "height": 256, "batch_size": 1}},
+            "6": {"class_type": "KSampler",
+                  "inputs": {"seed": 1, "steps": 1, "cfg": 1.0, "sampler_name": "euler",
+                             "scheduler": "simple", "denoise": 1.0, "model": ["1", 0],
+                             "positive": ["4", 0], "negative": ["4", 1],
+                             "latent_image": ["5", 0]}},
+            "7": {"class_type": "VAEDecode", "inputs": {"samples": ["6", 0], "vae": ["3", 0]}},
+            "8": {"class_type": "PreviewImage", "inputs": {"images": ["7", 0]}},
+        }
+    return None
+
+
+def warm_image_model(model, node):
+    """Queue the warm-up graph on `node`. Returns (ok, message)."""
+    wf = _warm_workflow(model)
+    if wf is None:
+        return False, (f"no warm-up graph for {model} yet -- it will load on its next "
+                       f"real render on {node}")
+    url = COMFY_ENDPOINTS[node] + "/prompt"
+    try:
+        req = urllib.request.Request(
+            url, data=json.dumps({"prompt": wf}).encode(),
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            json.load(r)
+        return True, f"warming {model} on {node}"
+    except urllib.error.HTTPError as e:
+        try:
+            err = json.load(e)
+            msg = (err.get("error") or {}).get("message") or str(e)
+            for ne in (err.get("node_errors") or {}).values():
+                for d in ne.get("errors", []):
+                    msg = f"{msg}: {d.get('message')}"
+                    break
+                break
+        except Exception:
+            msg = str(e)
+        return False, msg[:300]
+    except (urllib.error.URLError, OSError) as e:
+        return False, f"{node} unreachable: {str(e)[:150]}"
+
+
+def unload_image_models(node):
+    """POST /free on a node: drops ComfyUI's weights without killing the container."""
+    url = COMFY_ENDPOINTS[node] + "/free"
+    try:
+        req = urllib.request.Request(
+            url, data=json.dumps({"unload_models": True, "free_memory": True}).encode(),
+            headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=20).read()
+        return True, f"unloaded image weights on {node}"
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError) as e:
+        return False, f"{node}: {str(e)[:150]}"
+
+
 def node_of(model):
     """Which machines a model occupies. Encoded in the name suffix by config.yaml."""
     for suffix, nodes in (
@@ -88,11 +253,57 @@ def node_of(model):
     ):
         if model.endswith(suffix):
             return nodes
-    return ["jean-luc"]  # embeds + imagegen are started by Jean-Luc's llama-swap
+    if model == "imagegen":
+        return [comfyui_node()]
+    return ["jean-luc"]  # embeds are started by Jean-Luc's llama-swap
+
+
+TPS_FILE = os.path.expanduser("~/.config/fleet-ui/tps.json")
+_tps_override = {}
+_tps_mtime = None
+
+
+def _load_tps_overrides():
+    """Measured tok/s for members whose NAME carries no -<N>tps- marker.
+
+    The SPEED column originally had one source: the member id. That works for
+    `gemma4-26b-54tps-jean-luc` and not at all for `qwen38fn-long-sglang-tp2-starfleet`,
+    so every big TP=2 member rendered as "-". Renaming them is not an option -- the id is
+    the model name opencode, litellm/claude-local, the ctx state files and RAG-Lab all
+    address, so a rename to carry a number would break every one of them. A measured value
+    belongs in data anyway, not in an identifier: it changes when the config changes.
+    Reloaded on mtime so editing the file needs no restart. Values may be a bare number or
+    {"tps": n, "src": "..."} -- keep the provenance, these numbers go stale silently.
+    """
+    global _tps_override, _tps_mtime
+    try:
+        st = os.stat(TPS_FILE).st_mtime
+    except OSError:
+        return
+    if st == _tps_mtime:
+        return
+    try:
+        with open(TPS_FILE) as fh:
+            raw = json.load(fh)
+    except (OSError, ValueError):
+        return
+    out = {}
+    for k, v in raw.items():
+        if k.startswith("_"):
+            continue
+        if isinstance(v, dict):
+            v = v.get("tps")
+        if isinstance(v, (int, float)):
+            out[k] = v
+    _tps_override, _tps_mtime = out, st
 
 
 def tps_of(model):
-    """The measured tok/s baked into the model name, e.g. '...-57tps-mtp4-...' -> 57."""
+    """The measured tok/s for a member: the overrides file first, then the number baked
+    into the model name, e.g. '...-57tps-mtp4-...' -> 57."""
+    _load_tps_overrides()
+    if model in _tps_override:
+        return _tps_override[model]
     m = re.search(r"-(\d+)tps", model)
     return int(m.group(1)) if m else None
 
@@ -224,6 +435,23 @@ def read_ctx(member):
     return ctx if MIN_CTX <= ctx <= MAX_CTX else None
 
 
+def read_ctx_ceiling(member):
+    """The largest context this member may be SET to, from ~/.gb10/ctxmax/<member>.
+
+    Why this exists: the offered Max is min(checkpoint window, measured KV pool), and the pool only
+    reflects the context the member is loaded at RIGHT NOW. A GLM member serving 256k therefore
+    advertised 256k -- or 32768 before its pool was ever parsed -- so the Context control could
+    never step UP to what the member is actually allowed to serve. serve-sglang.sh clamps to the
+    same number, so the control and the launcher agree instead of contradicting each other.
+    """
+    try:
+        with open(os.path.join(CTX_MAX_DIR, member)) as fh:
+            ctx = int(fh.read().strip().split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+    return ctx if MIN_CTX <= ctx <= MAX_CTX else None
+
+
 def read_all_ctx():
     try:
         names = os.listdir(CTX_DIR)
@@ -327,7 +555,7 @@ def observe_pools():
     sgl_pool, sgl_ctx = _pool_from_sglang_text(sgl_text) if sgl_text else (None, None)
     # SGLang echoes its args as server_args=ServerArgs(model_path='/models/X', ...),
     # NOT as the --model-path form the docker cmd uses. Match both.
-    m = re.search(r"model[_-]path[=\s]+['\"]?/models/([A-Za-z0-9._-]+)", sgl_text or "")
+    m = re.search(r"model[_-]path['\"]?\s*[:=]\s*['\"]?/models/([A-Za-z0-9._-]+)", sgl_text or "")
     sgl_sub = m.group(1) if m else None
 
     changed = False
@@ -464,6 +692,25 @@ def _deployed_ctx(argv):
     return int(m.group(1)) if m else None
 
 
+def _rope_override_max(argv):
+    """The window a rope-scaling override buys, from the launcher's own DRYRUN argv.
+
+    A member can serve PAST its checkpoint's max_position_embeddings when it is started
+    with a RoPE override: qwen38fn-long runs Qwen3.8-Flash-Next (262,144 in config.json)
+    at 524,288 with `--json-model-override-args {"text_config":{"max_position_embeddings":
+    524288,"rope_parameters":{"rope_type":"yarn",...}}}`. Without this, _native_max reads
+    the checkpoint and caps the member at half of what it actually serves -- the two
+    members share one checkpoint directory, so the file alone cannot tell them apart.
+    Only an override that ALSO scales rope counts: raising max_position_embeddings on its
+    own does not extend anything, it just removes the guard rail.
+    """
+    flat = (argv or "").replace("\\", "")
+    if "rope_type" not in flat and "rope_scaling" not in flat:
+        return None
+    m = re.search(r'max_position_embeddings\\?"?\s*:\s*(\d+)', flat)
+    return int(m.group(1)) if m else None
+
+
 def _usable_max(native, pool, deployed):
     """The largest context worth offering as "Max".
 
@@ -551,7 +798,8 @@ def resolve_ctx_max():
             sub_, argv = _model_subdir(launcher, key)
             dep = _deployed_ctx(argv)
             if sub_:
-                val = _native_max(sub_)
+                # a rope override outranks the checkpoint: same weights, wider window
+                val = _rope_override_max(argv) or _native_max(sub_)
                 vis = _vision_from(argv, _has_vision_tower(sub_))
         if val and key:
             by_key[key] = (val, sub_, vis, dep)
@@ -1047,15 +1295,55 @@ class Handler(BaseHTTPRequestHandler):
                     "load_eta": eta_for(m, times),
                     "ctx": ctxs.get(m),
                     "ctx_capable": m in wired,
-                    "ctx_max": maxes.get(m),
+                    "ctx_max": read_ctx_ceiling(m) or maxes.get(m),
                     "ctx_native": natives.get(m),
                     "ctx_deployed": deployeds.get(m),
                     "vision": visions.get(m),
                     "effort": read_effort(m),
                     "effort_options": [o["label"] for o in (_effort_opts.get(m) or [])],
                     "ctx_pool": (pools.get(m) or {}).get("pool"),
+                    "kind": "llm",
                 }
                 for m in snap["models"]
+            ]
+            _img_prefs = load_img_nodes()
+            # Image Creation rows. These are NOT llama-swap members -- they live inside
+            # the single `imagegen` container -- so they carry no ttl/context/tps and no
+            # pin/unload controls. What they do carry is the footprint the admission gate
+            # reserves on the ComfyUI node, which is the number that matters when an LLM
+            # load and a render compete for the same pool.
+            snap["models"] += [
+                {
+                    "id": im["id"],
+                    "nodes": [img_node(im["id"], _img_prefs)],
+                    "tps": None,
+                    "pinned": False,
+                    "error": None,
+                    "load_eta": None,
+                    "ctx": None,
+                    "ctx_capable": False,
+                    "ctx_max": None,
+                    "ctx_native": None,
+                    "ctx_deployed": None,
+                    "vision": None,
+                    "effort": None,
+                    "effort_options": [],
+                    "ctx_pool": None,
+                    "kind": im.get("kind", "image"),
+                    "need_mb": im.get("need_mb"),
+                    "note": im.get("note"),
+                    # Our own record of the last warm-up, not something ComfyUI can be
+                    # asked: it exposes no loaded-model list, and memcheck.sh may call
+                    # /free behind our back. Treat it as "we put it there", not gospel.
+                    "loaded_at": (_img_prefs.get(im["id"]) or {}).get("loaded_at"),
+                    "img_nodes": sorted(COMFY_ENDPOINTS),
+                }
+                # kind="judge" is excluded: the visual-QA critic is a real llama-swap
+                # member (qwen3vl32-vision-starfleet) and already has a Model Registry
+                # row on its true node. It lives in the catalog only so the image
+                # pipeline and the fleet quote one number for it -- listing it here too
+                # would both duplicate it and put it on the wrong machine.
+                for im in image_models() if im.get("kind") != "judge"
             ]
             now = time.time()
             with _loading_lock:
@@ -1075,7 +1363,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(400, '{"error":"bad json"}', "application/json")
         model = body.get("model")
         known = STATE["models"]
-        if not model or (known and model not in known):
+        img_ids = {m["id"] for m in image_models()}
+        # image models are not llama-swap members, so they are never in STATE["models"]
+        if not model or (known and model not in known and model not in img_ids):
             return self._send(400, '{"error":"unknown model"}', "application/json")
 
         if self.path == "/api/pin":
@@ -1139,6 +1429,52 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(502, json.dumps({"error": str(e)[:200]}), "application/json")
             return self._send(200, '{"ok":true}', "application/json")
 
+        if self.path == "/api/imgnode":
+            node = body.get("node")
+            if node not in COMFY_ENDPOINTS:
+                return self._send(400, json.dumps(
+                    {"error": f"unknown node {node!r}; have {sorted(COMFY_ENDPOINTS)}"}),
+                    "application/json")
+            prefs = load_img_nodes()
+            entry = prefs.setdefault(model, {})
+            moved = entry.get("node") not in (None, node)
+            entry["node"] = node
+            if moved:
+                # the weights are on the old node now, not this one
+                entry.pop("loaded_at", None)
+            save_img_nodes(prefs)
+
+            if not body.get("warm", True):
+                return self._send(200, json.dumps({"ok": True, "node": node}),
+                                  "application/json")
+
+            ok, msg = warm_image_model(model, node)
+            if ok:
+                prefs = load_img_nodes()
+                prefs.setdefault(model, {})["node"] = node
+                prefs[model]["loaded_at"] = time.time()
+                save_img_nodes(prefs)
+            # A failed warm is not a failed assignment: the preference is saved either
+            # way, so a render still routes correctly once the node is reachable.
+            return self._send(200, json.dumps({"ok": True, "node": node,
+                                               "warmed": ok, "message": msg}),
+                              "application/json")
+
+        if self.path == "/api/imgunload":
+            prefs = load_img_nodes()
+            node = img_node(model, prefs)
+            ok, msg = unload_image_models(node)
+            if ok:
+                # /free drops EVERY model on that node, so clear the flag for all of
+                # them rather than pretending only this one went.
+                for mid, e in prefs.items():
+                    if e.get("node", DEFAULT_IMG_NODE) == node:
+                        e.pop("loaded_at", None)
+                save_img_nodes(prefs)
+            return self._send(200 if ok else 502,
+                              json.dumps({"ok": ok, "node": node, "message": msg}),
+                              "application/json")
+
         self._send(404, '{"error":"not found"}', "application/json")
 
 
@@ -1183,6 +1519,21 @@ def selfcheck():
     assert _launcher_and_key("/x/ctx-env.sh m /x/serve-nemcascade.sh --port 1") == (
         "/x/serve-nemcascade.sh", "")
     assert _launcher_and_key("no launcher here") == (None, None)
+    # A rope override must lift the member past its checkpoint's own window, and a plain
+    # argv must not be mistaken for one.
+    assert _rope_override_max(
+        'flags=[--json-model-override-args {"text_config":{"max_position_embeddings":524288,'
+        '"rope_parameters":{"rope_type":"yarn","factor":2.0}}}]') == 524288
+    assert _rope_override_max("flags=[--context-length 524288]") is None
+    assert _rope_override_max("") is None
+    # The SPEED column must prefer a measured override over whatever the name happens to say.
+    _tps_override.clear(); _tps_override["qwen38fn-long-sglang-tp2-starfleet"] = 23.7
+    _tps_override["gemma4-26b-54tps-jean-luc"] = 51.0
+    assert tps_of("qwen38fn-long-sglang-tp2-starfleet") == 23.7   # name has no marker
+    assert tps_of("gemma4-26b-54tps-jean-luc") == 51.0            # override beats the name
+    assert tps_of("qwen3.6-35b-57tps-mtp4-jean-luc") == 57        # falls back to the name
+    assert tps_of("nomic-embed-text") is None                     # neither: stays blank
+    _tps_override.clear()
     # A launcher without DRYRUN must never be executed by the probe.
     assert _supports_dryrun("/nonexistent/serve-nope.sh") is False
     # Both spellings of the model path must resolve -- SGLang logs the second one.

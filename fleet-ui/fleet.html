@@ -112,6 +112,8 @@ tr.live td:first-child{border-left-color:var(--blue)}
   transition:none}
 @keyframes sweep{0%{transform:translateX(-100%)}100%{transform:translateX(313%)}}
 .load .sub{margin-top:6px;font-size:11px;color:var(--dim)}
+/* second line under an image model's name: kind, footprint, note */
+td .sub{margin-top:3px;font-size:11px;color:var(--dim);line-height:1.35}
 
 .st{font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.08em}
 .st.ready{color:var(--blue)} .st.starting{color:var(--amber)}
@@ -180,11 +182,13 @@ tr.live td:first-child{border-left-color:var(--blue)}
       <button class="pill" data-f="pinned">Pinned</button>
       <button class="pill" data-f="vision">Vision</button>
       <button class="pill" data-f="embed">Embeddings</button>
+      <button class="pill" data-f="image">Image</button>
       <span class="count" id="count"></span>
     </div>
     <table><thead><tr><th>Model</th><th>Node</th><th>Speed</th><th>Context</th><th>Effort</th>
       <th>State</th><th>TTL</th><th class="act">Persistent</th></tr></thead>
       <tbody id="rows"></tbody></table>
+
   </div>
 </div>
 
@@ -192,7 +196,7 @@ tr.live td:first-child{border-left-color:var(--blue)}
 const TAG={"jean-luc":["jl","JEAN-LUC"],"kathryn":["ka","KATHRYN"],"dynamic":["dy","AUTO"]};
 const gb=kb=>(kb/1048576).toFixed(1);
 const busy=new Set();
-const FILTERS=["all","jean-luc","kathryn","starfleet","dynamic","live","pinned","vision","embed"];
+const FILTERS=["all","jean-luc","kathryn","starfleet","dynamic","live","pinned","vision","embed","image"];
 /* the hash makes a view bookmarkable — open #kathryn to land straight on her models */
 let filter=FILTERS.includes(location.hash.slice(1))?location.hash.slice(1):"all";
 let query="", last={nodes:{},models:[],running:[],pins:[],errors:{},loading:[]};
@@ -214,8 +218,70 @@ addEventListener("hashchange",()=>{
 setFilter(filter);
 document.getElementById("q").oninput=e=>{query=e.target.value.trim().toLowerCase();render(last);};
 
+function isImg(m){ return !!(m.kind && m.kind!=="llm"); }
+
+const KINDLBL={image:"Image",video:"Video",judge:"Visual QA"};
+
+/* Image/video models share the registry table but fill it differently: they are not
+   llama-swap members, so there is no speed, context, effort or ttl to show. The Node
+   cell becomes a chooser, because for these the node is an INPUT (where you want it to
+   run), not a reported fact. */
+function imgRow(m, working){
+  const loaded=!!m.loaded_at, busyNow=working||imgBusy.has(m.id);
+  const opts=(m.img_nodes||["jean-luc","kathryn"]).map(n=>
+    `<option value="${n}"${m.nodes.includes(n)?" selected":""}>${(TAG[n]||["",n])[1]}</option>`).join("");
+  return `<tr class="${loaded?"live":""}">
+    <td><div class="mid">${m.id}</div>
+        <div class="sub">${KINDLBL[m.kind]||m.kind} &middot; ${
+          m.need_mb?(m.need_mb/1024).toFixed(1)+" GB":"&mdash;"}${
+          m.note?" &middot; "+m.note:""}</div></td>
+    <td class="ctx"><select class="ctxsel set" ${busyNow?"disabled":""}
+        title="Where this model should run. Changing it moves the model: it is warmed on the new node, and renders route there."
+        onchange="setImgNode('${m.id}',this.value)">${opts}</select></td>
+    <td class="mid">&mdash;</td>
+    <td class="mid">&mdash;</td>
+    <td class="mid">&mdash;</td>
+    <td><span class="st ${busyNow?"loading":loaded?"ready":"stopped"}">${
+        busyNow?"loading":loaded?"loaded":"stopped"}</span></td>
+    <td class="mid">&mdash;</td>
+    <td class="act">
+      <button class="${loaded?"on":""}" ${busyNow?"disabled":""}
+        onclick="loadImg('${m.id}')">${loaded?"Loaded":"Load"}</button>
+      <button ${busyNow||!loaded?"disabled":""}
+        onclick="unloadImg('${m.id}')">Unload</button></td></tr>`;
+}
+
+const imgBusy=new Set();
+
+async function imgPost(path, model, extra){
+  imgBusy.add(model); render(last);
+  try{
+    const res=await fetch(path,{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify(Object.assign({model},extra||{}))});
+    const j=await res.json().catch(()=>({}));
+    /* A warm-up can fail (node down, model missing) while the assignment still stuck.
+       Say so rather than silently showing "stopped". */
+    if(j.message && (j.warmed===false || j.ok===false)) alert(j.message);
+  }catch(e){ alert(String(e)); }
+  finally{ imgBusy.delete(model); refresh(); }
+}
+const setImgNode=(m,node)=>imgPost("/api/imgnode",m,{node});
+/* Load = warm it where it is already assigned. Read the node off the current row, and
+   fall back rather than throwing if the row went away between render and click. */
+const loadImg=m=>{
+  const row=(last.models||[]).find(x=>x.id===m);
+  const node=(row&&row.nodes&&row.nodes[0])||"kathryn";
+  return imgPost("/api/imgnode",m,{node});
+};
+const unloadImg=m=>imgPost("/api/imgunload",m);
+
 function keep(m,run){
   if(query && !m.id.toLowerCase().includes(query)) return false;
+  /* The Image tab is the ONLY one that shows image/video models. They are not
+     llama-swap members, so node/ttl/context filters are meaningless for them and they
+     would just be rows of dashes everywhere else -- including "All". */
+  if(filter==="image") return isImg(m);
+  if(isImg(m)) return false;
   switch(filter){
     case "all": return true;
     case "live": return !!run[m.id];
@@ -396,7 +462,8 @@ function render(s){
 
   const ok=Object.values(s.nodes).filter(n=>n&&!n.error);
   const free=ok.reduce((a,n)=>a+n.mem_avail_kb,0);
-  document.getElementById("r-mdl").textContent=s.models.length;
+  document.getElementById("r-mdl").textContent=
+    s.models.filter(m=>!m.kind||m.kind==="llm").length;
   document.getElementById("r-res").textContent=(s.running||[]).length;
   document.getElementById("r-pin").textContent=(s.pins||[]).length;
   document.getElementById("r-node").textContent=ok.length+"/"+Object.keys(s.nodes).length;
@@ -409,7 +476,8 @@ function render(s){
   const loadingIds=new Set((s.loading||[]).map(l=>l.model));
   const shown=[...s.models].filter(m=>keep(m,run)).sort((a,c)=>
     (c.pinned-a.pinned)||((run[c.id]?1:0)-(run[a.id]?1:0))||a.id.localeCompare(c.id));
-  document.getElementById("count").textContent=`${shown.length} of ${s.models.length}`;
+  document.getElementById("count").textContent=
+    `${shown.length} of ${s.models.filter(m=>!m.kind||m.kind==="llm").length}`;
 
   /* Never replace the table while a context dropdown has focus: the 3s poll would
      close it mid-choice. Everything else on the page still updates. */
@@ -420,6 +488,7 @@ function render(s){
   if(!_picking) document.getElementById("rows").innerHTML = shown.length ? shown.map(m=>{
     const r=run[m.id], working=busy.has(m.id), loading=loadingIds.has(m.id),
           st=loading?"loading":working?"working":(r?r.state:"stopped");
+    if(isImg(m)) return imgRow(m, working);
     return `<tr class="${m.pinned?"pinned":r?"live":""}">
       <td><div class="mid">${m.id}${m.vision?`<span class="vis ${m.vision}" title="${
         m.vision==="on"?"Vision tower ACTIVE — this member accepts images"
