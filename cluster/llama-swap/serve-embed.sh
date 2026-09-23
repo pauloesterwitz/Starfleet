@@ -21,7 +21,11 @@ set -uo pipefail
 IMAGE="${IMAGE:-vllm/vllm-openai:v0.27.1-aarch64}"
 MODELS="${MODELS:-$HOME/models}"
 MEMCHECK="$HOME/llama-swap/memcheck.sh"
-NEED_MB="${NEED_MB:-4000}"
+# NEED_MB / GPUFRAC are per-key (set in the case table below) because this script no longer
+# serves only ~1 GB models: Qwen3-Reranker-8B is 16 GB of weights, which neither the 4000MB
+# memcheck floor nor the 0.08 pool fraction (~9.7 GB of 121 GB) can hold. Env still wins.
+NEED_MB_ENV="${NEED_MB:-}"
+GPUFRAC_ENV="${GPUFRAC:-}"
 
 KEY="${1:-}"; shift || true
 PORT=""
@@ -37,6 +41,8 @@ done
 # EXTRA per key. --trust-remote-code is needed for nomic (custom NomicBert code in the repo);
 # embeddinggemma is a stock Gemma3TextModel and does not need it.
 EXTRA=()
+NEED_MB=4000     # the ~1 GB embedders; rerankers raise it below
+GPUFRAC=0.08     # ~9.7 GB of the 121 GB pool
 case "$KEY" in
   nomic-embed-text)
     BASE="/models/nomic-embed-text-v1.5"
@@ -74,13 +80,56 @@ case "$KEY" in
     EXTRA=(--convert embed)
     ;;
 
+  qwen3-reranker-8b|qwen3-reranker-4b)
+    # Qwen3-Reranker, added 2026-09-23. NOT a native cross-encoder like bge-reranker-v2-m3:
+    # upstream ships a CAUSAL LM (Qwen3ForCausalLM) that ranks by comparing the "yes" and "no"
+    # token logits, so vLLM has to be told to convert it. The registry has no
+    # Qwen3ForSequenceClassification class, but resolve_model_cls() rewrites the
+    # *ForSequenceClassification suffix back to the registered *ForCausalLM and wraps it via
+    # as_seq_cls_model() -- which is why the architectures override below is required and not
+    # merely cosmetic. is_original_qwen3_reranker + classifier_from_token ["no","yes"] select
+    # the from_2_way_softmax head: score = logit(yes) - logit(no), num_labels 1, so the default
+    # use_activation:true sigmoid turns it into the same 0-1 relevance score bge returns.
+    # Exposes /v1/rerank and /v1/score, same caller contract as bge.
+    #
+    # CALLER CONTRACT — this reranker is NOT a drop-in for bge-reranker-v2-m3 at the prompt level.
+    # bge is a native cross-encoder, so vLLM joins query and document with the tokenizer's own
+    # pair encoding. Qwen3-Reranker is an LLM-as-reranker: vLLM's scoring path takes the
+    # "no separating token" branch and the prompt it scores is literally text_1 + text_2. The
+    # instruction wrapper the model was trained on therefore has to come from the CALLER, split
+    # across the two fields — /v1/rerank's `query` and each `documents` entry:
+    #
+    #   query     = "<|im_start|>system\nJudge whether the Document meets the requirements based"
+    #               " on the Query and the Instruct provided. Note that the answer can only be"
+    #               ' "yes" or "no".<|im_end|>\n<|im_start|>user\n<Instruct>: <task>\n<Query>: <q>\n'
+    #   document  = "<Document>: <d><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    #
+    # Sending a bare query and bare documents does not error — it silently scores an
+    # out-of-distribution prompt, the same failure mode as an unprefixed harrier query above.
+    #
+    # max-model-len 8192 matches bge-reranker-v2-m3's native window and Qwen's own eval setting.
+    # The checkpoint allows 40960; serving that would size the KV cache for a context no
+    # reranking call uses, out of a pool fraction that has to stay small enough not to starve
+    # an LLM member.
+    if [ "$KEY" = qwen3-reranker-8b ]; then
+      BASE="/models/Qwen3-Reranker-8B"; NEED_MB=26000; GPUFRAC=0.20   # 16.4 GB of weights
+    else
+      BASE="/models/Qwen3-Reranker-4B"; NEED_MB=16000; GPUFRAC=0.12   # 8.0 GB of weights
+    fi
+    EXTRA=(--convert classify
+           --max-model-len 8192
+           --hf-overrides '{"architectures":["Qwen3ForSequenceClassification"],"classifier_from_token":["no","yes"],"is_original_qwen3_reranker":true}')
+    ;;
+
   *)
-    echo "serve-embed: unknown key '$KEY' (want: nomic-embed-text | embeddinggemma | bge-reranker-v2-m3 | harrier-embed-0.6b)" >&2
+    echo "serve-embed: unknown key '$KEY' (want: nomic-embed-text | embeddinggemma | bge-reranker-v2-m3 | harrier-embed-0.6b | qwen3-reranker-8b | qwen3-reranker-4b)" >&2
     exit 2
     ;;
 esac
 
 NAME="$KEY"
+NEED_MB="${NEED_MB_ENV:-$NEED_MB}"
+GPUFRAC="${GPUFRAC_ENV:-$GPUFRAC}"
 
 # use_activation:true applies the model's output activation — L2 normalization for an embed
 # task (WITHOUT it vLLM returns UNNORMALIZED vectors, measured L2 ~22.8 for nomic, while ollama
@@ -95,8 +144,8 @@ trap cleanup EXIT INT TERM HUP
 
 # --init so SIGTERM reaches vLLM (PID 1); --rm auto-cleans.
 # --served-model-name = the llama-swap member so proxied requests match.
-# gpu-memory-utilization 0.08 (~9 GB of the 121 GB pool): these models are tiny, and a high value
-# would have vLLM reserve pool an LLM member then cannot get.
+# --gpu-memory-utilization is $GPUFRAC, set per key above: small on purpose, so vLLM never
+# reserves pool an LLM member then cannot get.
 CMD=(docker run --rm --name "$NAME" --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=all --ipc=host --init
     -p 127.0.0.1:"${PORT}":8000
     -v "$MODELS":/models:ro
@@ -106,7 +155,7 @@ CMD=(docker run --rm --name "$NAME" --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=a
       --served-model-name "$NAME"
       --pooler-config "$POOLER"
       "${EXTRA[@]}"
-      --gpu-memory-utilization 0.08
+      --gpu-memory-utilization "$GPUFRAC"
       --host 0.0.0.0 --port 8000)
 
 # ponytail: DRYRUN=1 prints the argv and exits — the self-check for the case table above, runnable

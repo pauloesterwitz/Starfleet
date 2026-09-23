@@ -5,12 +5,13 @@
 #
 #   cmd: memcheck.sh <need_mb> <server-cmd> [args...]
 #
-# Fit test:  MemAvailable + reclaimable_ollama - live_reservations  >=  need_mb
+# Fit test:  MemAvailable - live_reservations  >=  need_mb
 #   - live_reservations: memory image/video jobs reserved via gate.py's ledger
 #     (~/.gb10/reservations) but may not have allocated yet — the OOM-race gap.
-#   - MEMCHECK_RECLAIM_OLLAMA=1 counts ollama-resident models as available, for a
-#     server that evicts ollama on start (serve-ds4.sh); ds4 is exclusive with
-#     ollama, so that memory is genuinely reclaimable for it. Default off.
+#   - MEMCHECK_RECLAIM_OLLAMA=1 used to count ollama-resident models as available for
+#     a server that evicts ollama on start (serve-ds4.sh). REMOVED 2026-09-23: the ollama
+#     backend has been off since 2026-07-27 and uninstalled since, so the branch could
+#     never fire. The env var is now ignored wherever it is still set.
 #
 # On success it records ITS OWN footprint in the ledger (exec keeps this pid), so
 # a concurrent image/video admission counts the loading model too. Symmetric.
@@ -216,17 +217,10 @@ fi
 
 avail=$(awk '/^MemAvailable:/{print int($2/1024)}' /proc/meminfo)
 
-reclaim=0
-if [ "${MEMCHECK_RECLAIM_OLLAMA:-0}" = "1" ]; then
-  reclaim=$(ollama ps 2>/dev/null | awk 'NR>1 && NF>0 {
-      s=$3; if($4=="GB") s*=1024; else if($4=="TB") s*=1048576; else if($4!="MB") s=0;
-      t+=s } END{ printf "%d", t+0 }') || reclaim=0
-fi
-
-eff=$((avail + reclaim - res))
+eff=$((avail - res))
 if [ "$eff" -lt "$need" ]; then
   echo "memcheck: refusing to load — need ${need}MB, have ${eff}MB" \
-       "(avail=${avail} +reclaimable_ollama=${reclaim} -reserved=${res})" >&2
+       "(avail=${avail} -reserved=${res})" >&2
   exit 1
 fi
 

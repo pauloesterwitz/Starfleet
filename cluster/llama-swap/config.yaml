@@ -1,8 +1,7 @@
 # llama-swap — DGX Spark GB10 (121 GiB unified pool)
 # One OpenAI-compatible endpoint arbitrating the GB10 pool between:
-#   - spark-big  (ds4 + the 80-86GB ollama models qwen3.5-122b / mistral-medium-3.5 /
-#     nemotron-3-super): EXCLUSIVE, one at a time — never co-resident with anything.
-#   - spark-small (qwen3.6-35b-dflash, gemma4-26b-dflash, small ollama models): CO-RESIDENT up to memory.
+#   - spark-big  (ds4): EXCLUSIVE, one at a time — never co-resident with anything.
+#   - spark-small (the single-node NVFP4 members): CO-RESIDENT up to memory.
 #     memcheck refuses a load that won't fit (clean error, never OOM); idle vLLM models unload via ttl.
 #
 # Start:  ~/llama-swap/llama-swap -config ~/llama-swap/config.yaml -watch-config
@@ -46,18 +45,19 @@ models:
   # because the ollama backend it sat next to got turned off, not because ds4 itself broke.
   # antirez ds4 engine, IQ2_XXS routed-expert quant on CUDA/GB10. ds4flash.gguf is the
   # symlink download_model.sh created -> the 80.8 GiB chat-v2-imatrix GGUF.
-  # serve-ds4.sh evicts any loaded Ollama models first (airtight exclusivity), then
-  # exec's ds4-server with the flags below baked in. ${PORT} is assigned by llama-swap.
+  # serve-ds4.sh exec's ds4-server with the flags below baked in. ${PORT} is assigned
+  # by llama-swap.
   # memcheck.sh refuses (exit 1 -> llama-swap errors) if ds4 won't fit the pool
   # right now, instead of loading ~108GB into it and OOM-killing the box. It
-  # counts ollama as reclaimable (serve-ds4.sh evicts it, harmless no-op now that ollama
-  # is gone entirely) and subtracts any live image/video reservation (gate.py).
+  # subtracts any live image/video reservation (gate.py). The MEMCHECK_RECLAIM_OLLAMA=1
+  # this cmd used to carry was dropped 2026-09-23: it counted ollama-resident models as
+  # reclaimable, and the ollama backend has been off since 2026-07-27 and is uninstalled.
   # reclaim-dflash.sh force-removes a leaked DFlash vLLM container (exclusive group) before
   # memcheck, so an orphaned container can't block/OOM ds4. exec chain preserves the PID.
   # EXCLUSIVE (spark-big, below): loading this evicts whatever else is on Jean-Luc's pool
   # (spark-small), and vice versa — 80.8 GiB doesn't leave room to co-reside with anything.
   deepseek-v4-flash:
-    cmd: /home/pauloesterwitz/llama-swap/ctx-env.sh deepseek-v4-flash /home/pauloesterwitz/llama-swap/render-guard.sh /home/pauloesterwitz/llama-swap/reclaim-dflash.sh /usr/bin/env MEMCHECK_RECLAIM_OLLAMA=1 /home/pauloesterwitz/llama-swap/memcheck.sh 108000 /home/pauloesterwitz/ds4/serve-ds4.sh --port ${PORT}
+    cmd: /home/pauloesterwitz/llama-swap/ctx-env.sh deepseek-v4-flash /home/pauloesterwitz/llama-swap/render-guard.sh /home/pauloesterwitz/llama-swap/reclaim-dflash.sh /home/pauloesterwitz/llama-swap/memcheck.sh 108000 /home/pauloesterwitz/ds4/serve-ds4.sh --port ${PORT}
     proxy: http://127.0.0.1:${PORT}
     # ds4-server has NO /health endpoint; point llama-swap's readiness probe at
     # /v1/models, which returns 200 exactly when ds4 has finished loading and can serve.
@@ -84,44 +84,6 @@ models:
     ttl: 900
     filters:
       stripParams: "store,metadata,service_tier,parallel_tool_calls,user,presence_penalty,frequency_penalty,logit_bias,logprobs,top_logprobs,n"
-
-  # DEPRECATED 2026-07-27 (Paul): ollama backend off — vLLM only
-  # ollama:
-    # Proxy to the EXISTING `ollama serve` daemon on :11434 (started outside llama-swap,
-    # 5-day uptime; other tools hit it directly). llama-swap requires every group member to
-    # have a cmd, so we give it a harmless placeholder process and point `proxy`/`checkEndpoint`
-    # at the real daemon. Killing the placeholder on swap-out costs nothing; switching to an
-    # Ollama model still evicts ds4 via the exclusive group. (llama-swap can't evict Ollama's
-    # OWN loaded models — for airtight "never co-resident" see the ds4 wrapper option in chat.)
-    # CO-RESIDENT with the vLLM DFlash models now (same spark-small group), so we must NOT evict
-    # their containers — just a harmless placeholder. ollama's own daemon is memory-aware and won't
-    # over-commit against resident vLLM VRAM. Loading ds4 (spark-big, exclusive) still evicts ollama.
-  #   cmd: /home/pauloesterwitz/llama-swap/render-guard.sh sleep infinity
-  #   proxy: http://127.0.0.1:11434
-  #   checkEndpoint: /api/tags
-    # Requested model name passes straight through to the daemon (no useModelName).
-    # (qwen3.5:122b, mistral-medium-3.5, nemotron-3-super moved to their own EXCLUSIVE spark-big
-    #  members above — they're 80-86GB and must never co-reside. Small ollama models stay here.)
-  #   aliases:
-  #     - qwen3.6:35b-a3b-q8_0
-  #     - qwen3-vl:32b
-  #     - nemotron-3-nano:30b
-  #     - gpt-oss:120b
-  #     - gpt-oss:20b
-  #     - qwen3-coder-next:q4_K_M
-  #     - gemma4:31b
-  #     - gemma4:26b
-      # gemma4:26b with num_ctx 49152 baked in (eval/gemma4-26b-eva.Modelfile in sap_odata_mock_eva).
-      # Same 17GB blobs as gemma4:26b — the plain tag loads at n_ctx=4096, which silently truncates
-      # that eval's ~40k-token system prompt. /v1 carries no num_ctx, so it has to live in the tag.
-  #     - gemma4:26b-eva
-  #     - gemma4:e4b
-  #     - nemotron-cascade-2:latest
-  #     - llava:latest
-  #     - nomic-embed-text:latest
-  #     - embeddinggemma:latest
-  #     - qwen3-vl:8b
-  #     - qwen3-vl-wiki:latest
 
   # gemma4-26b-dflash RETIRED 2026-07-20: it was the DFlash speculative-decoding member, and DFlash is
   # being dropped ("not working well for agentic coding") — its draft weights are deleted. It was also
@@ -264,50 +226,12 @@ models:
     checkEndpoint: /health
     useModelName: gemma4-26b-ct-nvfp4
 
-  # ── Big ollama models — EXCLUSIVE (spark-big): 80-86GB each, never co-resident with anything ──
-  # Each is its own llama-swap member (can't group individual ollama tags otherwise). The wrapper
-  # evicts all other ollama models on load and on swap-out; memcheck (RECLAIM_OLLAMA=1) gates the
-  # fit -> clean error, never OOM; reclaim-dflash clears any leaked vLLM container first.
-  # DEPRECATED 2026-07-27 (Paul): ollama backend off — vLLM only
-  # qwen3.5-122b:
-  #   cmd: /home/pauloesterwitz/llama-swap/render-guard.sh /home/pauloesterwitz/llama-swap/reclaim-dflash.sh /usr/bin/env MEMCHECK_RECLAIM_OLLAMA=1 /home/pauloesterwitz/llama-swap/memcheck.sh 85000 /home/pauloesterwitz/llama-swap/serve-ollama-exclusive.sh
-  #   proxy: http://127.0.0.1:11434
-  #   checkEndpoint: /api/tags
-  #   ttl: 1800
-    # Rewrite the upstream model name to the real ollama tag, so requesting the
-    # MEMBER name (qwen3.5-122b) also resolves — not just the tag aliases.
-  #   useModelName: qwen3.5:122b
-  #   aliases:
-  #     - qwen3.5:122b
-  #     - qwen3.5:122b-a10b-q4_K_M
-
-  # DEPRECATED 2026-07-27 (Paul): ollama backend off — vLLM only
-  # mistral-medium-3.5:
-  #   cmd: /home/pauloesterwitz/llama-swap/render-guard.sh /home/pauloesterwitz/llama-swap/reclaim-dflash.sh /usr/bin/env MEMCHECK_RECLAIM_OLLAMA=1 /home/pauloesterwitz/llama-swap/memcheck.sh 84000 /home/pauloesterwitz/llama-swap/serve-ollama-exclusive.sh
-  #   proxy: http://127.0.0.1:11434
-  #   checkEndpoint: /api/tags
-  #   ttl: 1800
-  #   useModelName: mistral-medium-3.5:latest
-  #   aliases:
-  #     - mistral-medium-3.5:latest
-
-  # DEPRECATED 2026-07-27 (Paul): ollama backend off — vLLM only
-  # nemotron-3-super:
-  #   cmd: /home/pauloesterwitz/llama-swap/render-guard.sh /home/pauloesterwitz/llama-swap/reclaim-dflash.sh /usr/bin/env MEMCHECK_RECLAIM_OLLAMA=1 /home/pauloesterwitz/llama-swap/memcheck.sh 90000 /home/pauloesterwitz/llama-swap/serve-ollama-exclusive.sh
-  #   proxy: http://127.0.0.1:11434
-  #   checkEndpoint: /api/tags
-  #   ttl: 1800
-  #   useModelName: nemotron-3-super:latest
-  #   aliases:
-  #     - nemotron-3-super:latest
-  #     - nemotron-3-super:120b
-
   # ── DeepSeek-V4-Flash-NVFP4, TP=2 across BOTH Sparks (vLLM + Ray + RoCE) — PROXY ONLY ──
   # The cluster is started OUT OF BAND:  systemctl --user start ds4-tp2   (~14min cold load; it owns
   # BOTH Sparks, ~98G Jean-Luc + ~95G Kathryn; Kathryn's worker is started automatically over ssh).
   # llama-swap does NOT lifecycle-manage it: a 2-node Ray cluster is too fragile to hot-swap, and a
-  # 14-minute load would hang any client long before it answered. Same placeholder trick as `ollama`
-  # above. ds4-tp2-proxy-guard.sh fast-fails with a hint if the cluster isn't up — otherwise llama-swap
+  # 14-minute load would hang any client long before it answered, so the member parks on a
+  # placeholder process and proxies to the cluster instead. ds4-tp2-proxy-guard.sh fast-fails with a hint if the cluster isn't up — otherwise llama-swap
   # would sit on the failing checkEndpoint for the whole 2400s healthCheckTimeout and look hung.
   # DISTINCT from `deepseek-v4-flash` above (antirez ds4 engine, IQ2_XXS GGUF, single-node) — same
   # model family, different engine + quant. MEASURED 2026-07-17: 18.5 tok/s single-stream, 105.4 agg
@@ -669,6 +593,40 @@ models:
     ttl: 3600
     useModelName: bge-reranker-v2-m3
 
+  # Qwen3-Reranker-8B / -4B, added 2026-09-23. Both are CAUSAL LMs converted to a scoring head
+  # by serve-embed.sh (see its qwen3-reranker-* case) — 16.4 GB and 8.0 GB of weights, an order
+  # of magnitude past the ~1 GB embedders, which is why they live in the `rerankers` group below
+  # (swap:true) rather than the co-resident `embeddings` one. Same /v1/rerank + /v1/score contract
+  # and same 0-1 score range as bge-reranker-v2-m3, so callers can switch by model name alone.
+  qwen3-reranker-8b:
+    cmd: /home/pauloesterwitz/llama-swap/serve-embed.sh qwen3-reranker-8b --port ${PORT}
+    proxy: http://127.0.0.1:${PORT}
+    checkEndpoint: /health
+    ttl: 3600
+
+  # Kathryn twin, same ssh/tunnel pattern as nomic-embed-text-kathryn above. useModelName for the
+  # same reason as every other twin here: serve-embed.sh sets --served-model-name to the KEY it is
+  # passed, not to this member's name, so without it vLLM 404s any request naming the member.
+  qwen3-reranker-8b-kathryn:
+    cmd: /home/pauloesterwitz/llama-swap/serve-kathryn-embed.sh qwen3-reranker-8b --port ${PORT}
+    proxy: http://127.0.0.1:${PORT}
+    checkEndpoint: /health
+    ttl: 3600
+    useModelName: qwen3-reranker-8b
+
+  qwen3-reranker-4b:
+    cmd: /home/pauloesterwitz/llama-swap/serve-embed.sh qwen3-reranker-4b --port ${PORT}
+    proxy: http://127.0.0.1:${PORT}
+    checkEndpoint: /health
+    ttl: 3600
+
+  qwen3-reranker-4b-kathryn:
+    cmd: /home/pauloesterwitz/llama-swap/serve-kathryn-embed.sh qwen3-reranker-4b --port ${PORT}
+    proxy: http://127.0.0.1:${PORT}
+    checkEndpoint: /health
+    ttl: 3600
+    useModelName: qwen3-reranker-4b
+
   # microsoft/harrier-oss-v1-0.6b, added 2026-09-23. Multilingual retrieval embedder,
   # MTEB-v2 multilingual 69.0 (vs the 768-dim pair above, which are English-leaning and much
   # older). 1024-dim, 32k context, decoder with LAST-token pooling — see serve-embed.sh's
@@ -711,10 +669,10 @@ routing:
       groups:
         # ds4 is huge (~108GB) — EXCLUSIVE: loading it clears spark-small; loading any spark-small
         # member clears ds4. So the big model is never co-resident with anything.
-        # REACTIVATED 2026-08-26 (Paul): deepseek-v4-flash only — qwen3.5-122b/mistral-medium-3.5/
-        # nemotron-3-super stay deprecated (ollama-backed, and ollama is gone entirely now; their
-        # NVFP4 successors live in the starfleet group instead: qwen3.5-122b-mtp3-starfleet,
-        # nemotron-120b-mtp3-starfleet).
+        # REACTIVATED 2026-08-26 (Paul): deepseek-v4-flash only. The ollama-backed
+        # qwen3.5-122b / mistral-medium-3.5 / nemotron-3-super members that used to sit here were
+        # deleted 2026-09-23 with the rest of the ollama deployment; their NVFP4 successors live
+        # in the starfleet group instead (qwen3.5-122b-mtp3-starfleet, nemotron-120b-mtp3-starfleet).
         spark-big:
           swap: true
           exclusive: true
@@ -739,7 +697,6 @@ routing:
             - gemma4-26b-54tps-jean-luc
             - qwen3.8-27b-19tps-jean-luc
             - qwen3.8-27b-vision-jean-luc
-            # - ollama
         # KATHRYN's pool — a DIFFERENT machine's 121GB. exclusive:false is the whole point: these
         # members must never evict spark-big/spark-small and must never be evicted by them, because
         # loading a model over there frees nothing over here. Fit is gated by Kathryn's own memcheck
@@ -790,7 +747,7 @@ routing:
             # - qwen38flashnext-nvfp4-starfleet   # DISABLED 2026-08-28: qwen4_exp unsupported by both images (see member comment above)
         # ComfyUI's own container — exclusive:false + swap:false, same "isolated, never evicts
         # / never evicted" pattern as ds4-tp2 and qwen-dyn above. It's a different memory
-        # subsystem (docker --gpus all container, not an llama-swap-launched vLLM/ollama proc).
+        # subsystem (docker --gpus all container, not an llama-swap-launched vLLM proc).
         # Tiny (~1GB each) and co-resident with everything: swap:false so both can be up at once,
         # exclusive:false so an embedding call never clears an LLM group (and vice versa).
         embeddings:
@@ -801,10 +758,27 @@ routing:
             - embeddinggemma
             - nomic-embed-text-kathryn
             - embeddinggemma-kathryn
-            - bge-reranker-v2-m3
-            - bge-reranker-v2-m3-kathryn
             - harrier-embed-0.6b
             - harrier-embed-0.6b-kathryn
+        # RERANKERS — split out of `embeddings` 2026-09-23 when the Qwen3 rerankers arrived.
+        # Two reasons they are not embedders:
+        #   swap:TRUE (the embeddings group is swap:false). A reranker is a CHOICE, not a
+        #   component — a pipeline picks exactly one, and a resident Qwen3-Reranker-8B is 16.4 GB
+        #   that no other reranker being up can justify. swap:true also gives Fleet's machine
+        #   picker its meaning here: selecting Kathryn MOVES the reranker instead of leaving a
+        #   copy resident on both Sparks, the same reasoning the spark-big group documents for ds4.
+        #   exclusive:false, so a reranker still never evicts an LLM group and is never evicted by
+        #   one — serve-embed.sh's per-key memcheck (26000MB / 16000MB) is the fit authority.
+        rerankers:
+          swap: true
+          exclusive: false
+          members:
+            - bge-reranker-v2-m3
+            - bge-reranker-v2-m3-kathryn
+            - qwen3-reranker-8b
+            - qwen3-reranker-8b-kathryn
+            - qwen3-reranker-4b
+            - qwen3-reranker-4b-kathryn
         imagegen:
           swap: false
           exclusive: false

@@ -11,7 +11,7 @@
 #   proxy: http://127.0.0.1:${PORT}
 set -uo pipefail
 
-KEY="${1:?usage: serve-kathryn-embed.sh <nomic-embed-text|embeddinggemma|bge-reranker-v2-m3|harrier-embed-0.6b> --port <port>}"
+KEY="${1:?usage: serve-kathryn-embed.sh <any serve-embed.sh key> --port <port>}"
 shift
 PORT=8000
 while [ $# -gt 0 ]; do case "$1" in --port) PORT="${2:-8000}"; shift 2 || shift;; *) shift;; esac; done

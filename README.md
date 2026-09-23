@@ -53,7 +53,7 @@ inference servers and **swaps models in and out on demand**: a request names a
 model, llama-swap starts whatever process serves it, proxies the request, and
 unloads it again after an idle TTL.
 
-That matters here because 35 models are defined but only ~121 GiB per node is
+That matters here because 39 models are defined but only ~121 GiB per node is
 available. Without it you'd be manually starting and stopping vLLM. With it,
 everything — the coding agents, this monitor, any OpenAI-compatible client —
 talks to **one endpoint on the head node** and never thinks about placement.
@@ -88,13 +88,15 @@ configuration, so the fastest option is obvious from the name alone.
 
 ### Not every member is a chat model
 
-Eight of the 35 are an embedding tier — `nomic-embed-text`, `embeddinggemma`,
-`harrier-embed-0.6b` and the `bge-reranker-v2-m3` cross-encoder, each with a
-twin on the other node. They are served by
+Twelve of the 39 never generate a token. Six are embedders — `nomic-embed-text`,
+`embeddinggemma`, `harrier-embed-0.6b` — and six are rerankers — the
+`bge-reranker-v2-m3` cross-encoder and `qwen3-reranker-4b`/`-8b` — each with a
+twin on the other node. All twelve are served by
 [`serve-embed.sh`](cluster/llama-swap/serve-embed.sh) through vLLM's pooling
-runner, and at roughly 1 GiB apiece they live in their own group with both
-`swap: false` and `exclusive: false`: an embedding call must never evict a
-language model, and must never be evicted by one.
+runner, in two groups that both set `swap: false` and `exclusive: false`: a
+retrieval call must never evict a language model, and must never be evicted by
+one. They are separate groups because retrieval usually wants an embedder and a
+reranker resident at the same time.
 
 The twins are not redundancy. Jean-Luc's pool can be genuinely too full for a
 1 GiB model while a TP=2 member occupies it — on 2026-09-23 `harrier-embed-0.6b`
@@ -104,10 +106,12 @@ request without complaint. `gpu-memory-utilization` is a fraction of the whole
 pool, not of what is left in it, so a tiny model can still be squeezed out.
 Having each embedder addressable on either node is what makes that survivable.
 
-One naming note: Fleet's **Embeddings** filter selects members by id
-(`/embed|rerank/i`), so a new embedder carries `embed` in its member name even
-when upstream does not — `microsoft/harrier-oss-v1-0.6b` is wired as
-`harrier-embed-0.6b`. Choosing the name is free; teaching the filter a list of
+One naming note. Fleet has a filter per kind, and each is a single test against
+the member id — `/embed/i` and `/rerank/i`. That only partitions cleanly because
+no embedder id contains `rerank` and no reranker id contains `embed`, which is a
+convention the member names have to keep rather than something the code can
+enforce: `microsoft/harrier-oss-v1-0.6b` is wired as `harrier-embed-0.6b` for
+exactly that reason. Choosing the name is free; teaching two filters a list of
 exceptions is not.
 
 ### Memory-aware admission control: memcheck.sh
@@ -115,7 +119,7 @@ exceptions is not.
 llama-swap has no built-in idea how much memory a host actually has free before
 starting a model — there's an open ask for exactly that
 ([mostlygeek/llama-swap#158](https://github.com/mostlygeek/llama-swap/issues/158)),
-closed `not_planned`. With 35 models sharing ~121 GiB per node, an unguarded
+closed `not_planned`. With 39 models sharing ~121 GiB per node, an unguarded
 `cmd:` means the failure mode is an OOM kill mid-load, not a clean refusal.
 
 Every member's `cmd:` in [`config.yaml`](cluster/llama-swap/config.yaml) runs

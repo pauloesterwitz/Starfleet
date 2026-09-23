@@ -31,7 +31,7 @@ case "$MFE" in *\'*|*\;*|*\`*|*\$*|*\&*|*\|*) MFE="" ;; esac
 
 REMOTE="${CTX:+MML_OVERRIDE=$CTX }${MFE:+MODEL_FLAGS_EXTRA='$MFE' }"
 REMOTE="$REMOTE\$HOME/llama-swap/render-guard.sh \$HOME/llama-swap/reclaim-dflash.sh"
-REMOTE="$REMOTE /usr/bin/env MEMCHECK_RECLAIM_OLLAMA=1 \$HOME/llama-swap/memcheck.sh 108000"
+REMOTE="$REMOTE \$HOME/llama-swap/memcheck.sh 108000"
 REMOTE="$REMOTE \$HOME/ds4/serve-ds4.sh --port ${PORT}"
 
 # DRYRUN=1 must NOT touch the network -- the contract Fleet requires before it probes a
