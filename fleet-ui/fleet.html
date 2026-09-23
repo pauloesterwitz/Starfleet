@@ -268,6 +268,24 @@ const machineSel={};   // base name -> sticky machine pick across renders
 const MACHINE_ORDER=["jean-luc","kathryn","dynamic"];
 function setMachine(base,node){ machineSel[base]=node; render(last); }
 
+/* The Node column is a picker on EVERY row, so the column reads the same way the whole way
+   down instead of alternating between a control and a couple of tags. Where there is no real
+   choice it is one disabled option rather than a different kind of cell: TP=2 runs across both
+   Sparks at once, which is a single placement and not two options, and a model deployed on one
+   machine has nothing to choose between. Only a member that actually exists is ever offered. */
+function nodeCell(m){
+  const lbl=n=>(TAG[n]||["",n])[1];
+  if(m._family) return `<select class="ctxsel set"
+      title="Where this model runs. Pin, context, effort and load all apply to the machine picked here."
+      onchange="setMachine('${m._base}',this.value)">${m._family.map(n=>
+      `<option value="${n}"${n===m.nodes[0]?" selected":""}>${lbl(n)}</option>`).join("")}</select>`;
+  const tp2=m.nodes.length>1;
+  return `<select class="ctxsel" disabled title="${tp2
+      ? "TP=2 — this member runs across both Sparks at once, so there is no node to pick"
+      : "Only deployed on this machine, so there is nothing to pick"
+    }"><option>${tp2?"STARFLEET TP2":lbl(m.nodes[0])}</option></select>`;
+}
+
 function groupModels(models,run){
   const byBase={}, out=[];
   for(const m of models){
@@ -332,6 +350,14 @@ function groupModels(models,run){
     "groupModels: lone deployments stay ungrouped, and vision is its own model");
   console.assert(g.some(m=>m.id==="qwen38fn-sglang-tp2-starfleet"&&!m._family),
     "groupModels: TP=2 members are never given a machine picker");
+  /* every row carries a <select>, but only a family's is live */
+  const tp2Cell=nodeCell(g.find(m=>m.id==="qwen38fn-sglang-tp2-starfleet"));
+  const famCell=nodeCell(fam("qwen3.6-35b-mtp4"));
+  console.assert(/^<select/.test(tp2Cell)&&/disabled/.test(tp2Cell)&&/STARFLEET TP2/.test(tp2Cell),
+    "nodeCell: TP=2 gets a dropdown, disabled, one placement",tp2Cell);
+  console.assert(/^<select/.test(famCell)&&!/disabled/.test(famCell)&&
+    (famCell.match(/<option/g)||[]).length===3,
+    "nodeCell: a family gets a live dropdown with one option per real member",famCell);
   console.assert(modelName("qwen3.6-35b-85tps-mtp4-jean-luc")==="qwen3.6-35b-mtp4"&&
                  modelName("qwen38fn-long-sglang-tp2-starfleet")==="qwen38fn-long-sglang"&&
                  modelName("nomic-embed-text")==="nomic-embed-text",
@@ -625,11 +651,7 @@ function render(s){
         }">IMG${m.vision==="off"?" OFF":""}</span>`:""}</div>${
         modelName(m.id)!==m.id?`<div class="sub">${m.id}</div>`:""}${
         m.error?`<div class="err">${m.error}</div>`:""}</td>
-      <td>${m._family?`<select class="ctxsel set"
-        title="Deployed on both — pick which one this row shows and controls (pin/context/effort/load are per machine; picking doesn't move anything)"
-        onchange="setMachine('${m._base}',this.value)">${m._family.map(n=>
-          `<option value="${n}"${n===m.nodes[0]?" selected":""}>${TAG[n][1]}</option>`).join("")}</select>`
-        :m.nodes.map(n=>`<span class="tag ${TAG[n][0]}">${TAG[n][1]}</span>`).join("")}</td>
+      <td class="ctx">${nodeCell(m)}</td>
       <td class="mid">${m.tps?m.tps+" T/S":"&mdash;"}</td>
       <td class="ctx">${m.ctx_capable?`<select class="ctxsel${m.ctx?(m.ctx===m.ctx_max?" atmax":" set"):""}"
         ${working?"disabled":""} title="${ctxTitle(m)}"
