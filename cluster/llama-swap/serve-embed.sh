@@ -92,6 +92,14 @@ case "$KEY" in
     # use_activation:true sigmoid turns it into the same 0-1 relevance score bge returns.
     # Exposes /v1/rerank and /v1/score, same caller contract as bge.
     #
+    # NEED_MB is deliberately ~6 GB ABOVE what --gpu-memory-utilization reserves (0.20 x 121 GB =
+    # 24.2 GB, 0.12 x 121 GB = 14.5 GB). That fraction is of TOTAL pool, not of free pool, so vLLM
+    # asks for it unconditionally; memcheck is the only thing standing between a full pool and a
+    # CUDA OOM six minutes into the load. Measured 2026-09-23: with qwen38fn-sglang-tp2-starfleet
+    # resident (27 GB free on Jean-Luc) NEED_MB=26000 PASSED and vLLM then OOM'd in init_device.
+    # The margin turns that into a clean one-second refusal, which is the contract memcheck
+    # promises everywhere else in this file.
+    #
     # CALLER CONTRACT — this reranker is NOT a drop-in for bge-reranker-v2-m3 at the prompt level.
     # bge is a native cross-encoder, so vLLM joins query and document with the tokenizer's own
     # pair encoding. Qwen3-Reranker is an LLM-as-reranker: vLLM's scoring path takes the
@@ -106,15 +114,19 @@ case "$KEY" in
     #
     # Sending a bare query and bare documents does not error — it silently scores an
     # out-of-distribution prompt, the same failure mode as an unprefixed harrier query above.
+    # MEASURED 2026-09-23 on qwen3-reranker-8b, query "What is the capital of China?":
+    #   templated  0.9945 "The capital of China is Beijing." / 0.0000 a gravity definition
+    #   raw        0.9000 the same Beijing sentence          / 0.9451 the same gravity definition
+    # i.e. untemplated the irrelevant document OUTRANKS the answer. The wrapper is not optional.
     #
     # max-model-len 8192 matches bge-reranker-v2-m3's native window and Qwen's own eval setting.
     # The checkpoint allows 40960; serving that would size the KV cache for a context no
     # reranking call uses, out of a pool fraction that has to stay small enough not to starve
     # an LLM member.
     if [ "$KEY" = qwen3-reranker-8b ]; then
-      BASE="/models/Qwen3-Reranker-8B"; NEED_MB=26000; GPUFRAC=0.20   # 16.4 GB of weights
+      BASE="/models/Qwen3-Reranker-8B"; NEED_MB=30000; GPUFRAC=0.20   # 16.4 GB weights, 24.2 GB reserved
     else
-      BASE="/models/Qwen3-Reranker-4B"; NEED_MB=16000; GPUFRAC=0.12   # 8.0 GB of weights
+      BASE="/models/Qwen3-Reranker-4B"; NEED_MB=18000; GPUFRAC=0.12   # 8.0 GB weights, 14.5 GB reserved
     fi
     EXTRA=(--convert classify
            --max-model-len 8192
