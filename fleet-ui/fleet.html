@@ -182,6 +182,7 @@ td .sub{margin-top:3px;font-size:11px;color:var(--dim);line-height:1.35}
       <button class="pill" data-f="pinned">Pinned</button>
       <button class="pill" data-f="vision">Vision</button>
       <button class="pill" data-f="embed">Embeddings</button>
+      <button class="pill" data-f="rerank">Rerankers</button>
       <button class="pill" data-f="image">Image</button>
       <span class="count" id="count"></span>
     </div>
@@ -196,7 +197,7 @@ td .sub{margin-top:3px;font-size:11px;color:var(--dim);line-height:1.35}
 const TAG={"jean-luc":["jl","JEAN-LUC"],"kathryn":["ka","KATHRYN"],"dynamic":["dy","AUTO"]};
 const gb=kb=>(kb/1048576).toFixed(1);
 const busy=new Set();
-const FILTERS=["all","jean-luc","kathryn","starfleet","dynamic","live","pinned","vision","embed","image"];
+const FILTERS=["all","jean-luc","kathryn","starfleet","dynamic","live","pinned","vision","embed","rerank","image"];
 /* the hash makes a view bookmarkable — open #kathryn to land straight on her models */
 let filter=FILTERS.includes(location.hash.slice(1))?location.hash.slice(1):"all";
 let query="", last={nodes:{},models:[],running:[],pins:[],errors:{},loading:[]};
@@ -219,6 +220,16 @@ setFilter(filter);
 document.getElementById("q").oninput=e=>{query=e.target.value.trim().toLowerCase();render(last);};
 
 function isImg(m){ return !!(m.kind && m.kind!=="llm"); }
+
+/* Rerankers are their own category, not a flavour of Embeddings. They answer a different
+   question -- a reranker scores query/document PAIRS and returns one relevance number, an
+   embedder returns a vector -- and a RAG pipeline picks one of each independently. The split
+   also stops the 16 GB Qwen3-Reranker-8B from sitting in a list whose other members are ~1 GB.
+   One regex each is enough because the two names never overlap: no embedder id contains
+   "rerank" and no reranker id contains "embed" (serve-embed.sh's key table is the authority,
+   and harrier-EMBED-0.6b is named the way it is precisely to keep that true). */
+const isRerank=m=>/rerank/i.test(m.id);
+const isEmbed =m=>/embed/i.test(m.id);
 
 const KINDLBL={image:"Image",video:"Video",judge:"Visual QA"};
 
@@ -326,6 +337,14 @@ function groupModels(models,run){
                  modelName("nomic-embed-text")==="nomic-embed-text",
     "modelName: the label carries no node, no TP=2 marker and no measured tps");
   console.assert(g.length===6,"groupModels: 9 members -> 2 families + 4 lone rows",g.map(m=>m.id));
+  /* the Embeddings / Rerankers split: every real member lands in exactly one of the two,
+     and the LLMs land in neither */
+  const cat=id=>[isEmbed({id}),isRerank({id})].join();
+  console.assert(cat("nomic-embed-text")==="true,false"&&cat("harrier-embed-0.6b")==="true,false",
+    "filters: embedders are Embeddings only");
+  console.assert(cat("bge-reranker-v2-m3")==="false,true"&&cat("qwen3-reranker-8b-kathryn")==="false,true",
+    "filters: rerankers are Rerankers only, never Embeddings");
+  console.assert(cat("qwen3.6-35b-85tps-mtp4-jean-luc")==="false,false","filters: an LLM is in neither");
 })();
 
 /* Image/video models share the registry table but fill it differently: they are not
@@ -396,7 +415,8 @@ function keep(m,run){
     case "pinned": return m.pinned;
     case "vision": return m.vision==="on";
     case "starfleet": return m.nodes.length>1;
-    case "embed": return /embed|rerank/i.test(m.id);
+    case "embed": return isEmbed(m);
+    case "rerank": return isRerank(m);
     default: return m.nodes.includes(filter) && m.nodes.length===1;
   }
 }
