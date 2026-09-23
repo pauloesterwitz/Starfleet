@@ -192,7 +192,11 @@ final class PanelController: ObservableObject {
                 self.init(brand: .glm53, variant: .none)
             case id.hasPrefix("hy3"):
                 self.init(brand: .hunyuan, variant: .none)
-            case id.contains("embed"), id.contains("imagegen"):
+            // "rerank" added 2026-09-23: bge-reranker-v2-m3 and the Qwen3-Reranker
+            // members carry no "embed" in their ids, so without this they fall through
+            // to .other. Note the Qwen cases above do NOT catch them -- "qwen3-reranker"
+            // has no version marker ("qwen3.8"/"qwen38"/"qwen3vl"/"qwen3-235b") in it.
+            case id.contains("embed"), id.contains("rerank"), id.contains("imagegen"):
                 self.init(brand: .aux, variant: .none)
             default:
                 self.init(brand: .other, variant: .none)
