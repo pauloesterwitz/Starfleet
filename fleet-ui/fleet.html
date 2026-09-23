@@ -112,6 +112,11 @@ tr.live td:first-child{border-left-color:var(--blue)}
   transition:none}
 @keyframes sweep{0%{transform:translateX(-100%)}100%{transform:translateX(313%)}}
 .load .sub{margin-top:6px;font-size:11px;color:var(--dim)}
+.load .hd button{font-family:var(--lcars);font-size:11px;font-weight:600;letter-spacing:.08em;
+  text-transform:uppercase;border:0;border-radius:11px;padding:3px 12px;margin-left:10px;
+  background:var(--grid);color:var(--text);cursor:pointer}
+.load .hd button:hover{background:var(--magenta);color:#000}
+.load .hd button:disabled{opacity:.32;cursor:default;background:var(--grid);color:var(--dim)}
 /* second line under an image model's name: kind, footprint, note */
 td .sub{margin-top:3px;font-size:11px;color:var(--dim);line-height:1.35}
 
@@ -575,6 +580,15 @@ async function act(url,model,pin){
   busy.delete(model); refresh();
 }
 
+async function cancelLoad(model){
+  /* Cancel also unpins, server-side: a pinned model that is merely unloaded comes
+     straight back on the next keepalive, which is not what "cancel" can mean. */
+  if(!confirm(`Cancel loading ${model}?\n\n`+
+     `The engine is killed where it stands, and the model is unpinned so it is `+
+     `not reloaded straight away. Anything already loaded is discarded.`)) return;
+  await act("/api/cancel",model);
+}
+
 function mmss(s){
   s=Math.max(0,Math.round(s));
   const m=Math.floor(s/60), r=s%60;
@@ -589,17 +603,31 @@ function paintLoading(){
   const drift=(Date.now()-loadAt)/1000;
   el.style.display="block";
   el.innerHTML=ld.map(l=>{
-    const t=l.elapsed+drift, eta=l.eta, over=eta&&t>eta;
+    const t=l.elapsed+drift, p=l.progress;
+    /* Two estimates, and the live one wins as soon as there is enough of it to
+       divide by. elapsed/done - elapsed re-projects from the engine's own progress,
+       so a load that hit a cold compile cache stops promising the median's finish
+       time -- the same member has come up in 3m and in 41m. The median is only the
+       prior that covers the first seconds, before any percentage exists. */
+    const live=(p>=.04)?t*(1-p)/p:null;
+    const left=live!=null?live:(l.eta?l.eta-t:null);
+    const over=left!=null&&left<=0;
     /* capped at 99: the bar must never read full while the load is still going */
-    const pct=eta?Math.min(99,t/eta*100):0;
-    const sub=!eta ? "First recorded load of this model &mdash; no estimate yet"
+    const pct=Math.round(p!=null?Math.max(1,Math.min(99,p*100))
+                                :(l.eta?Math.min(99,t/l.eta*100):0));
+    const det=p!=null||!!l.eta;
+    const sub=p!=null
+      ? `${l.phase}${left!=null?` &mdash; about ${mmss(left)} left`:" &mdash; measuring"}`
+      : !l.eta ? "First recorded load of this model &mdash; no estimate yet"
       : over ? "Taking longer than usual &mdash; still loading"
-      : `about ${mmss(eta-t)} left`;
+      : `about ${mmss(left)} left, from previous loads of this model`;
     return `<div class="load ${over?"over":""}">
       <div class="hd"><span class="nm">${l.model}</span>
         <span class="st loading">loading</span>
-        <span class="tm">${mmss(t)}${eta?` / ~${mmss(eta)}`:""}</span></div>
-      <div class="track ${eta?"":"indet"}"><i style="${eta?`width:${pct}%`:""}"></i></div>
+        <span class="tm">${mmss(t)}${left>0?` / ~${mmss(t+left)}`:""}</span>
+        <button ${busy.has(l.model)?"disabled":""}
+          onclick="cancelLoad('${l.model}')">Cancel</button></div>
+      <div class="track ${det?"":"indet"}"><i style="${det?`width:${pct}%`:""}"></i></div>
       <div class="sub">${sub}</div></div>`;
   }).join("");
 }

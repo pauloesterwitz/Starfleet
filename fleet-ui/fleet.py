@@ -403,6 +403,96 @@ def eta_for(model, hist=None):
     return _median((load_times() if hist is None else hist).get(model, []))
 
 
+# Real progress, read from the engine's own startup narration. The clock alone
+# lies badly here: the SAME member has come up in 208s and in 2492s, because
+# CUDA-graph capture is 3s against a warm compile cache and 13 minutes against a
+# cold one. vLLM and SGLang both say where they are, so take the percentage from
+# them and use the clock only to project what is left.
+# (label, fraction where the phase starts, where it ends, pattern). A pattern with
+# a capture group carries a tqdm percentage that interpolates inside the phase; one
+# without means only "this phase has begun".
+# Bounds are what the logs of the slowest members actually show: weights dominate
+# (GLM-5.3 TP2: load_weight=910s of a ~1800s startup), and the tail after uvicorn
+# says "Application startup complete" is NOT nothing -- that member answered /health
+# with 503 for another 142s before it was really up.
+LOAD_PHASES = (
+    ("starting engine",       0.00, 0.06,
+     r"gate .*? pool|Init torch distributed begin|ring up:|both nodes up"),
+    # "Load weight begin" carries no percentage, but it is the ONLY weight marker
+    # some loaders print (SGLang's ModelOpt path for the NVFP4 checkpoints prints no
+    # shard tqdm at all) -- without it the bar sits at 0% through the longest phase.
+    ("loading weights",       0.06, 0.60,
+     r"Load weight begin|(?:Multi-thread loading|Loading (?:safetensors|pt) checkpoint)"
+     r" shards:\s*(\d+)%"),
+    ("weights loaded",        0.60, 0.66,
+     r"Load weight end|Model loading took"),
+    ("allocating KV cache",   0.66, 0.70,
+     r"KV Cache is allocated|GPU KV cache size"),
+    ("capturing CUDA graphs", 0.70, 0.90,
+     r"Capturing (?:batches|CUDA graph shapes)[^:\n]*:\s*(\d+)%"),
+    ("warming up",            0.90, 0.99,
+     r"Engine startup timings|init engine \(profile|Application startup complete|Uvicorn running"),
+    ("ready",                 0.99, 1.00,
+     r"server is fired up"),
+)
+LOG_TAIL = 65536     # bytes of log read per poll; the whole narration fits many times over
+
+
+def _phase_from_text(text):
+    """(fraction, label) for the FURTHEST phase named in `text`, or (None, None).
+
+    Furthest, not last: SGLang re-runs the early phases for its draft model, so the
+    final matching line in a log is regularly an earlier stage than the load is at.
+    """
+    best = None
+    for i, (label, lo, hi, pat) in enumerate(LOAD_PHASES):
+        for m in re.finditer(pat, text):
+            if best is None or i >= best[0]:
+                pct = m.group(1) if m.lastindex else None
+                best = (i, label, lo + (hi - lo) * int(pct) / 100 if pct else lo)
+    return (round(best[2], 4), best[1]) if best else (None, None)
+
+
+def _engine_log(member):
+    """The launcher log this member narrates its startup into, or None. Same two
+    names observe_pools() already knows: vLLM writes run-<sub>.log, the SGLang
+    cluster launcher tees its head's output into sglang-<sub>.log."""
+    with _ctx_max_lock:
+        sub = _ctx_sub.get(member)
+    if not sub:
+        return None
+    paths = [q for n in (f"run-{sub}.log", f"sglang-{sub}.log")
+             for q in [os.path.join(LS_LOGS, n)] if os.path.exists(q)]
+    return max(paths, key=os.path.getmtime) if paths else None
+
+
+def _log_mark(member):
+    """(path, size-now) -- where this load's own output will start. Taken when the
+    load begins so the PREVIOUS run's "100% Completed" can never be read as this
+    one's progress, which is the whole reason the offset exists."""
+    path = _engine_log(member)
+    try:
+        return path, os.path.getsize(path)
+    except (OSError, TypeError):
+        return path, 0
+
+
+def load_progress(mark):
+    """(fraction, label) for a load in flight, from the bytes its own run appended."""
+    path, off = mark or (None, 0)
+    if not path:
+        return None, None
+    try:
+        with open(path, "rb") as fh:
+            size = os.fstat(fh.fileno()).st_size
+            start = off if size >= off else 0      # the launcher truncates on re-run
+            fh.seek(max(start, size - LOG_TAIL))
+            text = fh.read().decode("utf-8", "replace")
+    except OSError:
+        return None, None
+    return _phase_from_text(text)
+
+
 # ------------------------------------------------- per-model context window
 
 _ctx_lock = threading.Lock()
@@ -1077,7 +1167,9 @@ def touch(model):
     started = time.time()
     if cold:
         with _loading_lock:
-            _loading[model] = {"started": started, "eta": eta_for(model)}
+            _loading[model] = {"started": started, "eta": eta_for(model),
+                               "mark": _log_mark(model), "progress": None, "phase": None}
+    cancelled = False
     try:
         swap_get(f"/upstream/{q}/health", timeout=LOAD_TIMEOUT)
         elapsed = time.time() - started
@@ -1097,9 +1189,40 @@ def touch(model):
         if cold:
             with _loading_lock:
                 _loading.pop(model, None)
+        with _cancel_lock:
+            cancelled = model in _cancelled
+            _cancelled.discard(model)
+    if cancelled:
+        with LOCK:
+            STATE["errors"].pop(model, None)   # the user asked for this; it is not a fault
+        return False
     with LOCK:
         STATE["errors"][model] = msg
     return False
+
+
+_cancelled = set()        # models whose in-flight cold load the user aborted
+_cancel_lock = threading.Lock()
+
+
+def cancel_load(model):
+    """Abort a cold load in flight.
+
+    Unpin FIRST -- otherwise keepalive puts the model straight back, which is what
+    "cancel" must never do. Then ask llama-swap to kill the process the health probe
+    is blocked on; the touch() thread unwinds when that connection dies. The bar is
+    dropped here rather than there so the page stops showing a load the moment the
+    user cancels it, however long the upstream takes to actually die.
+    """
+    pins = set(load_pins())
+    if model in pins:
+        pins.discard(model)
+        save_pins(pins)
+    with _cancel_lock:
+        _cancelled.add(model)
+    with _loading_lock:
+        _loading.pop(model, None)
+    swap_get("/unload?model=" + urllib.parse.quote(model, safe=""))
 
 
 _reloading = set()        # pins currently being re-touched, so we don't double-fire
@@ -1352,11 +1475,22 @@ class Handler(BaseHTTPRequestHandler):
             ]
             now = time.time()
             with _loading_lock:
-                snap["loading"] = sorted(
-                    ({"model": m, "elapsed": round(now - v["started"], 1), "eta": v["eta"]}
-                     for m, v in _loading.items()),
-                    key=lambda d: d["model"],
-                )
+                inflight = [(m, dict(v)) for m, v in _loading.items()]
+            live = []
+            for m, v in inflight:
+                frac, phase = load_progress(v.get("mark"))
+                # Never walk backwards: once the tail has scrolled past the last
+                # phase line, a fresh read finds nothing, and a bar that drops from
+                # 60% to a sweep reads as a failure rather than as a quiet log.
+                if frac is None or frac < (v.get("progress") or 0):
+                    frac, phase = v.get("progress"), v.get("phase")
+                else:
+                    with _loading_lock:
+                        if m in _loading:
+                            _loading[m]["progress"], _loading[m]["phase"] = frac, phase
+                live.append({"model": m, "elapsed": round(now - v["started"], 1),
+                             "eta": v["eta"], "progress": frac, "phase": phase})
+            snap["loading"] = sorted(live, key=lambda d: d["model"])
             return self._send(200, json.dumps(snap), "application/json")
         self._send(404, "not found", "text/plain")
 
@@ -1430,6 +1564,13 @@ class Handler(BaseHTTPRequestHandler):
             save_pins(pins)
             try:
                 swap_get("/unload?model=" + urllib.parse.quote(model, safe=""))
+            except (urllib.error.URLError, OSError) as e:
+                return self._send(502, json.dumps({"error": str(e)[:200]}), "application/json")
+            return self._send(200, '{"ok":true}', "application/json")
+
+        if self.path == "/api/cancel":
+            try:
+                cancel_load(model)
             except (urllib.error.URLError, OSError) as e:
                 return self._send(502, json.dumps({"error": str(e)[:200]}), "application/json")
             return self._send(200, '{"ok":true}', "application/json")
@@ -1512,6 +1653,35 @@ def selfcheck():
     assert _median([30, 10, 20]) == 20
     assert eta_for("never-loaded", {}) is None
     assert eta_for("m", {"m": [100, 10, 12]}) == 12
+
+    # Load progress comes from the engine's own narration, and must read the
+    # FURTHEST phase in the log rather than whichever line happens to be last.
+    assert _phase_from_text("") == (None, None)
+    assert _phase_from_text("Init torch distributed begin.") == (0.0, "starting engine")
+    assert _phase_from_text(
+        "Loading safetensors checkpoint shards:  40% Completed | 2/5") == (0.276, "loading weights")
+    # SGLang names the same phase differently, and it is the LONGEST one -- missing
+    # it left the bar frozen at 0% for the 15 minutes the weights actually take.
+    assert _phase_from_text(
+        "Multi-thread loading shards:  50% Completed | 23/46 [08:12<08:03, 21.0s/it]"
+    ) == (0.33, "loading weights")
+    # the loader that prints no percentage at all still has to move off "starting"
+    assert _phase_from_text("[TP0] Load weight begin. avail mem=75.06 GB") == (
+        0.06, "loading weights")
+    # weights done, then capture at 0%: the later phase wins even though its own
+    # percentage is lower -- this is exactly the SGLang draft-model replay case.
+    assert _phase_from_text(
+        "Load weight end. elapsed=737.14 s\n"
+        "Capturing batches (bs=1 avail_mem=17.01 GB):   0%|") == (0.70, "capturing CUDA graphs")
+    assert _phase_from_text(
+        "Capturing batches (bs=1 avail_mem=17.01 GB): 100%|") == (0.90, "capturing CUDA graphs")
+    # uvicorn is up long before the model answers: that is 0.99, not done.
+    assert _phase_from_text("INFO: Application startup complete.") == (0.90, "warming up")
+    assert _phase_from_text("The server is fired up and ready to roll!") == (0.99, "ready")
+    # A model with no resolved checkpoint has no log to read, and that must be a
+    # quiet "no progress" rather than an exception on every poll.
+    assert load_progress(_log_mark("definitely-not-a-member")) == (None, None)
+    assert load_progress(None) == (None, None)
 
     # Context overrides: bounds match ctx-env.sh/ctxproxy, junk and unknown
     # members read as "no override" rather than as a bogus size.
