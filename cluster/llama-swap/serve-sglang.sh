@@ -39,6 +39,16 @@ case "$KEY" in
     # Qwen3-VL members had (that one leaked think-text INTO content instead; fixed by using
     # qwen3-thinking above). Callers should allow a few hundred tokens, or send
     # chat_template_kwargs {"enable_thinking": false} to turn thinking off per request.
+    # CORRECTION 2026-09-17, MEASURED: do NOT send enable_thinking=false. With the qwen3-thinking
+    # parser the whole reply then lands in reasoning_content and `content` comes back EMPTY
+    # (finish_reason=stop after 29-39 tokens, the complete answer sitting in reasoning_content).
+    # Leave thinking on and allow a few hundred to ~2000 max_tokens; a vision answer took 174.
+    #
+    # VISION TOWER: CONFIGURED AND WORKING, verified 2026-09-17. config.json has
+    # language_model_only=False, so qwen3_vl.py:1243 builds Qwen3VLMoeVisionModel, unquantized
+    # (model.visual.* is in the quantization ignore list). A 320x240 probe (red rectangle, blue
+    # circle, "47") added 82 image tokens over an identical text-only prompt and was described
+    # exactly. Send images as OpenAI image_url content parts through llama-swap; no flags needed.
     # IMAGE SWITCHED 2026-09-07 to the UPSTREAM image. The custom sglang-qwen38fn-gb10:local build
     # (Dockerfile.sglang-gb10) is RETIRED -- see the ROOT CAUSE block below. That build patched
     # _resolve_trtllm_sparse_decode() to accept sm_121; upstream now ships a purpose-built GB10
@@ -264,6 +274,103 @@ case "$KEY" in
     # Only write config.yaml when the fleet is idle. This file is not watched, so notes go here.
     # IF "!" RUNS EVER REAPPEAR: drop the four --speculative-* flags first, then re-read this block.
     FLAGS="--moe-runner-backend flashinfer_cutlass --disable-flashinfer-autotune --reasoning-parser qwen3-thinking --tool-call-parser qwen3_coder --speculative-algorithm NEXTN --speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 2" ;;
+  qwen38fn-long)
+    # Qwen3.8-Flash-Next at 512k, via a YaRN rope override. SIBLING of `qwen38fn` above, which
+    # stays at the native 262,144 with MTP K=1 -- this key changes nothing for that member.
+    # Precedent: glm53awq / glm53awq-long are the same split.
+    #
+    # WHY A ROPE OVERRIDE. max_position_embeddings is 262144 and rope_parameters ships
+    # rope_type "default", so 262144 is a hard wall, not a memory limit: the KV pool at
+    # mem-fraction 0.80 already holds ~690k tokens. YaRN factor 2.0 doubles the window and
+    # costs NO extra memory. Qwen's own recipe (model card, "Processing Long Texts") is
+    # factor 4.0 -> 1M; 2.0 is chosen because Qwen advises sizing the factor to real need,
+    # and because static YaRN rescales short prompts too.
+    #
+    # EVERY KEY OF rope_parameters IS RESTATED ON PURPOSE. --json-model-override-args REPLACES
+    # the dict, it does not merge into it. Drop mrope_section and the model silently loses
+    # mRoPE while the server still reports healthy -- vision breaks, text degrades, no error.
+    # max_position_embeddings must be raised in the SAME override: get_context_length() reads
+    # `rope_scaling` (absent on this model), so without it --context-length 524288 hard-fails
+    # with a ValueError. Do NOT paper over that with SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN.
+    # The JSON MUST stay compact: FLAGS is word-split, a single space breaks it into two args.
+    # The nested-text_config override is a no-op on many sglang builds (sgl-project#27974);
+    # it is FIXED in dev-qwen38-next-local (config.py merges via PretrainedConfig.update).
+    # The MTP head inherits it automatically (qwen4_exp_mtp.py does config = config.text_config).
+    #
+    # MEASURED 2026-09-20 at 479,655 prompt tokens (1.83x the native window), needle at three
+    # depths, 3/3 exact recall. MTP K=1 vs K=3 at that size:
+    #   K=1  decode 49.6-51.1 tok/s   prefill 1415-2199   KV pool 692,224
+    #   K=3  decode 66.2     tok/s    prefill 2208.8      KV pool 675,776   <- +31%, this config
+    # Decode does NOT fall off with context (short-context K=1 was 45.5-48.9).
+    # Short prompts (EN/DE/code) were diffed against the unscaled member: no visible tax.
+    #
+    # STABILITY, MEASURED. K=3 is the config that collapsed 60% of the time on the OLD patched
+    # image (K=1 40%, MTP off 0%) -- the recurrent conv/SSM state cannot be rewound on a partial
+    # acceptance (sgl-project/sglang#25587), which is why that was called architectural.
+    # On THIS image (dev-qwen38-next-local, unpatched) it is clean:
+    #   ratetest-glm53.py -n 40 against this member, 2026-09-20: 0/40 collapsed, max repeated-char
+    #   run 0, min unique-word ratio 0.38, every sample run to the full 1200-token budget.
+    # Results: ~/llama-swap/.yarn/ratetest-k3.json. The 262k member's K=1 reference was 0/80, so
+    # this arm is half that sample size -- re-run with -n 40 again if you want parity.
+    # K=3 is also the architectural ceiling (indexer_compress_ratio 4 => num_draft_tokens <= 4).
+    # IF "!" RUNS OR GARBAGE APPEAR: set --speculative-num-steps 1 and
+    # --speculative-num-draft-tokens 2 below (that is exactly the proven K=1 config), or run
+    # ~/llama-swap/bench-sglang-mtp-k.sh for a proper collapse rate first.
+    IMAGE=lmsysorg/sglang:dev-qwen38-next-local
+    SUB=Qwen3.8-Flash-Next-NVFP4-Spark
+    SERVED=qwen38fn-long-sglang-tp2
+    NEED=85000; MEMFRAC=0.80; CTX=${CTX_LEN:-524288}
+    # ── THE ROPE FACTOR FOLLOWS THE REQUESTED CONTEXT. Do not hard-code it. ──────────────────
+    # fleet-ui / ctxproxy let a context be picked per load (~/.gb10/ctx/<member>), so a fixed
+    # factor is wrong at every size but one: at 262144 it would apply YaRN to a window that is
+    # already trained (Qwen warns static YaRN costs short-prompt quality), and at 393216 it
+    # would scale for 512k. factor = CTX / 262144, and BELOW the native window no override is
+    # emitted at all -- the model then runs exactly as the 262k member does.
+    QNATIVE=262144
+    MAXTOK=$(( CTX + 32768 )); [ "$MAXTOK" -gt 758144 ] && MAXTOK=758144   # measured pool ceiling at 0.80
+    if [ "$CTX" -gt "$QNATIVE" ]; then
+      QFACTOR=$(python3 -c "print(f'{$CTX/$QNATIVE:.4f}')")
+      QROPE="--json-model-override-args {\"text_config\":{\"max_position_embeddings\":${CTX},\"rope_parameters\":{\"rope_type\":\"yarn\",\"factor\":${QFACTOR},\"original_max_position_embeddings\":${QNATIVE},\"rope_theta\":10000000,\"mrope_section\":[11,11,10],\"mrope_interleaved\":true,\"partial_rotary_factor\":0.25}}}"
+      echo "serve-sglang[qwen38fn-long]: ctx $CTX > native $QNATIVE -> YaRN factor $QFACTOR, pool $MAXTOK" >&2
+    else
+      QROPE=""
+      echo "serve-sglang[qwen38fn-long]: ctx $CTX <= native $QNATIVE -> no rope override, pool $MAXTOK" >&2
+    fi
+    # ── SPEED, SWEPT AT THIS CONFIG 2026-09-20 (6 arms, ctx 524288, .yarn/sweep-512k.log) ──────
+    # The 2026-08-29 K table does NOT transfer: it was measured at ctx 16384, where K=3 won at
+    # 49.4 tok/s. At 512k every arm is roughly half that, and the ordering changes.
+    #   arm                  single   agg@8   acceptance
+    #   k3-asis               19.1     57.3     1.97     <- unbounded, what was wired first
+    #   k3-bounded            20.9     30.4     2.33
+    #   k2-bounded            19.3     29.1     1.80
+    #   k1-bounded            21.4     30.0     1.52     <- WINNER, this config
+    #   nomtp-bounded         17.9     28.5     -        <- MTP is only worth +20% here, not +35%
+    #   k3-bounded-nograph    10.6     15.6     1.70     <- CUDA GRAPHS ARE WORTH 2x. NEVER DISABLE.
+    # agg@8 looks like a regression on the bounded arms and is not one: --max-running-requests 2
+    # caps concurrency, and this member cannot serve 8 long contexts anyway -- the pool holds
+    # ~557k tokens, about ONE 480k sequence. Single-stream is the number that matters here.
+    #
+    # BUT THE single COLUMN ABOVE DOES NOT SURVIVE A LONGER MEASUREMENT, so do not quote it as a
+    # speed win. That harness generates 192 tokens and divides by WALL TIME INCLUDING PREFILL, so
+    # it is sensitive to per-request overhead, not to decode rate. Measured again with
+    # .yarn/decode-bench.py (1500 tokens, temp 0, timed first-token-to-last):
+    #     k3-asis    23.6 tok/s   (24.5 / 23.6 / 23.2)
+    #     k1-bounded 23.7 tok/s   (22.9 / 23.8 / 23.7)
+    # i.e. STEADY-STATE DECODE IS UNCHANGED. What bounding actually buys is resources, verified
+    # on the reload: free memory after graph capture 18.78 -> 25.74 GB (~7 GB back), verify-graph
+    # capture 129.3 s / 2.91 GB -> 94.6 s / 1.35 GB, captured bs list [1..17] -> [1,2], pool
+    # 758,144 -> 557,056 tokens. K=1 is kept over K=3 because it ties on speed, frees that
+    # memory, and is the better-validated arm (0/80 vs 0/40 collapses).
+    # K=1 also happens to be the collapse-proven setting (0/80 on the 262k member; K=3 measured
+    # 0/40 here 2026-09-20, .yarn/ratetest-k3.json), so the fast arm is also the safe one.
+    #
+    # THE BOUNDING FLAGS ARE DELIBERATE, same idiom as glm53awq-long:
+    #   --max-total-tokens 557056 : the default built a 758,144-token pool for a member whose
+    #       window is 524,288. The surplus is dead memory.
+    #   --cuda-graph-max-bs 4 : the default captured graphs for bs up to 17 (129 s of capture
+    #       for the verify graph alone) on a member that serves one request at a time.
+    #   --max-running-requests 2 : concurrency this member can actually honour at 512k.
+    FLAGS="--moe-runner-backend flashinfer_cutlass --disable-flashinfer-autotune --reasoning-parser qwen3-thinking --tool-call-parser qwen3_coder --speculative-algorithm NEXTN --speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 2 --max-running-requests 2 --cuda-graph-max-bs 4 --max-total-tokens ${MAXTOK} ${QROPE}" ;;
   glm53flash)
     # GLM-5.3-Flash (zai-org) NVFP4-A16 by LibertAI: 320B total / 18B active MoE, natively
     # multimodal, 181.3 GiB. TP=2-FORCED — ~90.5 GiB of weights per Spark, the largest member
@@ -469,9 +576,141 @@ case "$KEY" in
     IMAGE=sglang-glm53-gb10:local
     SUB=GLM-5.3-Flash-AWQ-kda-w8
     SERVED=glm53-awq-sglang-tp2
-    NEED=100000; MEMFRAC=0.86; CTX=32768
-    FLAGS="--attention-backend dsa --dsa-prefill-backend tilelang --dsa-decode-backend tilelang --moe-runner-backend auto --kv-cache-dtype bfloat16 --disable-shared-experts-fusion --reasoning-parser glm45 --tool-call-parser glm47 --max-running-requests 1 --speculative-algorithm NEXTN --speculative-eagle-topk 1 --speculative-num-steps 2 --speculative-num-draft-tokens 3" ;;
-  *) echo "serve-sglang: unknown key '$KEY' (want qwen38fn|glm53flash|glm53awq)" >&2; exit 1 ;;
+    #
+    # ── MTP IS SAFE HERE, UNLIKE QWEN3.8-FLASH-NEXT. MEASURED 2026-09-17, n=40. ───────────────
+    # The qwen member above disables MTP because partial acceptance corrupts a recurrent state that
+    # cannot be rewound (60% of replies collapsed into "!"). GLM-5.3 is hybrid too - 34 of 45 layers
+    # are KDA linear attention - so the same question had to be asked, at the same sample size.
+    #   MTP K=2   0 collapses / 40 long reasoning generations, median 28.6 tok/s
+    #   MTP off   0 collapses / 40 (same prompts),             median 22.1 tok/s
+    #   acceptance 533 samples: median rate 0.62, median len 2.25, ZERO zero-acceptance events
+    # +30% on REAL reasoning workloads, not just short benches - the opposite of qwen, where the
+    # bench win evaporated in practice ("accept rate: 0.00 and it never recovers"). Three samples
+    # tripped the collapse detector and all three were the model computing correctly
+    # ("1.0000000000000002" etc.); ratetest-glm53.py no longer flags digit runs under 30 chars.
+    # WHY IT IS SAFE: this image HAS the rollback qwen's lacks. kda_backend.py writes each draft
+    # token's post-state into a speculative `intermediate_ssm` scratch and spec_utils.py:1121 calls
+    # update_mamba_state_after_mtp_verify() to commit the accepted-length state. Missing scratch
+    # RAISES rather than drifting silently. Re-verify with ~/llama-swap/mtp-stability-glm53.sh
+    # (n>=40) after any image upgrade - never with a smaller n, see the qwen n=20 lesson above.
+    #
+    # --max-mamba-cache-size 8 IS REQUIRED, not tuning. Without it this member refuses to start,
+    # intermittently, depending on how much memory is free at launch (2026-09-17 02:34 failure):
+    #   "Hybrid (mamba/linear-attention) state cache is too small to serve any requests.
+    #    max_mamba_cache_size=2, mamba_ratio=5, resulting max_num_reqs=0"
+    # GLM needs 5 recurrent-state slots PER REQUEST; SGLang derived 2 that evening, so floor(2/5)=0.
+    # Forcing 8 makes the launch deterministic for ~1 GB (conv 0.02 + ssm 0.62 + intermediate 0.41).
+    # --max-total-tokens ${MAXTOK} BOUNDS THE POOL ABSOLUTELY, and that is the real fix. A derived
+    # FRACTION is inherently racy: it is computed from MemAvailable at one instant but applied to
+    # whatever exists when SGLang allocates. Measured twice on 2026-09-18 - 0.95 of a 96.9 GB
+    # reading allocated against 105.7 GB and built a 1,182,720-token pool (1.5 GB free left), then
+    # 0.92 of a 104 GB reading built 933,952 tokens (3.2 GB free). Both for a member serving ctx
+    # 32768, which needs ~65k tokens. 131072 is 4x the context, costs 1.7 GB, and cannot drift.
+    # MEMFRAC IS DERIVED, NOT FIXED (2026-09-18). 0.86 assumed ~112 GB free and produced a NEGATIVE
+    # KV pool whenever Jean-Luc was busier: mem-fraction-static is a share of the memory present at
+    # launch and the 87.8 GB of weights (incl. the MTP draft) come out of it FIRST, so the pool is
+    # mf x 0.945 x free - 87.8. At 101 GB free, 0.86 gives -5.3 GB and SGLang refuses to start.
+    # This is why the member started on some days and not others. Target a ~1.8 GB pool (the state
+    # cache is 1.05 GB of it, leaving ~58k tokens of KV - ample at ctx 32768), clamped to [0.86, 0.92].
+    # THE UPPER CLAMP MATTERS. It was 0.95, and on 2026-09-18 the fraction was derived at a moment
+    # when only 96.9 GB was free (so it hit the clamp) but ALLOCATED against 105.7 GB once idle
+    # sessions had been closed. SGLang then built a 1,182,720-token KV pool - ~15 GB of cache for a
+    # 32k member - and left 1.5 GB free on each node, under the 3 GB watchdog floor and one new
+    # session away from OOM. 0.92 with a 3 GB pool target keeps ~10 GB of headroom instead.
+    # LONG-CONTEXT CALLERS: send chat_template_kwargs {"enable_thinking": false}. VERIFIED
+    # 2026-09-19 at ctx 262144 - a needle 250k tokens behind the question came back exact with
+    # thinking off, while every run WITH thinking returned nothing because the model was still
+    # reasoning when max_tokens ran out. This is the opposite of the qwen38fn member above, where
+    # enable_thinking=false strands the answer in reasoning_content. Retrieval here is fine; the
+    # answer budget was the whole problem.
+    # Sized from the context actually requested (glm-size.py, which carries the measured model
+    # and a selftest). CTX_LEN comes from ~/.gb10/ctx/<member> via ctx-env.sh, so raising the
+    # context here re-sizes the pool, the fraction and the memcheck gate together instead of
+    # leaving three hardcoded numbers to disagree. 87.8 GB of weights, 3.0 GB of state+draft.
+    # HARD CEILING 439296 (471k), Paul's choice 2026-09-20. Derived, not guessed: free memory after
+    # one full-context request is free - 87.8 (weights) - pool - 8 (runtime) - ctx x 10 kB (in-use
+    # state), and at today's ~113 GB free that hits the 3 GB watchdog floor at ~483k tokens.
+    #   floor 6 GB -> 345k   5 GB -> 387k   4 GB -> 429k   3 GB -> 471k   512k would need ~2 GB
+    # 512k is NOT merely against policy: it sits BELOW the 3 GB trip point, so the guard would fire
+    # mid-request. 471k lands exactly ON it, which is why Paul chose 429k instead (2026-09-20): a
+    # full GB of clearance, still 64% more context than the 256k default. glm-memfloor.service
+    # guards it either way, so the failure mode is "model killed, reload it" rather than the kernel
+    # choosing a victim among Paul's own sessions.
+    # Clamped HERE rather than only in fleet-ui, so a stray ~/.gb10/ctx value cannot exceed it.
+    CTX=${CTX_LEN:-32768}
+    if [ "$CTX" -gt 439296 ]; then
+      echo "serve-sglang[glm53awq]: context $CTX exceeds the 439296 (471k) ceiling - clamping" >&2
+      CTX=439296
+    fi
+    # The export below resolves CTX_LEN="${CTX_LEN:-$CTX}", so an override would otherwise WIN over
+    # the clamp and the ceiling would be cosmetic (caught 2026-09-20: ctx=999999 survived it).
+    # Write the clamped value back. Only this profile does so - qwen38fn relies on the passthrough.
+    CTX_LEN="$CTX"
+    read -r MEMFRAC NEED MAXTOK <<< "$($LS/glm-size.py "$CTX" 87.8 3.0)"
+
+    # THE LONG-CONTEXT SQUEEZE DID NOT WORK - removed 2026-09-20, do not re-derive it.
+    # Tried at 512k+MTP: prefill chunk 8192->4096, CUDA graphs bs 4->2, mamba slots 8->6, pool slack
+    # 10%->2%. Free memory on the HEAD node after one real 500k request: 2.8 GB with the squeeze and
+    # 2.8 GB without it, to the decimal. So the ~3.4 GB consumed during a long request is not
+    # activations and not graphs - it is head-node state that scales with sequence length (scheduler,
+    # radix tree, DSA indexer metadata), which no flag here touches. Kathryn ends at 8.6 GB; Jean-Luc
+    # is the binding node because it carries that state. 512k WITH MTP is therefore not viable:
+    # it serves correctly (31-32 tok/s on a 510,710-token prompt) but leaves the node under its floor.
+    # Use the no-MTP member for 512k - its weights are 8.2 GB smaller, which is the missing headroom.
+    # Worth keeping in mind: chunk 4096 cost NOTHING in prefill (1075 vs 1067 tok/s).
+    MAMBA=8; GRAPHBS=4; SQUEEZE=""
+ne; what breaks the
+    # node is the IN-USE cost, which is dominated by prefill activations (they scale with the chunk
+    # size) and by CUDA graphs captured for batch sizes this member can never reach. Measured
+    # 2026-09-19 without these: 7.7 GB free after load, 2.8 GB after one 500k request - under the
+    # floor. Halving the chunk costs some prefill throughput and buys headroom back.
+    # 6 mamba slots, not 8: MTP needs 5 per request and this member serves one at a time.
+    MAMBA=8; GRAPHBS=4; SQUEEZE=""
+    if [ "$CTX" -ge 393216 ]; then
+      MAMBA=6; GRAPHBS=2; SQUEEZE="--chunked-prefill-size 4096"
+    fi
+    FLAGS="--attention-backend dsa --dsa-prefill-backend tilelang --dsa-decode-backend tilelang --moe-runner-backend auto --kv-cache-dtype bfloat16 --disable-shared-experts-fusion --reasoning-parser glm45 --tool-call-parser glm47 --max-running-requests 1 --max-mamba-cache-size ${MAMBA} --cuda-graph-max-bs ${GRAPHBS} ${SQUEEZE} --max-total-tokens ${MAXTOK} --speculative-algorithm NEXTN --speculative-eagle-topk 1 --speculative-num-steps 2 --speculative-num-draft-tokens 3" ;;
+  glm53awq-long)
+    # LONG-CONTEXT PROFILE: same checkpoint as glm53awq, MTP REMOVED, 640k window.
+    # MEASURED 2026-09-16 (~112 GB free/node, ctx-sweep.py, raw data ~/llama-swap/.ctxsweep-glm53):
+    #   prompt    prefill       decode        KV pool actually built: 662,400 tokens
+    #    32k     1246 tok/s    21.8 tok/s
+    #   262k     1095 tok/s    21.6 tok/s
+    #   500k      910 tok/s    21.2 tok/s
+    # DECODE IS FLAT IN CONTEXT: 500k costs 3% against 32k. What long context costs is MTP -
+    # 31.5 -> 21.8 tok/s at the same 32k. That trade is why this is a SEPARATE key rather than a
+    # bigger CTX on glm53awq: you pick speed or window, and 500k is nearly free once MTP is gone.
+    #
+    # WHY MTP CANNOT STAY. The draft layer is 8.2 GB of WEIGHTS, and --mem-fraction-static must
+    # cover the weights FIRST (SGLang says so: "minimum viable = 1 - available/pre"). What is left
+    # then builds ~57k tokens of KV with MTP, against 662k without. Raising CTX with MTP on makes
+    # it WORSE, not better: at CTX=131072 the pool collapsed to 8,576 tokens, too small to even
+    # accept a 22k-token prompt, because the per-slot KDA/SSM state cache grows with the window.
+    #
+    # 1M IS NOT REACHABLE ON THIS HARDWARE - settled 2026-09-16, not pending. bf16 KV for 1M is
+    # ~13.6 GB plus the fixed state cache, which leaves under 1 GB of the 10-14 GB of runtime
+    # memory each node needs for CUDA graphs, state cache and prefill workspaces. An fp8 KV cache
+    # would halve it, but NO DSA backend does fp8 on sm_121: tilelang hardcodes bf16 on CUDA,
+    # flashmla_sparse_q8 rejects anything but sm_9x by explicit check, flashmla_kv is Hopper, and
+    # trtllm loads and then dies at CUDA-graph capture with "TllmGenFmhaRunner: Unsupported
+    # architecture". Do not spend another night on it without a new SGLang image.
+    #
+    # MEMFRAC 0.86 is not tuned, it DEGRADES GRACEFULLY: the pool is simply whatever remains after
+    # the weights, so less free memory means a smaller window, never a failed launch.
+    # DELIBERATELY NOT IN config.yaml: any write there hot-reloads llama-swap and kills the pinned
+    # model. Add the member by hand in a quiet moment if you want it swappable.
+    IMAGE=sglang-glm53-gb10:local
+    SUB=GLM-5.3-Flash-AWQ-kda-w8
+    SERVED=glm53-awq-long-sglang-tp2
+    # 524288, not 655360: Paul asked for the ladder to reach 512k (2026-09-18). The measured pool
+    # at 655360 was 662,400 tokens, so 512k+margin is comfortably inside what this config builds.
+    # --max-total-tokens bounds it absolutely - the same drift that twice handed the 32k member a
+    # ~15 GB cache would otherwise apply here at a much larger scale.
+    # Same derivation, without the MTP draft: 79.6 GB of weights, 2.0 GB of state.
+    CTX=${CTX_LEN:-262144}
+    read -r MEMFRAC NEED MAXTOK <<< "$($LS/glm-size.py "$CTX" 79.6 2.0)"
+    FLAGS="--attention-backend dsa --dsa-prefill-backend tilelang --dsa-decode-backend tilelang --moe-runner-backend auto --kv-cache-dtype bfloat16 --disable-shared-experts-fusion --reasoning-parser glm45 --tool-call-parser glm47 --max-running-requests 1 --max-mamba-cache-size 8 --cuda-graph-max-bs 4 --max-total-tokens ${MAXTOK}" ;;
+  *) echo "serve-sglang: unknown key '$KEY' (want qwen38fn|qwen38fn-long|glm53flash|glm53awq|glm53awq-long)" >&2; exit 1 ;;
 esac
 
 # MODEL_FLAGS_EXTRA: opt-in hook to append flags without editing this table (same idiom as

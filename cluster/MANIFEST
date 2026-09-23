@@ -38,6 +38,7 @@ cluster/llama-swap/gpujob-run                   ~/llama-swap/gpujob-run         
 cluster/llama-swap/serve-vllm-dflash.sh         ~/llama-swap/serve-vllm-dflash.sh              jean-luc
 cluster/llama-swap/serve-starfleet.sh           ~/llama-swap/serve-starfleet.sh                jean-luc
 cluster/llama-swap/serve-sglang.sh              ~/llama-swap/serve-sglang.sh                   jean-luc
+cluster/llama-swap/glm-size.py                  ~/llama-swap/glm-size.py                       jean-luc
 cluster/llama-swap/serve-nemcascade.sh          ~/llama-swap/serve-nemcascade.sh               jean-luc
 cluster/llama-swap/serve-kathryn.sh             ~/llama-swap/serve-kathryn.sh                  jean-luc
 cluster/llama-swap/serve-kathryn-nemcascade.sh  ~/llama-swap/serve-kathryn-nemcascade.sh       jean-luc

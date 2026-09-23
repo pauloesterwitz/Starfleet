@@ -40,5 +40,9 @@ flock -w 7200 /home/pauloesterwitz/.kathryn-sync.lock rsync -a --delete --inplac
 
 # output/ excluded: Kathryn's own ComfyUI generates its own images/videos there —
 # a --delete mirror from jean-luc would wipe Kathryn's independently generated content.
-flock -w 7200 /home/pauloesterwitz/.kathryn-sync.lock rsync -a --delete --inplace -e "$SSHOPTS" --exclude output \
+# distributed/ excluded for the same reason (added 2026-09-21): it holds
+# ComfyUI-Distributed's gpu_config.json, which run-comfyui.sh creates on whichever node
+# it runs on and the ComfyUI UI edits in place. Mirroring it would either delete
+# Kathryn's copy (jean-luc has none) or overwrite her worker list with jean-luc's.
+flock -w 7200 /home/pauloesterwitz/.kathryn-sync.lock rsync -a --delete --inplace -e "$SSHOPTS" --exclude output --exclude distributed \
     /home/pauloesterwitz/comfyui-data/ 10.100.0.1:/home/pauloesterwitz/comfyui-data/

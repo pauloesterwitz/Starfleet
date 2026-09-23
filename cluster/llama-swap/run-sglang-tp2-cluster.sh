@@ -231,7 +231,10 @@ TEE_PID=$!
 # the MCP containers, so she measured 97.7 GB free against Kathryn's 113.5 GB — 97.7 < 102.1
 # (=113.5*0.9) and the launch aborted, twice. Nothing was wrong; the nodes are just not twins.
 # We do NOT lose the protection it provides: memcheck.sh gates BOTH pools before any weights
-# load, and the bench/monitor wrapper tears both nodes down at a hard free-memory floor.
+# load. That gate is a LAUNCH check only. A runtime free-memory floor exists since 2026-09-15
+# (watchdog-memfloor.py), but ONLY test-glm53-longctx.sh runs it - launches through llama-swap
+# have NO runtime floor. This line used to claim "the bench/monitor wrapper tears both nodes down
+# at a hard free-memory floor"; no such code existed anywhere until then. Do not rely on it.
 # Set SGLANG_TP_BALANCE_CHECK=1 to restore the upstream behaviour.
 common_flags(){ # $1=fabric_ip $2=iface $3=models_dir
   # NO --rm. A crashed worker must remain inspectable: with --rm the container (and the only
