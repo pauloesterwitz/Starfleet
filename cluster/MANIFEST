@@ -41,6 +41,7 @@ cluster/llama-swap/serve-sglang.sh              ~/llama-swap/serve-sglang.sh    
 cluster/llama-swap/serve-nemcascade.sh          ~/llama-swap/serve-nemcascade.sh               jean-luc
 cluster/llama-swap/serve-kathryn.sh             ~/llama-swap/serve-kathryn.sh                  jean-luc
 cluster/llama-swap/serve-kathryn-nemcascade.sh  ~/llama-swap/serve-kathryn-nemcascade.sh       jean-luc
+cluster/llama-swap/serve-kathryn-ds4.sh         ~/llama-swap/serve-kathryn-ds4.sh              jean-luc
 cluster/llama-swap/serve-embed.sh               ~/llama-swap/serve-embed.sh                    jean-luc
 cluster/llama-swap/serve-kathryn-embed.sh       ~/llama-swap/serve-kathryn-embed.sh            jean-luc
 cluster/llama-swap/ds4-tp2-proxy-guard.sh       ~/llama-swap/ds4-tp2-proxy-guard.sh            jean-luc

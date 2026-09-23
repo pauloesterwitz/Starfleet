@@ -69,6 +69,22 @@ models:
     filters:
       stripParams: "store,metadata,service_tier,parallel_tool_calls,user,presence_penalty,frequency_penalty,logit_bias,logprobs,top_logprobs,n"
 
+  # Kathryn twin, added 2026-09-23 — the last non-TP2 model with no machine to pick in Fleet.
+  # Everything it needs was already mirrored there: ds4-server, the 81GB GGUF behind
+  # ~/ds4/ds4flash.gguf, and serve-ds4.sh. serve-ds4.sh carries no memcheck of its own (on
+  # Jean-Luc that chain lives in the cmd above), so serve-kathryn-ds4.sh reproduces
+  # render-guard -> reclaim-dflash -> memcheck 108000 on KATHRYN's pool instead.
+  # Same spark-big group as the Jean-Luc member: swap:true makes picking a machine MOVE ds4
+  # rather than hold 81 GiB on both Sparks.
+  # UNMEASURED on Kathryn; identical hardware, so expect the Jean-Luc figures.
+  deepseek-v4-flash-kathryn:
+    cmd: /home/pauloesterwitz/llama-swap/ctx-env.sh deepseek-v4-flash-kathryn /home/pauloesterwitz/llama-swap/serve-kathryn-ds4.sh --port ${PORT}
+    proxy: http://127.0.0.1:${PORT}
+    checkEndpoint: /v1/models
+    ttl: 900
+    filters:
+      stripParams: "store,metadata,service_tier,parallel_tool_calls,user,presence_penalty,frequency_penalty,logit_bias,logprobs,top_logprobs,n"
+
   # DEPRECATED 2026-07-27 (Paul): ollama backend off — vLLM only
   # ollama:
     # Proxy to the EXISTING `ollama serve` daemon on :11434 (started outside llama-swap,
@@ -704,6 +720,12 @@ routing:
           exclusive: true
           members:
             - deepseek-v4-flash
+            # The Kathryn twin belongs here too: swap:true is what makes picking a machine in
+            # Fleet MOVE ds4 instead of leaving 81 GiB resident on both Sparks. The cost is that
+            # loading it also clears spark-small, which sits on Jean-Luc and would physically
+            # have been fine — llama-swap's groups are global, with no per-node notion, so the
+            # conservative reading is the only safe one.
+            - deepseek-v4-flash-kathryn
         # Small models CO-RESIDE: swap:false = run in parallel, don't evict each other. exclusive:true
         # only clears the OTHER group (ds4) when one loads — it does NOT evict siblings in this group.
         # Fit is gated per-model by memcheck (clean error if full); idle vLLM models unload via ttl.
