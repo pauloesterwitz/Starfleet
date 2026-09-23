@@ -270,19 +270,27 @@ function groupModels(models,run){
       variants.find(v=>v.pinned) ? variants.find(v=>v.pinned).nodes[0] :
       MACHINE_ORDER.find(n=>byMachine[n]);
     machineSel[base]=pick;
+    /* One speed for the family, not the picked member's own. Both Sparks are the same
+       GB10, so a spread like 85 / 87 / 86 tps on one model is measurement noise, not a
+       property of the machine -- showing the number jump as you move the picker would
+       read as a real difference. Members with no measured value (the embeddings) stay
+       blank rather than averaging to zero. */
+    const speeds=variants.map(v=>v.tps).filter(t=>typeof t==="number");
+    const tps=speeds.length
+      ? Math.round(speeds.reduce((a,t)=>a+t,0)/speeds.length*10)/10 : null;
     out.push(Object.assign({},byMachine[pick],
-      {_base:base,_family:MACHINE_ORDER.filter(n=>byMachine[n])}));
+      {tps,_base:base,_family:MACHINE_ORDER.filter(n=>byMachine[n])}));
   }
   return out;
 }
 (function selfCheck(){
-  const llm=(id,node,extra)=>Object.assign({id,kind:"llm",nodes:[node],pinned:false},extra);
+  const llm=(id,node,tps)=>({id,kind:"llm",nodes:[node],pinned:false,tps:tps??null});
   const g=groupModels([
     /* the real shapes: per-node tps in the name, an unsuffixed Jean-Luc twin, a
        fastest-node third member, a lone model, and a TP=2 member */
-    llm("qwen3.6-35b-85tps-mtp4-jean-luc","jean-luc"),
-    llm("qwen3.6-35b-87tps-mtp4-kathryn","kathryn"),
-    llm("qwen3.6-35b-86tps-mtp4-fastest-node","dynamic"),
+    llm("qwen3.6-35b-85tps-mtp4-jean-luc","jean-luc",85),
+    llm("qwen3.6-35b-87tps-mtp4-kathryn","kathryn",87),
+    llm("qwen3.6-35b-86tps-mtp4-fastest-node","dynamic",86),
     llm("nomic-embed-text","jean-luc"),
     llm("nomic-embed-text-kathryn","kathryn"),
     llm("qwen3.8-27b-19tps-jean-luc","jean-luc"),
@@ -295,6 +303,10 @@ function groupModels(models,run){
     "groupModels: per-node tps must not split a family",fam("qwen3.6-35b-mtp4"));
   console.assert(fam("nomic-embed-text")&&fam("nomic-embed-text")._family.join()==="jean-luc,kathryn",
     "groupModels: an unsuffixed member is Jean-Luc's half of the pair",fam("nomic-embed-text"));
+  console.assert(fam("qwen3.6-35b-mtp4").tps===86,"groupModels: speed is the family average",
+    fam("qwen3.6-35b-mtp4").tps);
+  console.assert(fam("nomic-embed-text").tps===null,"groupModels: nothing measured stays blank",
+    fam("nomic-embed-text").tps);
   console.assert(!fam("qwen3.8-27b")&&!fam("qwen3.8-27b-vision"),
     "groupModels: lone deployments stay ungrouped, and vision is its own model");
   console.assert(g.some(m=>m.id==="qwen38fn-sglang-tp2-starfleet"&&!m._family),
