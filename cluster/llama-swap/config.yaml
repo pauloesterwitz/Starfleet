@@ -95,6 +95,10 @@ models:
   #     - qwen3-coder-next:q4_K_M
   #     - gemma4:31b
   #     - gemma4:26b
+      # gemma4:26b with num_ctx 49152 baked in (eval/gemma4-26b-eva.Modelfile in sap_odata_mock_eva).
+      # Same 17GB blobs as gemma4:26b — the plain tag loads at n_ctx=4096, which silently truncates
+      # that eval's ~40k-token system prompt. /v1 carries no num_ctx, so it has to live in the tag.
+  #     - gemma4:26b-eva
   #     - gemma4:e4b
   #     - nemotron-cascade-2:latest
   #     - llava:latest
@@ -362,6 +366,45 @@ models:
   # recovers) and pays the draft cost for nothing. The +35%/49.4 tok/s in the tuning table is real
   # only for SHORT benchmark prompts. VERIFIED ON THIS PATH: 0/10 collapses, 35.4 tok/s, tool
   # calls 3/3. Full reasoning in serve-sglang.sh under the qwen38fn key.
+  # ── Qwen3.8-Flash-Next at 512k, via a YaRN rope override (2026-09-20) ────────────────────────
+  # SIBLING of qwen38fn-sglang-tp2-starfleet below, which is UNCHANGED at its native 262,144.
+  # Same split as glm53-awq / glm53-awq-long. Nothing here touches the default member.
+  #
+  # 262,144 is a POSITIONAL wall, not a memory one: the KV pool at mem-fraction 0.80 already
+  # holds ~690k tokens, so 512k costs no extra memory. A YaRN factor-2.0 override on
+  # text_config.rope_parameters doubles the window; the full flag lives in serve-sglang.sh
+  # under the `qwen38fn-long` key, which also carries the three ways this override can silently
+  # no-op. Do not reproduce the JSON here.
+  #
+  # MEASURED 2026-09-20 at 479,655 prompt tokens (1.83x native), needle at depths 0.10/0.50/0.90:
+  # 3/3 exact recall, and short EN/DE/code prompts diffed against the unscaled member showed no
+  # static-YaRN tax.
+  # SPEED: ~23.7 tok/s steady-state decode (temp 0, 1500-token generations). A 6-arm sweep at
+  # this config (.yarn/sweep-512k.log) ranked k1-bounded first at 21.4 vs 19.1 for the old
+  # unbounded K=3, but that harness counts prefill in its rate over 192-token generations; on the
+  # longer measurement the two configs TIE (23.6 vs 23.7). Bounding is kept for the ~7 GB it
+  # frees, not for speed.
+  # The 2026-08-29 K table is NOT applicable -- it was taken at ctx 16384 where K=3 won at 49.4;
+  # at 512k the whole field sits near 20 and K=1 edges it. Two earlier numbers in this file's
+  # history were wrong and are retracted: "66.2 tok/s at K=3" came from a 1.4-SECOND decode
+  # window right after a 480k prefill, not steady state. CUDA graphs are worth 2x here
+  # (21.4 -> 10.6 without) and MTP only +20% (17.9 without). Flag rationale: serve-sglang.sh.
+  # This member is ~half the speed of the 262k one (48.9 tok/s) -- that is the price of the
+  # window, which is exactly why both members exist.
+  #
+  # ttl 3600 like the other long members (cold load ~540s, same weights as the 262k member).
+  # Per-member context lives in ~/.gb10/ctx/<member>; this one is set to 524288.
+  qwen38fn-long-sglang-tp2-starfleet:
+    cmd: /home/pauloesterwitz/llama-swap/ctx-env.sh qwen38fn-long-sglang-tp2-starfleet /home/pauloesterwitz/llama-swap/serve-sglang.sh qwen38fn-long --port ${PORT}
+    proxy: http://127.0.0.1:${PORT}
+    checkEndpoint: /health
+    cmdStop: /home/pauloesterwitz/llama-swap/run-sglang-tp2-cluster.sh down
+    ttl: 3600
+    useModelName: qwen38fn-long-sglang-tp2
+    aliases:
+      - Qwen3.8-Flash-Next-512k
+      - qwen3.8-flash-next-512k
+
   qwen38fn-sglang-tp2-starfleet:
     cmd: /home/pauloesterwitz/llama-swap/ctx-env.sh qwen38fn-sglang-tp2-starfleet /home/pauloesterwitz/llama-swap/serve-sglang.sh qwen38fn --port ${PORT}
     proxy: http://127.0.0.1:${PORT}
@@ -386,52 +429,6 @@ models:
       - Qwen3.8-Flash-Next
       - qwen3.8-flash-next
 
-  # ── GLM-5.3-Flash NVFP4 (LibertAI), TP=2 across BOTH Sparks — the fleet's SECOND SGLang member ──
-  # 320B total / 18B active MoE, natively multimodal, 181.3 GiB = ~90.5 GiB of weights per Spark.
-  # The BIGGEST member on this fleet (hy3 is 168 GiB), and TP=2-forced: it does not fit one node.
-  # Notable as the first GLM to combine sparse (11 DeepSeek-sparse layers) and linear (34 KDA)
-  # attention; the full flag rationale lives in serve-sglang.sh under the glm53flash key.
-  #
-  # SGLANG, NOT vLLM, and for a different reason than qwen38fn. vLLM on sm_121 DOES work now, but
-  # only via Libertai/glm53-flash-vllm-gb10, which needs a hand-written sparse-MLA CUDA kernel (no
-  # vLLM MLA backend accepts this model's NoPE dims on sm_121: the sparse decode path asserts
-  # pe_dim == 64 and GLM-5.3-Flash has qk_rope_head_dim = 0) PLUS a plugin for vLLM's
-  # uninitialised NVFP4 MoE activation scale — without which every expert is multiplied by zero
-  # and the model emits one token forever, with no error and no warning. SGLang needs neither.
-  #
-  # CONCURRENCY: ONE request at a time. The 34 KDA layers each need a per-request recurrent
-  # state, so --max-running-requests is pinned at 2 (8 @ 131072 ctx fails outright). Context and
-  # concurrency compete for the same pool, which is why ctx is 65536 and not the spec'd 1M.
-  #
-  # ttl 3600, NOT the starfleet-standard 900 — same rule as ds4-nvfp4-tp2: never set a ttl
-  # shorter than the cold load, and a 320B MoE takes well past 900s to load.
-  # UNMEASURED: no throughput figure published by LibertAI or measured here yet.
-  glm53-flash-sglang-tp2-starfleet:
-    cmd: /home/pauloesterwitz/llama-swap/ctx-env.sh glm53-flash-sglang-tp2-starfleet /home/pauloesterwitz/llama-swap/serve-sglang.sh glm53flash --port ${PORT}
-    proxy: http://127.0.0.1:${PORT}
-    checkEndpoint: /health
-    ttl: 3600
-    useModelName: glm53-flash-sglang-tp2
-    aliases:
-      - GLM-5.3-Flash
-      - glm-5.3-flash
-
-  # ── GLM-5.3-Flash AWQ (KDA attention INT8, experts INT4) — the FAST GLM member ──────────────
-  # MEASURED 2026-09-09: 31.3 tok/s single-stream, 31.3 agg@8, with NEXTN MTP K=2 (acceptance
-  # 2.38). The NVFP4 member below does 14.5, so this is 2.16x. Without MTP the same checkpoint
-  # does 22.3/31.1, so K=2 is strictly better: identical aggregate, +40% single-stream.
-  # +54%, from quantizing the 9.17 GiB of KDA attention that NVFP4 structurally could not touch
-  # (per-tensor weight_scale_2 cannot survive QKVParallelLinear's merge; AWQ's group-wise scales
-  # can). Per-token read drops 20.33 -> ~12.9 GiB, and decode here is 68% bandwidth-bound.
-  # ctx 32768, not 65536: prefill runs ~98 tok/s, so a full 65k context is ~11 minutes to first
-  # token. 32768 is the honest usable setting and it leaves room for the KDA state cache.
-  # MTP K=2 IS the served config. K is a genuine peak, not a ceiling: acceptance keeps rising
-  # (K=1 1.77, K=2 2.38, K=3 2.75) but throughput falls after K=2, because each extra draft
-  # position must be advanced through the KDA recurrent state and rolled back on rejection.
-  # GLM-5.3 follows qwen3.8-27b (K=2), NOT qwen38fn (K=3). Do not raise K. K=4 is impossible.
-  # CUDA graphs measured 1.49x here (31.3 vs 15.0 with --disable-cuda-graph) — never disable.
-  # Checkpoint config.json carries six local fixes (documented in serve-sglang.sh); .bak files
-  # sit beside it. Do NOT re-download the repo over it without re-applying them.
   glm53-awq-sglang-tp2-starfleet:
     cmd: /home/pauloesterwitz/llama-swap/ctx-env.sh glm53-awq-sglang-tp2-starfleet /home/pauloesterwitz/llama-swap/serve-sglang.sh glm53awq --port ${PORT}
     proxy: http://127.0.0.1:${PORT}
@@ -442,10 +439,6 @@ models:
       - GLM-5.3-Flash-AWQ
       - glm-5.3-flash-awq
 
-  # 122B on Starfleet, + native MTP spec=3 (Paul 2026-07-22, eval grading). MTP VERIFIED working
-  # (weights load ~2min, spec engages, 40.3 tok/s in the velocity bench). ttl 28800 (8h) so it does NOT
-  # idle-unload during the hackathon (Paul: "protect it, nothing kills it until 19:00"). Cold load ~4min
-  # through the cluster - do NOT poke the Ray cluster (docker exec / ray.init) while it starts.
   qwen3.5-122b-mtp3-starfleet:
     cmd: /home/pauloesterwitz/llama-swap/ctx-env.sh qwen3.5-122b-mtp3-starfleet /home/pauloesterwitz/llama-swap/serve-starfleet.sh qwen3.5-122b-mtp3 --port ${PORT}
     proxy: http://127.0.0.1:${PORT}
@@ -660,6 +653,32 @@ models:
     ttl: 3600
     useModelName: bge-reranker-v2-m3
 
+  # microsoft/harrier-oss-v1-0.6b, added 2026-09-23. Multilingual retrieval embedder,
+  # MTEB-v2 multilingual 69.0 (vs the 768-dim pair above, which are English-leaning and much
+  # older). 1024-dim, 32k context, decoder with LAST-token pooling — see serve-embed.sh's
+  # harrier-embed-0.6b case for the vLLM flags ("Qwen3Model" is not a registered arch, so
+  # --convert embed does the wrapping) and for the asymmetric query-prefix caller contract.
+  # Verified end-to-end on Kathryn 2026-09-23: dim 1024, L2 norm 1.000000, and the model
+  # card's own MS-MARCO example scores the right diagonal (65.6/27.8, 30.4/69.9).
+  # NOT a drop-in for RAG_EMBED_DIM=768 callers — different dimensionality, re-embed required.
+  # Named -embed- rather than -oss- so fleet-ui's Embeddings filter (/embed|rerank/i) picks it up.
+  harrier-embed-0.6b:
+    cmd: /home/pauloesterwitz/llama-swap/serve-embed.sh harrier-embed-0.6b --port ${PORT}
+    proxy: http://127.0.0.1:${PORT}
+    checkEndpoint: /health
+    ttl: 3600
+
+  # Kathryn twin, same ssh/tunnel pattern as nomic-embed-text-kathryn above. Weights and the
+  # patched serve-embed.sh were pushed to Kathryn 2026-09-23 (kathryn-sync.timer also mirrors
+  # both hourly). useModelName for the same reason as the twins above: serve-embed.sh sets
+  # --served-model-name to the KEY, not to this member's name.
+  harrier-embed-0.6b-kathryn:
+    cmd: /home/pauloesterwitz/llama-swap/serve-kathryn-embed.sh harrier-embed-0.6b --port ${PORT}
+    proxy: http://127.0.0.1:${PORT}
+    checkEndpoint: /health
+    ttl: 3600
+    useModelName: harrier-embed-0.6b
+
   # ── ComfyUI image backend, moved off the always-on systemd unit and under llama-swap ──
   # so it idle-unloads instead of sitting resident forever (Paul asked for 2h auto-pause,
   # 2026-07-20). Own group below (own container, doesn't compete for GB10 pool with LLMs).
@@ -744,7 +763,7 @@ routing:
             - qwenvl235-vision-starfleet
             - ds4-nvfp4-tp2   # moved here 2026-08-26 when llama-swap took over its lifecycle
             - qwen38fn-sglang-tp2-starfleet   # 2026-08-28: SGLang, not vLLM — occupies both Sparks
-            - glm53-flash-sglang-tp2-starfleet   # 2026-08-29: SGLang TP=2, 181 GiB — the largest member here
+            - qwen38fn-long-sglang-tp2-starfleet   # 2026-09-20: same weights, YaRN factor 2.0, 512k, MTP K=3
             - glm53-awq-sglang-tp2-starfleet   # 2026-09-09: AWQ INT8 attention, 22.3 tok/s — the fast GLM
             # - qwen38flashnext-nvfp4-starfleet   # DISABLED 2026-08-28: qwen4_exp unsupported by both images (see member comment above)
         # ComfyUI's own container — exclusive:false + swap:false, same "isolated, never evicts
@@ -762,6 +781,8 @@ routing:
             - embeddinggemma-kathryn
             - bge-reranker-v2-m3
             - bge-reranker-v2-m3-kathryn
+            - harrier-embed-0.6b
+            - harrier-embed-0.6b-kathryn
         imagegen:
           swap: false
           exclusive: false
