@@ -41,7 +41,7 @@ Two **NVIDIA DGX Spark** nodes, each a GB10 with ~121 GiB of unified memory and
 
 | Node | Role |
 | --- | --- |
-| **Jean-Luc** | Head node. Runs [llama-swap](https://github.com/mostlygeek/llama-swap), which fronts every model behind a single OpenAI-compatible endpoint, plus Ollama. |
+| **Jean-Luc** | Head node. Runs [llama-swap](https://github.com/mostlygeek/llama-swap), which fronts every model behind a single OpenAI-compatible endpoint. |
 | **Kathryn** | Worker. Serves models of her own, and pairs with Jean-Luc for tensor-parallel jobs. |
 
 ### llama-swap holds the fleet together
@@ -53,7 +53,7 @@ inference servers and **swaps models in and out on demand**: a request names a
 model, llama-swap starts whatever process serves it, proxies the request, and
 unloads it again after an idle TTL.
 
-That matters here because 28 models are defined but only ~121 GiB per node is
+That matters here because 35 models are defined but only ~121 GiB per node is
 available. Without it you'd be manually starting and stopping vLLM. With it,
 everything — the coding agents, this monitor, any OpenAI-compatible client —
 talks to **one endpoint on the head node** and never thinks about placement.
@@ -86,12 +86,36 @@ gemma4-31b-19tps-starfleet    tensor-parallel across BOTH
 The embedded tok/s figure is the measured single-stream throughput of that exact
 configuration, so the fastest option is obvious from the name alone.
 
+### Not every member is a chat model
+
+Eight of the 35 are an embedding tier — `nomic-embed-text`, `embeddinggemma`,
+`harrier-embed-0.6b` and the `bge-reranker-v2-m3` cross-encoder, each with a
+twin on the other node. They are served by
+[`serve-embed.sh`](cluster/llama-swap/serve-embed.sh) through vLLM's pooling
+runner, and at roughly 1 GiB apiece they live in their own group with both
+`swap: false` and `exclusive: false`: an embedding call must never evict a
+language model, and must never be evicted by one.
+
+The twins are not redundancy. Jean-Luc's pool can be genuinely too full for a
+1 GiB model while a TP=2 member occupies it — on 2026-09-23 `harrier-embed-0.6b`
+died on the head node with *"No available memory for the cache blocks"* while
+Qwen3.8-Flash-Next held the pool, and the Kathryn twin served the identical
+request without complaint. `gpu-memory-utilization` is a fraction of the whole
+pool, not of what is left in it, so a tiny model can still be squeezed out.
+Having each embedder addressable on either node is what makes that survivable.
+
+One naming note: Fleet's **Embeddings** filter selects members by id
+(`/embed|rerank/i`), so a new embedder carries `embed` in its member name even
+when upstream does not — `microsoft/harrier-oss-v1-0.6b` is wired as
+`harrier-embed-0.6b`. Choosing the name is free; teaching the filter a list of
+exceptions is not.
+
 ### Memory-aware admission control: memcheck.sh
 
 llama-swap has no built-in idea how much memory a host actually has free before
 starting a model — there's an open ask for exactly that
 ([mostlygeek/llama-swap#158](https://github.com/mostlygeek/llama-swap/issues/158)),
-closed `not_planned`. With 28 models sharing ~121 GiB per node, an unguarded
+closed `not_planned`. With 35 models sharing ~121 GiB per node, an unguarded
 `cmd:` means the failure mode is an OOM kill mid-load, not a clean refusal.
 
 Every member's `cmd:` in [`config.yaml`](cluster/llama-swap/config.yaml) runs
@@ -99,7 +123,7 @@ through [`memcheck.sh`](cluster/llama-swap/memcheck.sh) first — a pure
 preflight gate, read-only, that never evicts anything:
 
 ```
-MemAvailable + reclaimable_ollama - live_reservations  >=  need_mb
+MemAvailable - live_reservations  >=  need_mb
 ```
 
 `live_reservations` reads a ledger shared with the image/video generation
@@ -206,6 +230,36 @@ Two corollaries:
 - **Benchmark, don't assume.** Every model in the roster is pinned to whichever
   mode actually measured faster — which is why some `-starfleet` members exist
   and some models are deliberately single-node.
+
+---
+
+## Context is its own budget
+
+Fitting the weights is only half of it. A long context is bought with KV cache,
+and on a fixed pool that trade has to be made explicitly.
+
+Some of it is not a memory question at all. Qwen3.8-Flash-Next stops at 262,144
+tokens because of a **positional** wall, not a memory one — at mem-fraction 0.80
+its KV pool already holds ~690k tokens, so 512k costs nothing extra. A YaRN
+factor-2.0 rope override doubles the window, and that is the whole difference
+between `qwen38fn-sglang-tp2-starfleet` and its `-long` sibling. Measured at
+479,655 prompt tokens (1.83× native): needles at depths 0.10/0.50/0.90 recalled
+3/3 exactly. The cost is speed, not capacity — ~23.7 tok/s against the 262k
+member's 48.9. Roughly half, which is precisely why both members exist rather
+than one.
+
+GLM-5.3-Flash is the opposite case: there the context genuinely is a memory
+budget, and three hardcoded numbers (`NEED`, `MEMFRAC`, `CTX`) kept disagreeing
+with each other and with the machine. [`glm-size.py`](cluster/llama-swap/glm-size.py)
+replaces them — given the context actually being requested it returns the
+mem-fraction, the admission requirement, and `--max-total-tokens`, all three
+derived from one model of the pool. That last flag is not optional: left to
+itself SGLang once sized a KV cache of 1,182,720 tokens for a 32k member.
+
+Per-member context lives in `~/.gb10/ctx/<member>`, so a window can be changed
+without editing `config.yaml` — which matters more than it sounds, because
+writing that file triggers llama-swap's `-watch-config` reload and evicts every
+resident model, and a cold TP=2 load runs 26–41 minutes.
 
 ---
 
