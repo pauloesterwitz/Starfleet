@@ -239,9 +239,19 @@ const KINDLBL={image:"Image",video:"Video",judge:"Visual QA"};
    ponytail: the family is inferred from the naming convention, same convention node_of()
    already parses. If it ever misfires, have the backend declare a family id instead. */
 const TPS_IN_NAME=/-\d+(?:\.\d+)?tps(?=-|$)/;
+/* What the row is called: the MODEL, with everything about WHERE it runs taken out --
+   the node suffix, the TP=2 marker, and the measured throughput that only differs
+   because it was measured on that node. Where it runs is the Node column's job, and
+   naming a merged row after one of its members (gemma4-26b-54tps-jean-luc) hid the fact
+   that it covers both. The real member id still shows underneath whenever it differs,
+   because that id -- not this label -- is what opencode, litellm and the ctx files address. */
+function modelName(id){
+  return id.replace(/-(jean-luc|kathryn|fastest-node|starfleet)$/,"")
+           .replace(/-tp2(?=-|$)/,"").replace(TPS_IN_NAME,"");
+}
 function familyBase(m){
   if(isImg(m)||m.nodes.length!==1||/-tp2(?=-|$)|-starfleet$/.test(m.id)) return null;
-  return m.id.replace(/-(jean-luc|kathryn|fastest-node)$/,"").replace(TPS_IN_NAME,"");
+  return modelName(m.id);
 }
 const machineSel={};   // base name -> sticky machine pick across renders
 const MACHINE_ORDER=["jean-luc","kathryn","dynamic"];
@@ -311,6 +321,10 @@ function groupModels(models,run){
     "groupModels: lone deployments stay ungrouped, and vision is its own model");
   console.assert(g.some(m=>m.id==="qwen38fn-sglang-tp2-starfleet"&&!m._family),
     "groupModels: TP=2 members are never given a machine picker");
+  console.assert(modelName("qwen3.6-35b-85tps-mtp4-jean-luc")==="qwen3.6-35b-mtp4"&&
+                 modelName("qwen38fn-long-sglang-tp2-starfleet")==="qwen38fn-long-sglang"&&
+                 modelName("nomic-embed-text")==="nomic-embed-text",
+    "modelName: the label carries no node, no TP=2 marker and no measured tps");
   console.assert(g.length===6,"groupModels: 9 members -> 2 families + 4 lone rows",g.map(m=>m.id));
 })();
 
@@ -368,7 +382,9 @@ const loadImg=m=>{
 const unloadImg=m=>imgPost("/api/imgunload",m);
 
 function keep(m,run){
-  if(query && !m.id.toLowerCase().includes(query)) return false;
+  /* match the name the row SHOWS as well as the real member id -- the label drops the tps
+     marker, so "qwen3.6-35b-mtp4" is not a substring of any member id */
+  if(query && !(m.id+" "+modelName(m.id)).toLowerCase().includes(query)) return false;
   /* The Image tab is the ONLY one that shows image/video models. They are not
      llama-swap members, so node/ttl/context filters are meaningless for them and they
      would just be rows of dashes everywhere else -- including "All". */
@@ -583,10 +599,11 @@ function render(s){
           st=loading?"loading":working?"working":(r?r.state:"stopped");
     if(isImg(m)) return imgRow(m, working);
     return `<tr class="${m.pinned?"pinned":r?"live":""}">
-      <td><div class="mid">${m.id}${m.vision?`<span class="vis ${m.vision}" title="${
+      <td><div class="mid">${modelName(m.id)}${m.vision?`<span class="vis ${m.vision}" title="${
         m.vision==="on"?"Vision tower ACTIVE — this member accepts images"
         :"Has a vision tower, but started text-only (--limit-mm-per-prompt image:0)"
         }">IMG${m.vision==="off"?" OFF":""}</span>`:""}</div>${
+        modelName(m.id)!==m.id?`<div class="sub">${m.id}</div>`:""}${
         m.error?`<div class="err">${m.error}</div>`:""}</td>
       <td>${m._family?`<select class="ctxsel set"
         title="Deployed on both — pick which one this row shows and controls (pin/context/effort/load are per machine; picking doesn't move anything)"

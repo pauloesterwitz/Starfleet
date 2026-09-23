@@ -247,6 +247,11 @@ def node_of(model):
     """Which machines a model occupies. Encoded in the name suffix by config.yaml."""
     for suffix, nodes in (
         ("-starfleet", ["jean-luc", "kathryn"]),   # TP=2, spans both
+        # ds4-nvfp4-tp2 is TP=2 without carrying the -starfleet suffix, and fell through to
+        # the Jean-Luc default -- it has always been drawn on the wrong machine. Harmless
+        # while the id itself still read "-tp2" on screen; not once the Model column shows
+        # the model rather than the member id.
+        ("-tp2", ["jean-luc", "kathryn"]),
         ("-fastest-node", ["dynamic"]),            # pick-node.sh decides at load time
         ("-jean-luc", ["jean-luc"]),
         ("-kathryn", ["kathryn"]),
@@ -1527,6 +1532,11 @@ def selfcheck():
     assert _rope_override_max("flags=[--context-length 524288]") is None
     assert _rope_override_max("") is None
     # The SPEED column must prefer a measured override over whatever the name happens to say.
+    # Load the real overrides file FIRST: tps_of() reloads it on mtime, and that reload
+    # rebinds _tps_override wholesale -- so without this the values injected below are gone
+    # by the time the first assert calls tps_of(), and this check fails on any machine that
+    # actually has a tps.json. Priming it makes the reload a no-op and the injection stick.
+    _load_tps_overrides()
     _tps_override.clear(); _tps_override["qwen38fn-long-sglang-tp2-starfleet"] = 23.7
     _tps_override["gemma4-26b-54tps-jean-luc"] = 51.0
     assert tps_of("qwen38fn-long-sglang-tp2-starfleet") == 23.7   # name has no marker
@@ -1629,6 +1639,10 @@ def selfcheck():
     assert node_of("qwen3.8-27b-14tps-jean-luc") == ["jean-luc"]
     assert node_of("gemma4-26b-46tps-fastest-node") == ["dynamic"]
     assert node_of("nomic-embed-text") == ["jean-luc"]
+    # TP=2 without the -starfleet suffix still spans both, and -tp2 in the MIDDLE of a name
+    # must not be mistaken for it -- that member's own -starfleet suffix decides.
+    assert node_of("ds4-nvfp4-tp2") == ["jean-luc", "kathryn"]
+    assert node_of("qwen38fn-long-sglang-tp2-starfleet") == ["jean-luc", "kathryn"]
     assert tps_of("qwen3.6-35b-57tps-mtp4-jean-luc") == 57
     assert tps_of("nomic-embed-text") is None
 
