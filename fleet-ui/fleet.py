@@ -8,7 +8,7 @@ llama-swap already owns model lifecycle, so this does not reimplement it:
   GET /v1/models              -> the catalogue
   GET /running                -> what is resident right now
   GET /upstream/<m>/health    -> loads <m> (no inference) and resets its ttl
-  GET /unload?model=<m>       -> evicts <m>
+  POST /api/models/unload/<m> -> evicts <m> (NOT GET /unload?model=, which evicts all)
 "Persistently loaded" = we re-hit that health probe before the ttl expires.
 
 Node resources come from one probe run locally and over ssh, not from
@@ -342,6 +342,16 @@ def parse_probe(text):
 
 def swap_get(path, timeout=10):
     with urllib.request.urlopen(SWAP + path, timeout=timeout) as r:
+        return r.read().decode()
+
+
+def swap_unload(model, timeout=30):
+    """Evict ONE model. llama-swap's plain GET /unload ignores ?model= and unloads
+    EVERY member, which killed the pinned Starfleet model whenever any other model was
+    unpinned (2026-10-02). The per-model route is POST /api/models/unload/<model>."""
+    req = urllib.request.Request(
+        SWAP + "/api/models/unload/" + urllib.parse.quote(model, safe=""), method="POST")
+    with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.read().decode()
 
 
@@ -1077,7 +1087,7 @@ def apply_effort(model, label):
             resident = any(r.get("model") == model for r in STATE["running"])
         if not resident:
             return False
-        swap_get("/unload?model=" + urllib.parse.quote(model, safe=""))
+        swap_unload(model)
         return True
 
 
@@ -1110,7 +1120,7 @@ def apply_ctx(model, ctx):
             resident = any(r.get("model") == model for r in STATE["running"])
         if not resident:
             return False
-        swap_get("/unload?model=" + urllib.parse.quote(model, safe=""))
+        swap_unload(model)
         return True
 
 
@@ -1170,6 +1180,12 @@ def touch(model):
             _loading[model] = {"started": started, "eta": eta_for(model),
                                "mark": _log_mark(model), "progress": None, "phase": None}
     cancelled = False
+    with LOCK:
+        # ponytail: a row that is actively loading must not still show the previous
+        # attempt's error. An error badge reads as "the start was aborted", so leaving
+        # a stale one on a healthy in-flight load is a lie. Cleared on entry; re-set
+        # below only if THIS attempt actually fails.
+        STATE["errors"].pop(model, None)
     try:
         swap_get(f"/upstream/{q}/health", timeout=LOAD_TIMEOUT)
         elapsed = time.time() - started
@@ -1222,7 +1238,7 @@ def cancel_load(model):
         _cancelled.add(model)
     with _loading_lock:
         _loading.pop(model, None)
-    swap_get("/unload?model=" + urllib.parse.quote(model, safe=""))
+    swap_unload(model)
 
 
 _reloading = set()        # pins currently being re-touched, so we don't double-fire
@@ -1563,7 +1579,7 @@ class Handler(BaseHTTPRequestHandler):
             pins.discard(model)          # unpin too, else keepalive reloads it
             save_pins(pins)
             try:
-                swap_get("/unload?model=" + urllib.parse.quote(model, safe=""))
+                swap_unload(model)
             except (urllib.error.URLError, OSError) as e:
                 return self._send(502, json.dumps({"error": str(e)[:200]}), "application/json")
             return self._send(200, '{"ok":true}', "application/json")
