@@ -30,16 +30,69 @@ the size of *his own sensor list*, not a device constraint. `smartmonitor_hid_li
 imposes nothing of the kind: it caps only **pairs per packet** (20, which is
 just what fits in 64 bytes) and requires the tag to fit in one byte.
 
-Confirmed on this device on 2026-09-02: channel 21 renders. Channels beyond
-that are untested — the tag is a `uint8_t`, so more are plausible, but nothing
-here has proved it. If you do need more, note that going past 20 channels means
-a full push no longer fits one report; `PanelDriver.sendSensors` already splits
-across reports, which the same test exercised.
+Confirmed on **two** physical panels — 2026-09-02 on the original, and
+2026-10-12 on the replacement after the first one failed. Channels beyond 21
+are untested: the tag is a `uint8_t`, so more are plausible, but nothing here
+has proved it. If you do need more, note that going past 20 channels means a
+full push no longer fits one report; `PanelDriver.sendSensors` already splits
+across reports, which the same test exercised both times.
 
 > Separately: this Mac is a **MacBook Air M4**, which supports a maximum of two
 > external displays, and both LS27A80s already use them. Even a *real* small
 > HDMI display could not have become a third screen here — only DisplayLink
 > bypasses that limit. Driving this panel directly was the only workable route.
+
+## Replacing the panel
+
+The replacement was bought from a **different retail vendor** and is the same
+hardware: `0483:0065`, manufacturer `llhmi.com`, product `llTechCo.,Ltd`, usage
+page `0xFF00`, 64-byte in/out reports, full speed. These panels are rebadged
+from one OEM, so a different seller is not a reason to expect a different
+device — **check before changing any code**, because nothing in `PanelDriver`
+or the theme needed touching:
+
+```bash
+ioreg -c IOHIDDevice -r -l -w 0 | grep -A12 llTechCo | \
+  grep -E '"(VendorID|ProductID|PrimaryUsagePage|MaxOutputReportSize)"'
+```
+
+(`system_profiler SPUSBDataType` returns nothing under the agent sandbox —
+`ioreg` is the one that works.)
+
+Then, in order:
+
+1. **Quit Starfleet Command.** `package.sh` deletes the app bundle, and the
+   app writes to the panel every 2 s, which fights a flash.
+2. **Check the contract**: `./.venv/bin/python upload_theme.py --check-only`.
+   If it passes, the installed app already agrees with the theme and you do not
+   need to rebuild — the 2026-10-12 swap flashed against a month-old binary on
+   that basis. If it fails, rebuild with `./package.sh`; skipping *that* is what
+   produced `OTHER TP2` twice (2026-09-02, 2026-09-14).
+
+   ⚠️ As of 2026-10-12 `./package.sh` **cannot run on this Mac**: `@State` is a
+   macro in the current SDK and its plugin (`libSwiftUIMacros`) ships only with
+   full Xcode, which is not installed — `xcode-select` points at
+   CommandLineTools, whose plugin dir has only `libObservationMacros` and
+   `libSwiftMacros`. Every `@State` then fails with "external macro
+   implementation type ... could not be found", and the *cascade* looks like
+   ordinary code errors in whichever file uses the property next ("cannot find
+   '$loadError' in scope"), so it reads as a broken commit rather than a broken
+   toolchain. Installing Xcode and `sudo xcode-select -s` is the fix. Until
+   then the panel is pinned to whatever contract the installed binary has.
+3. **Proof of life** before spending 90 s on an upload: push a datetime report
+   with brightness 5, then 100. The backlight is the only field that works
+   regardless of which theme is loaded, so a visible pulse proves your packets
+   land even on the factory theme.
+4. **Flash**, then relaunch and check the model row on **both** nodes. A
+   cluster (TP=2) model shows under both Sparks, so the two rows should read
+   the same — which makes Kathryn's row a direct A/B for channel 21: if it
+   renders a brand but no version, this unit ignores ch21 and the brand/variant
+   split needs renumbering onto a lower channel.
+
+`.flashed-contract.json` is **not** keyed by device serial, so after a swap it
+describes the old panel until the first flash overwrites it. A fresh panel with
+a leftover record would look up to date when it is still on its factory theme;
+deleting the file is the safe reset.
 
 ## Files
 
