@@ -33,7 +33,10 @@ final class StatusPoller: ObservableObject {
 
     let label: String // display identity, e.g. "Jean-Luc" / "Kathryn"
 
-    private let host: String
+    /// The ssh name, e.g. "jean-luc" / "kathryn". Not private because it is
+    /// also the node identity the status script tags models with, so callers
+    /// pooling models across hosts compare against it (effectiveLlamaSwapModels).
+    let host: String
     private let remoteScript = "~/bin/opencode-status.py"
     // 2s, not the original 5s, so the external USB panel reads as genuinely
     // live (pushing to it faster than this would just re-send stale numbers).

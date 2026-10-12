@@ -342,7 +342,8 @@ final class PanelController: ObservableObject {
         guard let host = poller.status?.host else { return .absent }
         let models = effectiveLlamaSwapModels(
             own: host.llamaSwap,
-            other: other.status?.host.llamaSwap ?? .unavailable
+            other: other.status?.host.llamaSwap ?? .unavailable,
+            ownNode: poller.host
         )
         // min(by:) keeps the first of equal-ranked entries, so llama-swap's own
         // order still breaks ties within a rank.

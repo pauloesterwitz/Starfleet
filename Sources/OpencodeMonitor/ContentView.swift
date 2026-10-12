@@ -142,7 +142,9 @@ private struct HostSection: View {
                     }
                 }
                 Divider()
-                HostStatsRow(host: status.host, otherLlamaSwap: otherPoller.status?.host.llamaSwap ?? .unavailable)
+                HostStatsRow(host: status.host,
+                             otherLlamaSwap: otherPoller.status?.host.llamaSwap ?? .unavailable,
+                             ownNode: poller.host)
             } else {
                 Text("Waiting for first poll…")
                     .foregroundStyle(.secondary)
@@ -268,6 +270,8 @@ private struct HostStatsRow: View {
     // one host today, so a both-Sparks cluster model it reports needs folding
     // into THIS host's line too, since it's genuinely running here as well.
     let otherLlamaSwap: LlamaSwapStatus
+    // This row's ssh name, to match against models' `node` tag.
+    let ownNode: String
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
@@ -289,7 +293,7 @@ private struct HostStatsRow: View {
     }
 
     private var effectiveModels: [LlamaSwapModel] {
-        effectiveLlamaSwapModels(own: host.llamaSwap, other: otherLlamaSwap)
+        effectiveLlamaSwapModels(own: host.llamaSwap, other: otherLlamaSwap, ownNode: ownNode)
     }
 
     private var servingSummary: String {
