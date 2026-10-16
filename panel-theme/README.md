@@ -89,10 +89,21 @@ Then, in order:
    renders a brand but no version, this unit ignores ch21 and the brand/variant
    split needs renumbering onto a lower channel.
 
-`.flashed-contract.json` is **not** keyed by device serial, so after a swap it
-describes the old panel until the first flash overwrites it. A fresh panel with
-a leftover record would look up to date when it is still on its factory theme;
-deleting the file is the safe reset.
+`.flashed-contract.json` is **not** keyed by device, and cannot be: units from
+this OEM report the same serial number (`2022100600`, `bcdDevice` 2) and expose
+no way to read back what is loaded — every device-to-host read in `hidss`'s
+`device.c` is a YMODEM ACK. So the record is the most recent flash *on this Mac*,
+whichever physical unit that was, and it says nothing about any other panel you
+own. A fresh panel with a leftover record would look up to date when it is still
+on its factory theme; deleting the file is the safe reset.
+
+**If you own more than one panel and swap them,** treat each as needing its own
+flash after any contract change. Neither the Mac nor the app can detect which is
+attached or what it holds; the only evidence is the screen. A unit on the vendor's
+stock screen has never been flashed. A unit on our theme showing wrong words is
+stale: flash it. The app itself copes with a swap — a failed write drops the
+handle and the next push (2 s) reopens whatever is attached — so the swap needs
+no relaunch.
 
 ## Files
 
