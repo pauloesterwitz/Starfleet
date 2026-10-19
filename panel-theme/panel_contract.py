@@ -52,6 +52,7 @@ CHANNELS = {
     "CH_JL_VARIANT": "jeanLucVariant",
     "CH_KT_BRAND": "kathrynBrand",
     "CH_KT_VARIANT": "kathrynVariant",
+    "CH_SCREENSAVER": "screensaver",
 }
 # (label, atlas in build_theme.py, Swift enum, how a Swift case is matched to its cell)
 #   "name"    the case name IS the word   (glm53 ~ "GLM5.3", idle ~ "IDLE")
