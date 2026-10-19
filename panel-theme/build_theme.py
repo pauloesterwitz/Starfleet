@@ -85,13 +85,14 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageChops, ImageDraw, ImageFont
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 LIB_PKG_DIR = SCRIPT_DIR / "vendor" / "smartmonitor_hid_lib" / "src" / "smartmonitor_hid"
 ASSET_DIR = SCRIPT_DIR / "theme_assets"
 OUT_IMGDAT = SCRIPT_DIR / "img.dat"
 OUT_PREVIEW = SCRIPT_DIR / "theme_preview.png"
+OUT_PREVIEW_SCREENSAVER = SCRIPT_DIR / "theme_preview_screensaver.png"
 OUT_HEADER_ZOOM = SCRIPT_DIR / "header_zoom.png"
 
 SLOT_SIZE = 64
@@ -281,6 +282,9 @@ CH_S2_STATUS, CH_S2_AGE, CH_S2_DONE, CH_S2_TOTAL = 14, 15, 16, 17
 # Resident model per machine: a BRAND field with a VARIANT field beside it.
 CH_JL_BRAND, CH_JL_VARIANT = 18, 19
 CH_KT_BRAND, CH_KT_VARIANT = 20, 21
+# Screensaver switch: 0 shows the dashboard, 1 covers it with the "Incoming
+# Transmission" screen.  Every screensaver widget is bound to this ONE channel.
+CH_SCREENSAVER = 22
 MODEL_FIELD_PAIRS = ((CH_JL_BRAND, CH_JL_VARIANT), (CH_KT_BRAND, CH_KT_VARIANT))
 
 # Status enum -> word, selected by the value the app sends on the status
@@ -315,6 +319,7 @@ SAMPLE_VALUES = {
     CH_S2_STATUS: 3, CH_S2_AGE: 47, CH_S2_DONE: 12, CH_S2_TOTAL: 12,   # WAITING
     # A composed pair on one node and the widest brand on the other, so the
     # preview shows the seam and the longest string the field can hold.
+    CH_SCREENSAVER: 0,                      # the dashboard; the second preview sets this to 1
     CH_JL_BRAND: 1, CH_JL_VARIANT: 2,                                  # QWEN3.6
     CH_KT_BRAND: 5, CH_KT_VARIANT: 9,                                  # DEEPSEEK TP2
 }
@@ -559,7 +564,11 @@ _RENDER_DIGIT_ATLAS = LIB.render.render_number_glyph_payload
 
 def _glyph_payload_dispatch(font, glyphs=LIB.render.DEFAULT_NUMBER_GLYPHS,
                             font_path=None, pixel_size=None, gamma=None):
-    """Stand-in for render_number_glyph_payload that understands word atlases."""
+    """Stand-in for render_number_glyph_payload that understands word atlases
+    and bitmap atlases."""
+    if font is not None and (font.text or "").startswith(BITMAP_ATLAS_MARK):
+        atlas = BITMAP_ATLASES[font.text[len(BITMAP_ATLAS_MARK):]]
+        return atlas.widths, atlas.height, atlas.payload
     words = font_atlas_words(font)
     if words is None:
         return _RENDER_DIGIT_ATLAS(font, glyphs, font_path, pixel_size, gamma)
@@ -571,6 +580,70 @@ def _glyph_payload_dispatch(font, glyphs=LIB.render.DEFAULT_NUMBER_GLYPHS,
 # compiler.py did `from .render import render_number_glyph_payload`, so the
 # name has to be replaced in the compiler's namespace, not render's.
 LIB.compiler.render_number_glyph_payload = _glyph_payload_dispatch
+
+
+# --------------------------------------------------------------------------
+# 5b.  Bitmap glyph atlas: artwork, not text, in the atlas cells
+# --------------------------------------------------------------------------
+# A number widget draws ONE atlas cell per decimal digit of its value, and a cell
+# is just an 8-bit coverage mask drawn in the widget's colour.  Nothing says the
+# mask has to be a glyph, so a value can select a whole picture.  That is the
+# only runtime switch this panel has: the theme is flashed (90 s) and static
+# text, images and the background cannot be hidden, but a number widget can go
+# from blank to a bitmap the moment its channel changes.
+BITMAP_ATLAS_MARK = "\x01bitmap:"      # FontSpec.text prefix, then a registry key
+
+
+@dataclass
+class BitmapAtlas:
+    """12 cells of coverage masks, keyed by the cell a value selects."""
+    key: str
+    widths: list[int]
+    height: int
+    payload: bytes
+    cells: dict[int, Image.Image]            # only the cells that carry ink
+
+    @property
+    def box_width(self) -> int:
+        return max(self.widths)
+
+
+# registry key -> atlas, read back by _glyph_payload_dispatch at compile time
+BITMAP_ATLASES: dict[str, BitmapAtlas] = {}
+# channel -> the atlases bound to it, so validate() can check the compiled bytes.
+# A list, because widgets may share a channel (the screensaver's do).
+BITMAP_CHANNELS: dict[int, list[BitmapAtlas]] = {}
+
+
+def make_bitmap_atlas(key: str, cells: dict[int, Image.Image], height: int,
+                      uniform: bool = False) -> BitmapAtlas:
+    """Build an atlas from ``{cell index: "L" mask}``.
+
+    Every cell shares one ``height`` (the record carries a single glyph height).
+    A cell left out is BLANK -- zero coverage -- and 1px wide, so a picture
+    costs ``width * height`` bytes once rather than twelve times.  That is only
+    safe if the firmware locates cell N by summing the width table.  The vendor's
+    own digit atlas proves it for cells 10 and 11 but NOT for 0..9, whose digits
+    are all 17px, so fixed-stride and cumulative indexing agree there.
+    ``uniform=True`` pads every cell to the widest, which is correct under either
+    reading, at twelve times the size.
+    """
+    assert all(0 <= index < ATLAS_CELLS for index in cells), cells.keys()
+    widest = max((mask.width for mask in cells.values()), default=1)
+    widths, chunks = [], []
+    for index in range(ATLAS_CELLS):
+        mask = cells.get(index)
+        width = widest if uniform else (mask.width if mask else 1)
+        canvas = Image.new("L", (width, height), 0)
+        if mask is not None:
+            assert mask.mode == "L" and mask.height <= height, (key, index, mask.size)
+            canvas.paste(mask, (0, 0))
+        widths.append(width)
+        chunks.append(canvas.tobytes())
+    atlas = BitmapAtlas(key=key, widths=widths, height=height,
+                        payload=b"".join(chunks), cells=dict(cells))
+    BITMAP_ATLASES[key] = atlas
+    return atlas
 
 
 # --------------------------------------------------------------------------
@@ -935,9 +1008,18 @@ WORD_ATLASES: dict[int, WordAtlas] = {}
 
 
 class ThemeBuilder:
+    # Static labels are drawn INTO THE BACKGROUND IMAGE rather than being widgets of
+    # their own.  The panel stops servicing widgets past a limit (see MAX_WIDGETS), and
+    # nineteen labels were what stood between the dashboard and room for the
+    # screensaver.  They look the same -- the same masks, blended the same way -- and
+    # they gain one thing: a number widget's repaint, or a cover going blank, restores
+    # the background underneath, so a label baked in comes back by itself.
+    bake_labels = True
+
     def __init__(self) -> None:
         self.widgets: list[Widget] = []
         self.placed: list[Placed] = []
+        self.baked: list[tuple[Image.Image, int, int, int]] = []     # mask, x, y, colour
         self._next_id = 0
 
     _font = staticmethod(make_font)
@@ -964,6 +1046,11 @@ class ThemeBuilder:
             x = (PANEL_W - rendered.width) // 2
         elif right:
             x -= rendered.width
+        if self.bake_labels:
+            mask = Image.frombytes("L", (rendered.width, rendered.height), rendered.payload)
+            self.baked.append((mask, x, y, color))
+            self.placed.append(Placed(f"baked {text!r}", x, y, rendered.width, rendered.height))
+            return rendered.width
         self.widgets.append(
             Widget(
                 global_id=self._alloc_id(),
@@ -1037,6 +1124,26 @@ class ThemeBuilder:
         return atlas.cell_w
 
 
+def _bitmap_field(self: "ThemeBuilder", channel: int, atlas: BitmapAtlas, color: int,
+                  x: int, y: int, alpha: int = 0xFF) -> None:
+    """Live bitmap widget: a number widget whose cells are ``atlas``.
+
+    The box is the widest cell, so no picture can be clipped by construction.
+    """
+    font = FontSpec(
+        text=BITMAP_ATLAS_MARK + atlas.key, name=F_NUMBER_FONT_NAME, size=12,
+        color_raw=f"{(alpha << 24) | color:08x}", color=(alpha << 24) | color,
+        bold_value=0, italic_value=0, bold=False, italic=False,
+    )
+    BITMAP_CHANNELS.setdefault(channel, []).append(atlas)
+    self._number_widget(channel, font, x, y, atlas.box_width, atlas.height,
+                        f"bitmap ch{channel}", atlas.box_width)
+
+
+ThemeBuilder.bitmap_field = _bitmap_field
+F_NUMBER_FONT_NAME = F_VALUE[0]     # unused by the dispatch, but the record wants a font
+
+
 def word_field_width(spec, words: tuple[str, ...], filler: str) -> int:
     """The width ``ThemeBuilder.word_field`` will take, without placing it.
 
@@ -1048,7 +1155,196 @@ def word_field_width(spec, words: tuple[str, ...], filler: str) -> int:
     return render_word_atlas(font, cells, gamma=1.4).cell_w
 
 
-def build_widgets() -> ThemeBuilder:
+# --------------------------------------------------------------------------
+# 9a.  The screensaver: "Incoming Transmission", for when there is nothing to show
+# --------------------------------------------------------------------------
+# Shown when no DGX Spark is reachable, while the Mac is locked, and at start-up
+# before the first status arrives.  After futurephonic's "LCARS - Incoming
+# Transmission" wallpaper, re-composed for a 320x480 portrait panel.
+#
+# HOW IT SWITCHES.  The panel stores one theme and re-flashing takes 90 s, and
+# nothing in the vendor's widget set hides or swaps anything.  What a value CAN do
+# is pick a number widget's atlas cell -- so the screensaver is a set of widgets
+# whose cell 0 is blank and whose cell 1 is a piece of the picture, all bound to
+# CH_SCREENSAVER.  Value 0 leaves the dashboard showing; value 1 draws them on top.
+#
+# MEASURED ON HARDWARE 2026-10-19 (probe_overlay.py / probe_send.py), which is
+# what makes this possible at all -- none of it is documented:
+#   * overlapping widgets draw in DEFINITION order, later on top, static text
+#     included: the screensaver widgets are built last for exactly that reason;
+#   * a widget's repaint composites correctly over what is beneath it: no box, no
+#     smear, no hole punched in a cover, and a widget UNDER a cover can keep
+#     updating without showing through;
+#   * after the cover goes blank the stripes, grid, static text and live digits
+#     all come back, so no "poke" of the dashboard is needed on the way out;
+#   * atlas cells may have DIFFERENT widths (the firmware sums the width table);
+#   * channels well beyond 21 work (22, 40, 100, 200 tried) and several widgets
+#     may share one channel.
+# THE LARGEST NUMBER-WIDGET BOX PROVEN ON THIS PANEL is 320x236 (probe_overlay.py).
+# A single 320x480 box -- a full-screen cover as one widget -- made the panel fall
+# back to its bootloader screen, showing only "boot", on 2026-10-19; re-flashing
+# the previous theme recovered it.  Why is not established: the atlas was 159 KB and
+# the box 153,600 px, and either could be the limit (a repaint buffer is the obvious
+# guess).  The total theme size is NOT the cause -- 662 KB against the vendor's own
+# 4 MiB cap -- so the cover is built from stripes, each well inside what is proven,
+# and validate() refuses any box bigger than the proven one.  The real boundary is
+# somewhere between 236 and 480 rows and has not been looked for.
+MAX_PROVEN_BOX = (320, 240)     # width, height
+#
+# FIRMWARE LIMITS, measured on 2026-10-19/20 with probe_count*.py.  The panel
+# silently stops servicing widgets past some count, and refuses (shows only "boot")
+# well past it.  Three separate limits are consistent with every observation, each
+# reached first by a different probe -- these are the largest values SEEN WORKING,
+# not documented caps, and validate() holds the build to them:
+#
+#   probe                        widgets  numbers  channels   result
+#   dashboard, labels as widgets   40       21        21      the 9 extras NEVER drew
+#   labels baked, + 9 digits       28       28        24      served 28 of 30 numbers
+#   labels baked, + 28 dots        26       26        26      served 26 of 49 numbers
+#
+# so: <= 40 widgets in all, <= 28 NUMBER widgets, <= 26 DISTINCT channels.  The probes
+# also showed byte size is NOT the constraint (tiny atlases got no further than big
+# ones), and that widgets sharing a channel cost no extra channel.  34 or more number
+# widgets made the panel fall back to its bootloader screen.
+MAX_WIDGETS, MAX_NUMBERS, MAX_CHANNELS = 40, 28, 26
+SS_COVER_STRIPES = 2            # 480 / 2 = 240 rows each: the proven maximum
+SS_AMBER = AMBER                # the dashboard's own amber
+SS_VIOLET = 0x9999FF            # classic LCARS periwinkle, as in the reference's bars
+SS_DISC_LEVEL = 102             # the roundel's field: periwinkle at 40% coverage, ~(64,64,110)
+SS_WHITE = 0xF4F4FF             # wreath and stars
+SS_MARGIN = 14
+SS_BAR_H = 18
+SS_TOP_BAR_Y = 16
+SS_EMBLEM_H, SS_EMBLEM_Y = 164, 46
+SS_TITLE_Y = 226
+SS_LINES_Y = 326
+SS_BOTTOM_BAR_Y = PANEL_H - 16 - SS_BAR_H
+SS_FONT = "DIN Condensed Bold"
+# Rows each colour layer is cut into, one widget per band.  Chosen by hand, because the
+# panel services at most MAX_NUMBERS widgets and the dashboard already uses 21, so the
+# whole screensaver is SEVEN: two cover stripes plus five of these.  Every band is at
+# most MAX_PROVEN_BOX tall, and a layer's bands are exactly where its ink is:
+#   violet  the header bar and the roundel's field (rows 0-199), the lines and the footer bar (320-479)
+#   amber   the header's label and cap (0-59), the title and the footer's caps (220-479)
+#   white   the wreath and stars
+SS_BANDS = {"violet": ((0, 200), (320, 480)), "amber": ((0, 60), (220, 480)),
+            "white": ((0, 480),)}
+
+
+def _ss_text(word: str, size: int) -> Image.Image:
+    """Ink-tight coverage mask for ``word``, rendered the way the widgets render."""
+    font = make_font((SS_FONT, size), SS_WHITE)
+    return LIB.render._render_mask(word, LIB.render.load_font(font))
+
+
+def _ss_bar(draw: ImageDraw.ImageDraw, x0: int, y0: int, x1: int, y1: int,
+            round_left: bool, round_right: bool) -> None:
+    r = (y1 - y0) // 2
+    draw.rectangle((x0 + (r if round_left else 0), y0, x1 - (r if round_right else 0), y1), fill=255)
+    if round_left:
+        draw.ellipse((x0, y0, x0 + 2 * r, y1), fill=255)
+    if round_right:
+        draw.ellipse((x1 - 2 * r, y0, x1, y1), fill=255)
+
+
+def screensaver_layers() -> list[tuple[str, int, Image.Image]]:
+    """(name, colour, full-canvas "L" mask) per colour.  Layers never overlap, so
+    their drawing order is free -- which is deliberate: it is the one thing about
+    overlapping widgets that is not obvious."""
+    canvas = lambda: Image.new("L", (PANEL_W, PANEL_H), 0)     # noqa: E731
+    amber, violet, white = canvas(), canvas(), canvas()
+    da, dv = ImageDraw.Draw(amber), ImageDraw.Draw(violet)
+    left, right, cap = SS_MARGIN, PANEL_W - SS_MARGIN, SS_BAR_H
+
+    # header: [violet cap][LCARS ONLINE][======= violet bar =======][amber cap]
+    y0, y1 = SS_TOP_BAR_Y, SS_TOP_BAR_Y + SS_BAR_H
+    _ss_bar(dv, left, y0, left + cap, y1, True, False)
+    label = _ss_text("LCARS ONLINE", 15)
+    label_x = left + cap + 8
+    amber.paste(255, (label_x, y0 + (SS_BAR_H - label.height) // 2), label)
+    _ss_bar(da, right - cap, y0, right, y1, False, True)
+    dv.rectangle((label_x + label.width + 8, y0, right - cap - 4, y1), fill=255)
+
+    # the roundel: the wreath and stars in white over a field.  The field is the VIOLET
+    # layer at partial coverage rather than a colour of its own -- a widget draws one
+    # colour but each pixel of its mask has its own strength, so a dim violet disc costs
+    # no widget, and widgets are what the panel runs out of.  Drawn 4x and reduced so
+    # its edge is smooth.
+    emblem = _ufp_alpha()
+    width = round(SS_EMBLEM_H * emblem.width / emblem.height)
+    emblem = emblem.resize((width, SS_EMBLEM_H), Image.Resampling.LANCZOS)
+    white.paste(255, ((PANEL_W - width) // 2, SS_EMBLEM_Y), emblem)
+    diameter = round(SS_EMBLEM_H * 0.84)      # measured off the reference: ~0.84 of the wreath's height
+    cx, cy = PANEL_W // 2, SS_EMBLEM_Y + SS_EMBLEM_H // 2
+    big = Image.new("L", (diameter * 4, diameter * 4), 0)
+    ImageDraw.Draw(big).ellipse((0, 0, diameter * 4 - 1, diameter * 4 - 1), fill=SS_DISC_LEVEL)
+    violet.paste(big.resize((diameter, diameter), Image.Resampling.LANCZOS),
+                 (cx - diameter // 2, cy - diameter // 2))   # nothing else violet is in this box
+
+    # title, stacked: "INCOMING TRANSMISSION" does not fit across 320px in one line
+    # Spaced by INK, not by the mask: the mask carries the font's own padding, which
+    # left a 20px hole between the two lines.
+    y = SS_TITLE_Y
+    for word, size in (("INCOMING", 42), ("TRANSMISSION", 36)):
+        mask = _ss_text(word, size)
+        top, bottom = mask.getbbox()[1], mask.getbbox()[3]
+        amber.paste(255, ((PANEL_W - mask.width) // 2, y - top), mask)
+        y += bottom - top + 9
+
+    # the three violet lines, reflowed for portrait
+    y = SS_LINES_Y
+    for line, gap in (("TO: CAPT. J.L. PICARD", 3), ("U.S.S. ENTERPRISE  \u2022  NCC-1701-E", 14),
+                      ("FROM: STARFLEET COMMAND", 3), ("COMMAND AUTHORIZATION REQUIRED", 0)):
+        mask = _ss_text(line, 17)
+        violet.paste(255, ((PANEL_W - mask.width) // 2, y), mask)
+        y += mask.height + gap
+
+    # footer: [amber cap][======= violet bar =======][amber cap]
+    y0, y1 = SS_BOTTOM_BAR_Y, SS_BOTTOM_BAR_Y + SS_BAR_H
+    _ss_bar(da, left, y0, left + cap, y1, True, False)
+    _ss_bar(da, right - cap, y0, right, y1, False, True)
+    dv.rectangle((left + cap + 4, y0, right - cap - 4, y1), fill=255)
+
+    return [("violet", SS_VIOLET, violet), ("amber", SS_AMBER, amber), ("white", SS_WHITE, white)]
+
+
+def screensaver_pieces() -> list[tuple[str, int, int, int, Image.Image]]:
+    """(label, colour, x, y, cropped mask), cover first.
+
+    Each layer is cut into the bands of SS_BANDS and each band cropped to its ink.
+    """
+    stripe = PANEL_H // SS_COVER_STRIPES
+    assert stripe * SS_COVER_STRIPES == PANEL_H and stripe <= MAX_PROVEN_BOX[1]
+    pieces = [(f"cover {i}", BG_NAVY, 0, i * stripe, Image.new("L", (PANEL_W, stripe), 255))
+              for i in range(SS_COVER_STRIPES)]
+    for name, colour, mask in screensaver_layers():
+        for y0, y1 in SS_BANDS[name]:
+            band = mask.crop((0, y0, PANEL_W, y1))
+            box = band.getbbox()
+            assert box is not None, f"the {name} layer has no ink in rows {y0}-{y1}"
+            assert box[3] - box[1] <= MAX_PROVEN_BOX[1], \
+                f"{name} rows {y0}-{y1}: ink is {box[3] - box[1]} tall, over {MAX_PROVEN_BOX[1]}"
+            # ink that falls OUTSIDE every band would silently go missing
+            pieces.append((f"{name} y{y0}", colour, box[0], y0 + box[1],
+                           band.crop((box[0], box[1], box[2], box[3]))))
+    for name, _colour, mask in screensaver_layers():
+        covered = Image.new("L", mask.size, 0)
+        for y0, y1 in SS_BANDS[name]:
+            covered.paste(255, (0, y0, PANEL_W, y1))
+        stray = ImageChops.subtract(mask, covered).getbbox()
+        assert stray is None, f"the {name} layer has ink outside its bands at {stray}"
+    return pieces
+
+
+def add_screensaver(builder: "ThemeBuilder") -> None:
+    """Append the screensaver widgets.  They MUST be added last: later widgets draw
+    on top, and the cover has to sit above every dashboard widget."""
+    for label, colour, x, y, mask in screensaver_pieces():
+        atlas = make_bitmap_atlas(f"ss-{label}", {1: mask}, mask.height)
+        builder.bitmap_field(CH_SCREENSAVER, atlas, colour, x, y)
+
+
+def build_widgets(screensaver: bool = True) -> ThemeBuilder:
     builder = ThemeBuilder()
 
     # --- header -----------------------------------------------------------
@@ -1098,10 +1394,24 @@ def build_widgets() -> ThemeBuilder:
         builder.number(total_ch, F_SESSION, BLUE,
                        slash_x + slash_w + SESS_GAP, row_y, digits=2)
 
+    # LAST, on purpose: widgets draw in definition order and these cover the rest.
+    # (``screensaver=False`` is for probe_count.py, which needs the bare dashboard.)
+    if screensaver:
+        add_screensaver(builder)
     return builder
 
 
-def build_bundle(background: Path) -> tuple[ThemeBundle, "ThemeBuilder"]:
+def bake_into_background(path: Path, builder: "ThemeBuilder") -> None:
+    """Paint the builder's baked labels onto the saved background image."""
+    if not builder.baked:
+        return
+    image = Image.open(path).convert("RGB")
+    for mask, x, y, colour in builder.baked:
+        image.paste(Image.new("RGB", mask.size, _rgb(colour)), (x, y), mask)
+    image.save(path)
+
+
+def build_bundle(background: Path, builder: "ThemeBuilder | None" = None) -> tuple[ThemeBundle, "ThemeBuilder"]:
     parent = WidgetParent(
         object_name="panel",
         widget_type=1,
@@ -1115,7 +1425,8 @@ def build_bundle(background: Path) -> tuple[ThemeBundle, "ThemeBuilder"]:
         background_image_path=background.name,
         image_delay=0,
     )
-    builder = build_widgets()
+    builder = builder or build_widgets()
+    bake_into_background(background, builder)
     theme = Theme(path="", widget_parents=[parent], widgets=builder.widgets)
     return ThemeBundle(ui_path="", base_dir=str(background.parent), theme=theme,
                        startup_pic=None), builder
@@ -1237,7 +1548,8 @@ def check_swift_sync() -> list[str]:
             )
 
     for const, expected in (("jeanLucBrand", CH_JL_BRAND), ("jeanLucVariant", CH_JL_VARIANT),
-                            ("kathrynBrand", CH_KT_BRAND), ("kathrynVariant", CH_KT_VARIANT)):
+                            ("kathrynBrand", CH_KT_BRAND), ("kathrynVariant", CH_KT_VARIANT),
+                            ("screensaver", CH_SCREENSAVER)):
         match = re.search(rf"static let {const}: UInt8 = (\d+)", source)
         if match is None:
             problems.append(f"{SWIFT_PANEL.name}: no `{const}` channel constant found")
@@ -1298,9 +1610,28 @@ def validate(data: bytes, expected_channels: list[int]) -> dict:
     # fields shadow each other and a gap means a channel the app writes to
     # lands nowhere.  (The ORDER is just widget creation order and does not
     # matter: the model field is built with its node's heading.)
-    if sorted(seen_channels) != list(range(1, len(seen_channels) + 1)):
+    # The screensaver's widgets deliberately SHARE CH_SCREENSAVER (hardware-checked
+    # 2026-10-19: several widgets on one channel all update), so it is counted once.
+    n_widgets = len([r for r in records if r.record_type in (0x92, 0x93)])
+    for what, have, limit in (("widgets", n_widgets, MAX_WIDGETS),
+                              ("number widgets", len(seen_channels), MAX_NUMBERS),
+                              ("distinct channels", len(set(seen_channels)), MAX_CHANNELS)):
+        if have > limit:
+            problems.append(
+                f"{have} {what}, but the most the panel has been seen to service is {limit}: "
+                "the extras are silently never drawn (and well past it the panel shows only "
+                "'boot') -- see MAX_WIDGETS")
+    ss_count = seen_channels.count(CH_SCREENSAVER)
+    if ss_count < 2:
+        problems.append(f"the screensaver should be several widgets on ch{CH_SCREENSAVER}, "
+                        f"found {ss_count}")
+    distinct = sorted(set(seen_channels))
+    dashboard = [c for c in seen_channels if c != CH_SCREENSAVER]
+    if sorted(dashboard + [CH_SCREENSAVER]) != list(range(1, len(dashboard) + 2)) \
+            or len(dashboard) != len(set(dashboard)):
         problems.append(
-            f"sensor channels are not a contiguous 1..N set: {sorted(seen_channels)}"
+            f"sensor channels are not a contiguous 1..N set with nothing bound twice "
+            f"(ch{CH_SCREENSAVER} aside): {distinct}"
         )
 
     # -- widget ids unique --------------------------------------------------
@@ -1346,6 +1677,20 @@ def validate(data: bytes, expected_channels: list[int]) -> dict:
         for width in widths:
             cells.append(data[cursor:cursor + width * height])
             cursor += width * height
+
+        # -- bitmap atlas (the screensaver): the bytes must be a picture we built
+        if channel in BITMAP_CHANNELS:
+            payload = data[offset:cursor]
+            if not any(a.payload == payload and a.widths == widths and a.height == height
+                       for a in BITMAP_CHANNELS[channel]):
+                problems.append(f"slot {record.index} (ch{channel}): bitmap atlas bytes in the "
+                                "file are not any picture this build produced")
+            elif not any(cells[1]):
+                problems.append(f"slot {record.index} (ch{channel}): cell 1 (the picture) is blank")
+            if any(cells[0]):
+                problems.append(f"slot {record.index} (ch{channel}): cell 0 must be blank, or "
+                                "the dashboard would never show")
+            continue
 
         for index, cell in enumerate(cells[:10]):
             if any(cell):
@@ -1467,15 +1812,51 @@ def validate(data: bytes, expected_channels: list[int]) -> dict:
     # A number widget repaints its whole box on every update, so anything its
     # box covers would get erased.  Static-on-static overlap is harmless --
     # those are painted once at theme load and never repainted.
+    #
+    # The screensaver widgets are the exception, and are overlays BY DESIGN: they sit
+    # on top of everything.  The rule above is about the dashboard's own widgets;
+    # hardware shows an overlay repaints cleanly (see section 9a), so what matters
+    # for them is ORDER, checked next.
+    overlay = lambda r: (r.record_type == 0x92                                   # noqa: E731
+                         and int(r.fields["fast_sensor"]) == CH_SCREENSAVER)
     for i, (record_a, box_a) in enumerate(boxed):
         for record_b, box_b in boxed[i + 1:]:
             if record_a.record_type != 0x92 and record_b.record_type != 0x92:
+                continue
+            if overlay(record_a) or overlay(record_b):
                 continue
             if _boxes_overlap(box_a, box_b):
                 problems.append(
                     f"slot {record_a.index} {box_a} overlaps slot {record_b.index} {box_b} "
                     "(a number repaint would erase it)"
                 )
+
+    # Overlays draw on top only if they come AFTER everything else, and the cover
+    # (the dashboard-coloured full-screen piece) has to be the first of them.
+    overlay_slots = [r.index for r in records if overlay(r)]
+    other_slots = [r.index for r in records if not overlay(r) and r.record_type != RECORD_ROTATE]
+    if overlay_slots and other_slots and min(overlay_slots) < max(other_slots):
+        problems.append(
+            f"screensaver slots {overlay_slots[0]}.. start before the last other widget "
+            f"(slot {max(other_slots)}): they would draw UNDER it and the dashboard would show through"
+        )
+    if overlay_slots != list(range(overlay_slots[0], overlay_slots[0] + len(overlay_slots))):
+        problems.append(f"screensaver slots are not contiguous: {overlay_slots}")
+    ss_boxes = [_record_box(r) for r in records if overlay(r)]
+    stripe = PANEL_H // SS_COVER_STRIPES
+    want = [(0, i * stripe, PANEL_W, stripe) for i in range(SS_COVER_STRIPES)]
+    if ss_boxes[:SS_COVER_STRIPES] != want:
+        problems.append(f"the first {SS_COVER_STRIPES} screensaver widgets should be the cover, "
+                        f"tiling the screen as {want}; got {ss_boxes[:SS_COVER_STRIPES]}")
+    for record in records:
+        if record.record_type != 0x92:
+            continue
+        box = _record_box(record)
+        if box and (box[2] > MAX_PROVEN_BOX[0] or box[3] > MAX_PROVEN_BOX[1]):
+            problems.append(
+                f"slot {record.index} (ch{int(record.fields['fast_sensor'])}): box {box[2]}x{box[3]} "
+                f"is bigger than the largest proven on hardware, {MAX_PROVEN_BOX[0]}x{MAX_PROVEN_BOX[1]} "
+                f"-- a 320x480 box made the panel show only 'boot'")
 
     emblem_report = _check_emblems(data, records, problems)
 
@@ -1586,6 +1967,8 @@ def _check_emblems(data: bytes, records: list, problems: list[str]) -> list[str]
             record_box = _record_box(record)
             if record.record_type != 0x92 or record_box is None:
                 continue
+            if int(record.fields["fast_sensor"]) == CH_SCREENSAVER:
+                continue          # an overlay, on top of the whole panel by design
             if _boxes_overlap((box[0], box[1], box[2] - box[0], box[3] - box[1]), record_box):
                 problems.append(
                     f"{label}: box {box} is inside number widget slot {record.index}'s repaint box"
@@ -1596,12 +1979,22 @@ def _check_emblems(data: bytes, records: list, problems: list[str]) -> list[str]
             f"(solid mean R{mean_r:.0f} G{mean_g:.0f} B{mean_b:.0f})"
         )
 
-    # The area behind the title must stay flat, or the text loses contrast.
+    # Nothing but the title may be in the title's box.  The title is baked into the
+    # background now (see ThemeBuilder.bake_labels), so the box is no longer flat navy
+    # -- it is navy plus the title's own antialiasing.  Every pixel must therefore lie
+    # on the line from the field colour to the title colour; anything off it is art
+    # that has wandered in, and would cost the text its contrast.
     title_box = TITLE_INK_BOX
     if title_box[2] > title_box[0]:
-        behind = set(_pixels(background.crop(title_box)))
-        if behind != {navy}:
-            problems.append(f"background behind the title is not flat navy: {sorted(behind)[:4]}")
+        amber = quantise_rgb565(AMBER)
+        span = [a - n for a, n in zip(amber, navy)]
+        for pixel in set(_pixels(background.crop(title_box))):
+            t = (pixel[0] - navy[0]) / span[0]
+            expected = [n + t * d for n, d in zip(navy, span)]
+            if not -0.05 <= t <= 1.05 or any(abs(p - e) > 14 for p, e in zip(pixel, expected)):
+                problems.append(f"background behind the title has {pixel}, which is neither the "
+                                f"navy field nor the title's own colour")
+                break
 
     # Every number widget repaints its whole box when its value changes, so
     # background chrome underneath it is liable to be erased.  The layout has
@@ -1610,6 +2003,8 @@ def _check_emblems(data: bytes, records: list, problems: list[str]) -> list[str]
     for record in records:
         if record.record_type != 0x92:
             continue
+        if int(record.fields["fast_sensor"]) == CH_SCREENSAVER:
+            continue              # an overlay: it composites over whatever is beneath
         box = _record_box(record)
         if box is None:
             continue
@@ -1639,7 +2034,8 @@ def save_header_zoom(preview: Image.Image, path: Path, scale: int = 4) -> Path:
 # --------------------------------------------------------------------------
 # 10.  Preview rendered straight out of the compiled file
 # --------------------------------------------------------------------------
-def render_preview(data: bytes, path: Path) -> Image.Image:
+def render_preview(data: bytes, path: Path,
+                   overrides: dict[int, int] | None = None) -> Image.Image:
     """Decode img.dat and draw what the firmware should put on the glass.
 
     Everything here comes from the compiled bytes -- background pixels, text
@@ -1688,7 +2084,7 @@ def render_preview(data: bytes, path: Path) -> Image.Image:
                 )
                 cursor += width * height
 
-            text = str(SAMPLE_VALUES.get(channel, 0))
+            text = str((overrides or {}).get(channel, SAMPLE_VALUES.get(channel, 0)))
             indices = [int(char) if char.isdigit() else (10 if char == "." else 11) for char in text]
             total = sum(widths[index] for index in indices)
             strip = Image.new("L", (max(1, total), height), 0)
@@ -1769,9 +2165,11 @@ def main() -> int:
         print(f"    title ink        {TITLE_INK_BOX}")
 
     preview = render_preview(data, OUT_PREVIEW)
+    render_preview(data, OUT_PREVIEW_SCREENSAVER, {CH_SCREENSAVER: 1})
     zoom = save_header_zoom(preview, OUT_HEADER_ZOOM)
     print()
     print(f"preview         : {OUT_PREVIEW}")
+    print(f"screensaver     : {OUT_PREVIEW_SCREENSAVER}")
     print(f"header zoom     : {zoom}")
 
     if result["problems"]:

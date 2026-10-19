@@ -7,7 +7,7 @@ import SwiftUI
 /// the panel costs zero extra polling on either Spark.
 ///
 /// The panel renders a compiled theme stored on the device; all we push are
-/// numbers on channels 1...21. The channel map below MUST stay in sync with the
+/// numbers on channels 1...22. The channel map below MUST stay in sync with the
 /// theme generator (`build_theme.py`), because the labels next to each value
 /// live in the theme, not here -- swapping two channels here would silently
 /// mislabel them on screen.
@@ -67,6 +67,16 @@ final class PanelController: ObservableObject {
     /// panel if it gets a tick in before the machine actually suspends.
     private var isAsleep = false
 
+    /// Pushes in a row on which neither Spark answered. Starts AT the threshold,
+    /// not at zero: until the first status arrives there is nothing to show yet, so
+    /// the panel opens on the screensaver -- which doubles as its loading screen --
+    /// rather than on a dashboard of zeros. Only the way back OUT of reachable is
+    /// debounced; the first answer switches to the dashboard immediately.
+    private var unreachablePushes = PanelController.screensaverAfterPushes
+    /// ~6 s at the 2 s cadence: long enough that one dropped poll does not flash the
+    /// screensaver over a dashboard that is still good.
+    private static let screensaverAfterPushes = 3
+
     private let jeanLuc: StatusPoller
     private let kathryn: StatusPoller
     private let driver = PanelDriver()
@@ -94,6 +104,10 @@ final class PanelController: ObservableObject {
         static let jeanLucVariant: UInt8 = 19
         static let kathrynBrand: UInt8 = 20
         static let kathrynVariant: UInt8 = 21
+        /// 0 shows the dashboard, 1 covers it with the "Incoming Transmission"
+        /// screen. Several theme widgets share this one channel (see build_theme.py,
+        /// section 9a); an app that never writes it simply never shows the screen.
+        static let screensaver: UInt8 = 22
     }
 
     /// Which model llama-swap currently has resident on a node, as the pair of
@@ -238,6 +252,7 @@ final class PanelController: ObservableObject {
         self.brightness = UserDefaults.standard.object(forKey: Self.brightnessKey) as? Double
             ?? Self.defaultBrightness
         observeSleepWake()
+        observeScreenLock()
         Task { await self.pushLoop() }
     }
 
@@ -253,6 +268,44 @@ final class PanelController: ObservableObject {
                            object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in self?.handleWake() }
         }
+    }
+
+    /// Whether the Mac is showing its lock screen right now.
+    ///
+    /// Read from the session dictionary on every push rather than tracked from the
+    /// lock/unlock notifications, because a flag can only be as right as the last
+    /// notification it saw: launched while already locked, or having missed one,
+    /// it would stay wrong until the next lock. The key is present only while
+    /// locked. The notifications below exist for latency, not correctness.
+    private static func screenIsLocked() -> Bool {
+        guard let session = CGSessionCopyCurrentDictionary() as? [String: Any] else { return false }
+        return (session["CGSSessionScreenIsLocked"] as? Bool) ?? false
+    }
+
+    /// Switch the moment the Mac locks or unlocks instead of up to 2 s later.
+    /// Undocumented distributed notifications, but long-stable and widely relied on;
+    /// if they ever stopped arriving, push() still catches the change on its next tick.
+    private func observeScreenLock() {
+        let center = DistributedNotificationCenter.default()
+        for name in ["com.apple.screenIsLocked", "com.apple.screenIsUnlocked"] {
+            center.addObserver(forName: Notification.Name(name),
+                               object: nil, queue: .main) { [weak self] _ in
+                Task { @MainActor in
+                    guard let self, self.isEnabled, !self.isAsleep else { return }
+                    self.push()
+                }
+            }
+        }
+    }
+
+    /// True when the panel should show the screensaver instead of the dashboard:
+    /// the Mac is locked, or no Spark has answered for a few pushes (including
+    /// before the first answer ever arrives).
+    private func screensaverActive() -> Bool {
+        if Self.screenIsLocked() { return true }
+        let reachable = [jeanLuc, kathryn].contains { $0.status != nil && $0.lastError == nil }
+        unreachablePushes = reachable ? 0 : min(unreachablePushes + 1, Self.screensaverAfterPushes)
+        return unreachablePushes >= Self.screensaverAfterPushes
     }
 
     /// Delivered shortly BEFORE the machine suspends, which is our only chance
@@ -312,6 +365,9 @@ final class PanelController: ObservableObject {
         values[Channel.kathrynVariant] = kathrynModel.variant.rawValue
 
         addSessionRows(into: &values)
+
+        // Always sent, so the panel never depends on remembering a previous state.
+        values[Channel.screensaver] = screensaverActive() ? 1 : 0
 
         let ok = driver.sendSensors(values)
         // Refreshes the clock and re-arms the blanking timeout. At 2s between

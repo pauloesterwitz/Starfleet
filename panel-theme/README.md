@@ -22,7 +22,7 @@ just numbered slots; the firmware's own names for them (`cpu_temperature`,
 `gpu_usage`, …) are irrelevant, because the labels drawn next to each value live
 in the theme, which we author.
 
-**This theme uses 21 channels, and 20 is not the ceiling it looks like.**
+**This theme uses 22 channels, and 20 is not the ceiling it looks like.**
 `hidss.h` declares `HIDSS_SENSOR_KEY_MAX = 20`, which reads like a firmware
 limit and is easy to design around unnecessarily — but count Buren's
 `HIDSS_SENSOR_*` enum and it has exactly 20 named entries, so that constant is
@@ -30,12 +30,13 @@ the size of *his own sensor list*, not a device constraint. `smartmonitor_hid_li
 imposes nothing of the kind: it caps only **pairs per packet** (20, which is
 just what fits in 64 bytes) and requires the tag to fit in one byte.
 
-Confirmed on **two** physical panels — 2026-09-02 on the original, and
-2026-10-12 on the replacement after the first one failed. Channels beyond 21
-are untested: the tag is a `uint8_t`, so more are plausible, but nothing here
-has proved it. If you do need more, note that going past 20 channels means a
-full push no longer fits one report; `PanelDriver.sendSensors` already splits
-across reports, which the same test exercised both times.
+Confirmed on **two** physical panels that channel 21 renders — 2026-09-02 on the
+original, and 2026-10-12 on the replacement after the first one failed. Channels 22,
+40, 100 and 200 were confirmed on 2026-10-19 (`probe_overlay.py`), on the panel that
+was attached then. So the tag, a `uint8_t`, has not been the limit anywhere it has
+been tried. Going past 20 channels means a full push no longer fits one report;
+`PanelDriver.sendSensors` already splits across reports, which every one of those
+tests exercised.
 
 > Separately: this Mac is a **MacBook Air M4**, which supports a maximum of two
 > external displays, and both LS27A80s already use them. Even a *real* small
@@ -239,8 +240,9 @@ on screen with no error anywhere.
 | 3 | Jean-Luc RAM % | 7 | Kathryn RAM % |
 | 4 | Jean-Luc GPU watts | 8 | Kathryn GPU watts |
 | 9 | actively-generating agent sessions, both nodes | | |
+| 22 | screensaver switch: 0 = dashboard, 1 = "Incoming Transmission" | | |
 
-With 21 channels the map no longer fits one 64-byte report (`[type][count]`
+With 22 channels the map no longer fits one 64-byte report (`[type][count]`
 plus 20 × `[channel][u16]`), so `PanelDriver.sendSensors` splits a push across
 reports. There is no begin/commit around a sensor write — the firmware applies
 each pair as it arrives — so the only effect is that the last fields land a
@@ -334,6 +336,90 @@ compiled `img.dat` and checks the cell bytes against a fresh rasterisation of
 each word, plus per-cell ink bounding boxes. On the status fields, values above
 4 land on `UNKNOWN` cells rather than on garbage; the brand and variant atlases
 define all ten, so there is nothing out of range to land on.
+
+## The screensaver
+
+When no DGX Spark is reachable, while the Mac is locked, and at start-up before the
+first status arrives, the panel shows an "Incoming Transmission" screen instead of
+the dashboard — after futurephonic's *LCARS – Incoming Transmission* wallpaper,
+re-composed for a 320×480 portrait panel (header bar, UFP roundel, amber title, three
+violet lines, footer bar). Channel 22 switches it: `0` dashboard, `1` screensaver.
+`PanelController` sends it on every push, so the panel never depends on remembering
+a previous state. Preview: `theme_preview_screensaver.png`.
+
+**Locked** is read from `CGSessionCopyCurrentDictionary()` on every push (the key is
+present only while locked) rather than tracked from the lock/unlock notifications,
+which only make the switch immediate. **No Spark** means neither poller has an
+answer; the way *out* of reachable is debounced (3 pushes, ~6 s) so one dropped poll
+does not flash the screensaver over a good dashboard, and the way *in* is not — the
+panel opens on the screensaver, which is its loading screen.
+
+### How a value can switch a whole screen
+
+The theme is one image flashed in 90 s, and none of the vendor's six widget types
+(background, static text, progress bar, image, number, datetime) hides or swaps
+anything; image widgets only animate on a timer. What a value *can* do is choose a
+number widget's atlas cell, and a cell is just a coverage mask. So the screensaver is
+**seven number widgets** sharing channel 22 — two stripes of a cover in the panel's
+field colour, then one widget per colour per band of rows — whose cell 0 is blank and
+whose cell 1 is a piece of the picture. A widget draws one colour, hence the layers;
+layers never overlap each other, so their order is free. The roundel's field is the
+violet layer at 40% coverage rather than a colour of its own: each pixel of a mask has
+its own strength, so a dim disc costs no widget — and widgets are what runs out.
+
+All of this rests on firmware behaviour no document describes, **measured on
+hardware 2026-10-19/20** with the probes in this directory:
+
+| Behaviour | Result |
+| --- | --- |
+| Overlapping widgets draw in **definition order**, later on top | yes — so the screensaver is defined *last* |
+| A widget's repaint composites over what is beneath it | yes — no box, no smear, no hole punched in a cover |
+| A widget *under* a cover can keep updating | yes — it does not show through |
+| After a cover goes blank the dashboard returns intact | yes — background, labels and live digits; nothing needs re-pushing |
+| Atlas cells of **different widths** | yes — the firmware sums the width table |
+| Several widgets bound to one channel | yes, and they cost no extra channel |
+
+### Firmware limits — the part that cost a day
+
+The panel **silently stops servicing widgets past a limit**, and past a larger one it
+shows only `boot`. The first screensaver build did exactly that: it was flashed, the
+panel loaded it, and nothing in the screensaver ever drew, with no error anywhere.
+Three limits, each reached first by a different probe, fit every observation:
+
+| Probe | Widgets | Number widgets | Channels | Served |
+| --- | --- | --- | --- | --- |
+| dashboard, labels as widgets, + 9 digits | 40 | 21 | 21 | the 9 extras never drew |
+| labels baked, + 9 digits (`probe_count2.py`) | 28 | 28 | 24 | 28 of 30 numbers |
+| labels baked, + 28 tiny dots (`probe_count3.py`) | 26 | 26 | 26 | 26 of 49 numbers |
+
+So **≤ 40 widgets in all, ≤ 28 number widgets, ≤ 26 distinct channels** are the
+largest values seen working (`MAX_WIDGETS`, `MAX_NUMBERS`, `MAX_CHANNELS`, enforced by
+`validate()`). They are measured, not documented, and may really be one budget
+counted differently. What they are *not*: **byte size** (a 556 KB theme loaded; tiny
+atlases got no further than big ones; the vendor's own host tool allows 4 MiB), or
+**record count** (the dashboard used 42, the probes 14–57). 34 or more number widgets
+made the panel fall back to its bootloader screen; re-flashing recovers it.
+
+Consequences, all in `build_theme.py`:
+
+- **Static labels are baked into the background** (`ThemeBuilder.bake_labels`), not
+  widgets. Nineteen of the dashboard's 40 widgets were labels; baking them looks the
+  same (within 8/255, which is RGB565 rounding) and is what makes room. A baked label
+  also comes back by itself when a cover goes blank, since the background is restored.
+- **The screensaver is 7 widgets, and the dashboard's 21 plus 7 is exactly 28.** Every
+  piece is at most `MAX_PROVEN_BOX` (320×240) — a single 320×480 box was in a build that
+  crashed, but that build also had 34 number widgets, so whether the box was a problem
+  too is **unknown**, and the build stays inside what was proven.
+- **A new number widget needs a slot.** To add one, something has to go: the build now
+  refuses to exceed the limits instead of flashing a theme that quietly drops widgets.
+
+Reproduce: `probe_overlay.py` + `probe_send.py` (the overlay/restore behaviour),
+`probe_count2.py` and `probe_count3.py` (the limits). Flashing a probe overwrites the
+dashboard; re-flash `img.dat` afterwards, and delete `.flashed-contract.json` first if
+you want it not to claim the dashboard is on the panel.
+
+To change the artwork, edit `screensaver_layers()` / `SS_BANDS` in `build_theme.py` and
+rebuild; `screensaver_art.py <out.png>` renders it without touching the device.
 
 ## Text rendering — don't let the library binarise it
 
