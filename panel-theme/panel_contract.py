@@ -42,7 +42,10 @@ ROOT = HERE.parent
 THEME_SRC = HERE / "build_theme.py"
 THEME_IMG = HERE / "img.dat"
 SWIFT_SRC = ROOT / "Sources" / "OpencodeMonitor" / "PanelController.swift"
-FLASHED = HERE / ".flashed-contract.json"     # machine-local: what is on THIS panel
+# Machine-local, and per MAC rather than per panel: units from this OEM report the same
+# serial number and expose no way to read back their theme, so the most recent flash on
+# this Mac is all that can be recorded, whichever physical unit it went to.
+FLASHED = HERE / ".flashed-contract.json"
 STAMP = Path("Contents") / "Resources" / "panel-contract.json"
 APP_NAME = "Starfleet Command.app"
 
@@ -274,9 +277,11 @@ def cmd_check(args) -> int:
         print("  note: no record of which theme is on the panel yet "
               "(upload_theme.py writes one from its next flash on)", file=sys.stderr)
     elif flashed != fp:
-        print(f"  WARNING: the panel was last flashed with contract {flashed}, this build "
-              f"speaks {fp}. Flash panel-theme/img.dat after this build, or the panel "
-              f"will show wrong words.", file=sys.stderr)
+        print(f"  WARNING: the last panel flashed from this Mac got contract {flashed}, this "
+              f"build speaks {fp}. Flash panel-theme/img.dat after this build, or the panel "
+              f"will show wrong words. If you own more than one panel, flash EACH of them: "
+              f"they cannot be told apart, so a flash of one says nothing about the other.",
+              file=sys.stderr)
     return 0
 
 
