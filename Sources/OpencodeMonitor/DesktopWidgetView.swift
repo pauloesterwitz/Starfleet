@@ -57,7 +57,8 @@ private struct HostSection: View {
                 // occupies both.
                 let servingModels = effectiveLlamaSwapModels(
                     own: host.llamaSwap,
-                    other: otherPoller.status?.host.llamaSwap ?? .unavailable
+                    other: otherPoller.status?.host.llamaSwap ?? .unavailable,
+                    ownNode: poller.host
                 )
                 if !servingModels.isEmpty {
                     Text(servingModels.map { $0.model ?? "?" }.joined(separator: ", "))

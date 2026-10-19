@@ -102,8 +102,13 @@ def read_llama_swap():
         with urllib.request.urlopen(LLAMA_SWAP_URL, timeout=2) as resp:
             data = json.loads(resp.read())
         cluster_ids = read_cluster_model_ids()
+        # `node`: llama-swap runs only here, so /running lists a Kathryn-served member
+        # as if it were local. ponytail: read off the "-kathryn" twin naming convention
+        # (== every member whose cmd uses serve-kathryn*, 14/14 today); read the cmd
+        # from config.yaml instead if a name ever drifts from where it runs.
         models = [
-            {"model": m.get("model"), "state": m.get("state"), "cluster": m.get("model") in cluster_ids}
+            {"model": m.get("model"), "state": m.get("state"), "cluster": m.get("model") in cluster_ids,
+             "node": "kathryn" if str(m.get("model")).endswith("-kathryn") else None}
             for m in data.get("running", [])
         ]
         return {"reachable": True, "models": models}

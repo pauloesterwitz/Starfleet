@@ -5,9 +5,15 @@ struct LlamaSwapModel: Codable {
     let model: String?
     let state: String?
     let cluster: Bool
+    /// Which Starfleet member actually runs this, when that is NOT the host
+    /// whose llama-swap reported it. llama-swap runs only on Jean-Luc, but it
+    /// launches Kathryn's members over ssh, so its /running lists them as
+    /// though they were local -- `node` is the host script saying otherwise.
+    /// Nil means "wherever it was reported from", which is the common case.
+    let node: String?
 
     enum CodingKeys: String, CodingKey {
-        case model, state, cluster
+        case model, state, cluster, node
     }
 
     init(from decoder: Decoder) throws {
@@ -16,6 +22,9 @@ struct LlamaSwapModel: Codable {
         state = try c.decodeIfPresent(String.self, forKey: .state)
         // Absent on a host not yet redeployed past the cluster-tagging change.
         cluster = try c.decodeIfPresent(Bool.self, forKey: .cluster) ?? false
+        // Likewise absent before the node-tagging change; nil then falls back
+        // to the old "it runs where it was reported" assumption.
+        node = try c.decodeIfPresent(String.self, forKey: .node)
     }
 }
 
@@ -26,22 +35,47 @@ struct LlamaSwapStatus: Codable {
     static let unavailable = LlamaSwapStatus(reachable: false, models: [])
 }
 
-/// Cluster models (llama-swap's `cluster: true` tag) occupy BOTH Sparks at
-/// once, but llama-swap itself only runs on one host today -- so its
-/// /running report is the only source for these. This folds a cluster
-/// model reported by `other` into `own`'s list too (if not already there),
-/// so it shows under every Starfleet member it actually occupies rather
-/// than just the one whose llama-swap happened to answer. Regular
-/// (non-cluster) models are never borrowed this way -- those genuinely run
-/// on one machine only.
-func effectiveLlamaSwapModels(own: LlamaSwapStatus, other: LlamaSwapStatus) -> [LlamaSwapModel] {
-    var seen = Set(own.models.compactMap(\.model))
-    var models = own.models
-    for m in other.models where m.cluster {
-        guard let name = m.model, !seen.contains(name) else { continue }
-        models.append(m)
-        seen.insert(name)
+/// The models actually running on `ownNode`, pooled from both hosts' reports.
+///
+/// Which host REPORTED a model says little about where it runs, because
+/// llama-swap runs only on Jean-Luc and launches the rest of the fleet from
+/// there. Two tags fix that up, and both come from the host script:
+///
+///   * `cluster` -- a TP=2 member occupying BOTH Sparks. Reported once, by
+///     whichever llama-swap answered, and shown under every member it occupies.
+///   * `node` -- a member launched over ssh onto another machine. Jean-Luc's
+///     /running lists Kathryn's embedders, rerankers and `-kathryn` twins as
+///     though they were local; this is what moves them to Kathryn's line.
+///     Before that tag existed these showed under Jean-Luc, which is wrong in
+///     the one direction that matters: it credits one Spark with another's work.
+///
+/// Anything untagged runs where it was reported, which is the common case and
+/// the pre-tag behaviour. Taking `ownNode` rather than a pair of node names
+/// means a model tagged for a machine that is not this one drops out by
+/// itself, so a third Spark would need no change here.
+func effectiveLlamaSwapModels(own: LlamaSwapStatus, other: LlamaSwapStatus,
+                              ownNode: String) -> [LlamaSwapModel] {
+    var models: [LlamaSwapModel] = []
+    var seen = Set<String>()
+
+    func collect(_ reported: [LlamaSwapModel], reportedByOwn: Bool) {
+        for m in reported {
+            let runsHere: Bool
+            if m.cluster {
+                runsHere = true
+            } else if let node = m.node {
+                runsHere = node == ownNode
+            } else {
+                runsHere = reportedByOwn
+            }
+            guard runsHere else { continue }
+            // A cluster model can legitimately be reported by both hosts.
+            if let name = m.model, !seen.insert(name).inserted { continue }
+            models.append(m)
+        }
     }
+    collect(own.models, reportedByOwn: true)
+    collect(other.models, reportedByOwn: false)
     return models
 }
 
