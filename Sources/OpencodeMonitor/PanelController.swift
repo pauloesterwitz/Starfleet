@@ -3,8 +3,11 @@ import Foundation
 import SwiftUI
 
 /// Feeds the external 3.5" USB panel from the same StatusPollers that drive the
-/// menu bar and the desktop widget -- deliberately no SSH of its own, so adding
-/// the panel costs zero extra polling on either Spark.
+/// menu bar and the desktop widget, plus one streamed GPU feed per Spark
+/// (GPUStream) for the three figures that move fast: GPU %, temperature, power.
+/// Everything else -- RAM, sessions, models -- still costs no SSH of its own.
+/// The streams are the panel's only extra load on a Spark: a standing ssh
+/// connection and an `nvidia-smi` loop, running only while the panel is fed.
 ///
 /// The panel renders a compiled theme stored on the device; all we push are
 /// numbers on channels 1...22. The channel map below MUST stay in sync with the
@@ -17,6 +20,7 @@ final class PanelController: ObservableObject {
         didSet {
             UserDefaults.standard.set(isEnabled, forKey: Self.enabledKey)
             if !isEnabled { driver.close() }
+            updateGPUStreams()
         }
     }
 
@@ -67,15 +71,29 @@ final class PanelController: ObservableObject {
     /// panel if it gets a tick in before the machine actually suspends.
     private var isAsleep = false
 
-    /// Pushes in a row on which neither Spark answered. Starts AT the threshold,
-    /// not at zero: until the first status arrives there is nothing to show yet, so
-    /// the panel opens on the screensaver -- which doubles as its loading screen --
-    /// rather than on a dashboard of zeros. Only the way back OUT of reachable is
-    /// debounced; the first answer switches to the dashboard immediately.
-    private var unreachablePushes = PanelController.screensaverAfterPushes
-    /// ~6 s at the 2 s cadence: long enough that one dropped poll does not flash the
-    /// screensaver over a dashboard that is still good.
-    private static let screensaverAfterPushes = 3
+    /// Since when neither Spark has answered; nil while at least one does. Starts at
+    /// `.distantPast`, not nil: until the first status arrives there is nothing to
+    /// show yet, so the panel opens on the screensaver -- which doubles as its loading
+    /// screen -- rather than on a dashboard of zeros. Only the way back OUT of
+    /// reachable is debounced; the first answer switches to the dashboard immediately.
+    ///
+    /// A time, not a count of pushes: the push loop's cadence is not what the grace
+    /// period should depend on (it was "3 pushes" while pushes were 2 s apart).
+    private var unreachableSince: Date? = .distantPast
+    /// Long enough that one dropped poll does not flash the screensaver over a
+    /// dashboard that is still good.
+    private static let screensaverAfter: TimeInterval = 6
+
+    /// How often the panel is fed. GPU %, temperature and power are streamed from each
+    /// Spark (see GPUStream) rather than polled, so a faster push has something new to
+    /// show; everything else still arrives at the status poller's 2 s and is simply
+    /// re-sent. Half a second matches the stream's own 500 ms.
+    private static let pushIntervalNanos: UInt64 = 500_000_000
+
+    /// One streamed GPU feed per Spark, keyed by ssh host name. Running only while the
+    /// panel is enabled and the Mac awake: a stream is a standing ssh connection and an
+    /// `nvidia-smi` loop on the Spark, which nothing should pay for with no panel to feed.
+    private let gpuStreams: [String: GPUStream]
 
     private let jeanLuc: StatusPoller
     private let kathryn: StatusPoller
@@ -246,6 +264,8 @@ final class PanelController: ObservableObject {
     init(jeanLuc: StatusPoller, kathryn: StatusPoller) {
         self.jeanLuc = jeanLuc
         self.kathryn = kathryn
+        self.gpuStreams = [jeanLuc.host: GPUStream(host: jeanLuc.host),
+                           kathryn.host: GPUStream(host: kathryn.host)]
         self.isEnabled = UserDefaults.standard.bool(forKey: Self.enabledKey)
         // object(forKey:), not double(forKey:) -- the latter returns 0 when the
         // key is absent, which would read as "brightness 0" on a fresh install.
@@ -253,6 +273,7 @@ final class PanelController: ObservableObject {
             ?? Self.defaultBrightness
         observeSleepWake()
         observeScreenLock()
+        updateGPUStreams()
         Task { await self.pushLoop() }
     }
 
@@ -304,8 +325,21 @@ final class PanelController: ObservableObject {
     private func screensaverActive() -> Bool {
         if Self.screenIsLocked() { return true }
         let reachable = [jeanLuc, kathryn].contains { $0.status != nil && $0.lastError == nil }
-        unreachablePushes = reachable ? 0 : min(unreachablePushes + 1, Self.screensaverAfterPushes)
-        return unreachablePushes >= Self.screensaverAfterPushes
+        if reachable {
+            unreachableSince = nil
+            return false
+        }
+        let since = unreachableSince ?? Date()
+        unreachableSince = since
+        return Date().timeIntervalSince(since) >= Self.screensaverAfter
+    }
+
+    /// Start or stop the GPU streams to match whether the panel is being fed.
+    private func updateGPUStreams() {
+        let wanted = isEnabled && !isAsleep
+        for stream in gpuStreams.values {
+            if wanted { stream.start() } else { stream.stop() }
+        }
     }
 
     /// Delivered shortly BEFORE the machine suspends, which is our only chance
@@ -314,6 +348,7 @@ final class PanelController: ObservableObject {
     /// time, `blankAfter` still blanks the panel ~10s later.
     private func handleSleep() {
         isAsleep = true
+        updateGPUStreams()
         if driver.isOpen {
             _ = driver.sendDateTime(brightness: Self.level(brightness),
                                     timeout: Self.blankOnSleep)
@@ -326,17 +361,18 @@ final class PanelController: ObservableObject {
     /// handle -- push() re-opens on demand, and a failed write drops it anyway.
     private func handleWake() {
         isAsleep = false
+        updateGPUStreams()
         if isEnabled { push() }
     }
 
-    /// Matches StatusPoller's own 2s cadence; each tick just reads whatever the
-    /// pollers last published, so a slow/unreachable host never stalls the panel.
-    /// The two loops are independent, so a value is at worst one poll interval
-    /// stale by the time it reaches the panel.
+    /// Each tick just reads whatever the pollers and GPU streams last produced, so a
+    /// slow or unreachable host never stalls the panel. The loops are independent, so
+    /// a value is at worst one source interval stale by the time it reaches the panel:
+    /// ~0.5 s for the streamed GPU figures, ~2 s for the rest.
     private func pushLoop() async {
         while !Task.isCancelled {
             if isEnabled, !isAsleep { push() }
-            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            try? await Task.sleep(nanoseconds: Self.pushIntervalNanos)
         }
     }
 
@@ -454,9 +490,12 @@ final class PanelController: ObservableObject {
     private func stats(for poller: StatusPoller, gpu: UInt8, temp: UInt8, ram: UInt8,
                        power: UInt8, into values: inout [UInt8: UInt16]) {
         let host = poller.status?.host
-        values[gpu] = UInt16(clamping: Int(host?.gpuUtilPct ?? 0))
-        values[temp] = UInt16(clamping: Int(host?.gpuTempC ?? 0))
-        values[ram] = UInt16(clamping: Int(host?.ramPct ?? 0))
-        values[power] = UInt16(clamping: Int(host?.gpuPowerW ?? 0))
+        // The streamed figure when it is fresh, else the poller's: per field, so a
+        // driver that cannot report one of the three ("[N/A]") costs only that one.
+        let live = gpuStreams[poller.host]?.fresh
+        values[gpu] = UInt16(clamping: Int(live?.utilPct ?? host?.gpuUtilPct ?? 0))
+        values[temp] = UInt16(clamping: Int(live?.tempC ?? host?.gpuTempC ?? 0))
+        values[ram] = UInt16(clamping: Int(host?.ramPct ?? 0))      // slow, and not in nvidia-smi
+        values[power] = UInt16(clamping: Int(live?.powerW ?? host?.gpuPowerW ?? 0))
     }
 }

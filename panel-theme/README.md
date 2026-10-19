@@ -463,8 +463,38 @@ Runtime pushing lives in the Swift app, not here:
 
 - `Sources/OpencodeMonitor/PanelDriver.swift` — raw HID over `IOHIDManager`.
 - `Sources/OpencodeMonitor/PanelController.swift` — feeds the panel from the
-  existing `StatusPoller`s, so the panel costs **zero extra SSH**.
+  existing `StatusPoller`s (RAM, sessions, models: no extra SSH) plus a GPU stream.
+- `Sources/OpencodeMonitor/GPUStream.swift` — one long-lived
+  `ssh host nvidia-smi … -lms 500` per Spark for GPU %, temperature and power.
 - Toggle: "Send to USB panel" in the menu bar dropdown.
+
+### Update rates
+
+| Figure | Source | Age at the panel |
+| --- | --- | --- |
+| GPU %, temperature, power (ch 1–2, 4, 5–6, 8) | `GPUStream`, ~2 samples/s | ≲ 0.5–1 s |
+| RAM %, sessions, models, screensaver switch | status poller, every 2 s | ≲ 2–2.5 s |
+
+The panel is pushed every 0.5 s. It used to be 2 s on top of a 2 s poll, so a figure
+was 2–4 s old, and **GPU load is bursty** — 0 % and 47 °C, then 96 % and 68 °C a minute
+later — so a sample every two seconds mostly misses what happens. Polling the full
+status faster was not the answer: one poll is ~0.8 s of work on Jean-Luc, so 1 s would
+keep ssh busy most of the time. The GPU figures alone are ~0.12 s as a one-off ssh and
+nothing at all as a stream, which is why only those are streamed.
+
+Things worth knowing:
+
+- The stream is a **standing connection and an `nvidia-smi` loop on each Spark**,
+  started only while the panel is enabled and the Mac awake, and stopped on sleep.
+  Killing the ssh kills the remote loop (checked: nothing is left running on the Spark).
+- It restarts itself with backoff (1 s → 15 s) if the connection drops; measured
+  recovery after killing it was ~1 s. A sample older than 3 s is ignored, and the panel
+  falls back to the poller's figure **per field**, so `[N/A]` on one costs only that one.
+- It is deliberately **not `@Published`**: the menu bar and desktop widget observe the
+  poller, and publishing twice a second would re-render them for figures they do not
+  show at that rate. They keep the 2 s figures.
+- The screensaver's "no Spark" grace period is now a **time** (6 s), not a count of
+  pushes, since the push cadence changed underneath it.
 
 ## Attribution
 
