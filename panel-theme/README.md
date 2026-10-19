@@ -283,36 +283,66 @@ The theme is one image flashed in 90 s, and none of the vendor's six widget type
 (background, static text, progress bar, image, number, datetime) hides or swaps
 anything; image widgets only animate on a timer. What a value *can* do is choose a
 number widget's atlas cell, and a cell is just a coverage mask. So the screensaver is
-**thirteen number widgets** sharing channel 22 — a full-screen cover in the panel's
-field colour, then one widget per colour per band of rows (violet, amber, the blue
-disc, the white wreath) — whose cell 0 is blank and whose cell 1 is a piece of the
-picture. A widget draws one colour, hence the layers; layers never overlap each
-other, so their order is free.
+**seven number widgets** sharing channel 22 — two stripes of a cover in the panel's
+field colour, then one widget per colour per band of rows — whose cell 0 is blank and
+whose cell 1 is a piece of the picture. A widget draws one colour, hence the layers;
+layers never overlap each other, so their order is free. The roundel's field is the
+violet layer at 40% coverage rather than a colour of its own: each pixel of a mask has
+its own strength, so a dim disc costs no widget — and widgets are what runs out.
 
 All of this rests on firmware behaviour no document describes, **measured on
-hardware 2026-10-19** with `probe_overlay.py` (builds a test theme) and
-`probe_send.py` (drives it):
+hardware 2026-10-19/20** with the probes in this directory:
 
 | Behaviour | Result |
 | --- | --- |
-| Overlapping widgets draw in **definition order**, later on top | yes — static text included, so the screensaver is defined *last* |
+| Overlapping widgets draw in **definition order**, later on top | yes — so the screensaver is defined *last* |
 | A widget's repaint composites over what is beneath it | yes — no box, no smear, no hole punched in a cover |
 | A widget *under* a cover can keep updating | yes — it does not show through |
-| After a cover goes blank the dashboard returns intact | yes — background, grid, static text and live digits; no "poke" needed |
+| After a cover goes blank the dashboard returns intact | yes — background, labels and live digits; nothing needs re-pushing |
 | Atlas cells of **different widths** | yes — the firmware sums the width table |
-| Channels beyond 21 | yes — 22, 40, 100, 200 |
-| Several widgets bound to one channel | yes |
+| Several widgets bound to one channel | yes, and they cost no extra channel |
 
-This overturned an assumption the validator used to make — that a number widget's
-repaint erases what its box covers — so those rules now exempt the screensaver
-widgets (and only them). `validate()` instead checks that the screensaver slots come
-**after** every other widget, are contiguous, and start with the full-screen cover.
+### Firmware limits — the part that cost a day
 
-To change the artwork, edit `screensaver_layers()` in `build_theme.py` and rebuild;
-`screensaver_art.py <out.png>` renders it without touching the device. A picture costs
-`width × height` bytes per widget, so each layer is split into a widget per band of
-rows and cropped to its ink (the artwork is ~250 KB of the 0.63 MiB theme;
-55 of 63 record slots are used).
+The panel **silently stops servicing widgets past a limit**, and past a larger one it
+shows only `boot`. The first screensaver build did exactly that: it was flashed, the
+panel loaded it, and nothing in the screensaver ever drew, with no error anywhere.
+Three limits, each reached first by a different probe, fit every observation:
+
+| Probe | Widgets | Number widgets | Channels | Served |
+| --- | --- | --- | --- | --- |
+| dashboard, labels as widgets, + 9 digits | 40 | 21 | 21 | the 9 extras never drew |
+| labels baked, + 9 digits (`probe_count2.py`) | 28 | 28 | 24 | 28 of 30 numbers |
+| labels baked, + 28 tiny dots (`probe_count3.py`) | 26 | 26 | 26 | 26 of 49 numbers |
+
+So **≤ 40 widgets in all, ≤ 28 number widgets, ≤ 26 distinct channels** are the
+largest values seen working (`MAX_WIDGETS`, `MAX_NUMBERS`, `MAX_CHANNELS`, enforced by
+`validate()`). They are measured, not documented, and may really be one budget
+counted differently. What they are *not*: **byte size** (a 556 KB theme loaded; tiny
+atlases got no further than big ones; the vendor's own host tool allows 4 MiB), or
+**record count** (the dashboard used 42, the probes 14–57). 34 or more number widgets
+made the panel fall back to its bootloader screen; re-flashing recovers it.
+
+Consequences, all in `build_theme.py`:
+
+- **Static labels are baked into the background** (`ThemeBuilder.bake_labels`), not
+  widgets. Nineteen of the dashboard's 40 widgets were labels; baking them looks the
+  same (within 8/255, which is RGB565 rounding) and is what makes room. A baked label
+  also comes back by itself when a cover goes blank, since the background is restored.
+- **The screensaver is 7 widgets, and the dashboard's 21 plus 7 is exactly 28.** Every
+  piece is at most `MAX_PROVEN_BOX` (320×240) — a single 320×480 box was in a build that
+  crashed, but that build also had 34 number widgets, so whether the box was a problem
+  too is **unknown**, and the build stays inside what was proven.
+- **A new number widget needs a slot.** To add one, something has to go: the build now
+  refuses to exceed the limits instead of flashing a theme that quietly drops widgets.
+
+Reproduce: `probe_overlay.py` + `probe_send.py` (the overlay/restore behaviour),
+`probe_count2.py` and `probe_count3.py` (the limits). Flashing a probe overwrites the
+dashboard; re-flash `img.dat` afterwards, and delete `.flashed-contract.json` first if
+you want it not to claim the dashboard is on the panel.
+
+To change the artwork, edit `screensaver_layers()` / `SS_BANDS` in `build_theme.py` and
+rebuild; `screensaver_art.py <out.png>` renders it without touching the device.
 
 ## Text rendering — don't let the library binarise it
 

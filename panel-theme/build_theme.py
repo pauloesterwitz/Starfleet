@@ -85,7 +85,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageChops, ImageDraw, ImageFont
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 LIB_PKG_DIR = SCRIPT_DIR / "vendor" / "smartmonitor_hid_lib" / "src" / "smartmonitor_hid"
@@ -1008,9 +1008,18 @@ WORD_ATLASES: dict[int, WordAtlas] = {}
 
 
 class ThemeBuilder:
+    # Static labels are drawn INTO THE BACKGROUND IMAGE rather than being widgets of
+    # their own.  The panel stops servicing widgets past a limit (see MAX_WIDGETS), and
+    # nineteen labels were what stood between the dashboard and room for the
+    # screensaver.  They look the same -- the same masks, blended the same way -- and
+    # they gain one thing: a number widget's repaint, or a cover going blank, restores
+    # the background underneath, so a label baked in comes back by itself.
+    bake_labels = True
+
     def __init__(self) -> None:
         self.widgets: list[Widget] = []
         self.placed: list[Placed] = []
+        self.baked: list[tuple[Image.Image, int, int, int]] = []     # mask, x, y, colour
         self._next_id = 0
 
     _font = staticmethod(make_font)
@@ -1037,6 +1046,11 @@ class ThemeBuilder:
             x = (PANEL_W - rendered.width) // 2
         elif right:
             x -= rendered.width
+        if self.bake_labels:
+            mask = Image.frombytes("L", (rendered.width, rendered.height), rendered.payload)
+            self.baked.append((mask, x, y, color))
+            self.placed.append(Placed(f"baked {text!r}", x, y, rendered.width, rendered.height))
+            return rendered.width
         self.widgets.append(
             Widget(
                 global_id=self._alloc_id(),
@@ -1166,19 +1180,55 @@ def word_field_width(spec, words: tuple[str, ...], filler: str) -> int:
 #   * atlas cells may have DIFFERENT widths (the firmware sums the width table);
 #   * channels well beyond 21 work (22, 40, 100, 200 tried) and several widgets
 #     may share one channel.
+# THE LARGEST NUMBER-WIDGET BOX PROVEN ON THIS PANEL is 320x236 (probe_overlay.py).
+# A single 320x480 box -- a full-screen cover as one widget -- made the panel fall
+# back to its bootloader screen, showing only "boot", on 2026-10-19; re-flashing
+# the previous theme recovered it.  Why is not established: the atlas was 159 KB and
+# the box 153,600 px, and either could be the limit (a repaint buffer is the obvious
+# guess).  The total theme size is NOT the cause -- 662 KB against the vendor's own
+# 4 MiB cap -- so the cover is built from stripes, each well inside what is proven,
+# and validate() refuses any box bigger than the proven one.  The real boundary is
+# somewhere between 236 and 480 rows and has not been looked for.
+MAX_PROVEN_BOX = (320, 240)     # width, height
+#
+# FIRMWARE LIMITS, measured on 2026-10-19/20 with probe_count*.py.  The panel
+# silently stops servicing widgets past some count, and refuses (shows only "boot")
+# well past it.  Three separate limits are consistent with every observation, each
+# reached first by a different probe -- these are the largest values SEEN WORKING,
+# not documented caps, and validate() holds the build to them:
+#
+#   probe                        widgets  numbers  channels   result
+#   dashboard, labels as widgets   40       21        21      the 9 extras NEVER drew
+#   labels baked, + 9 digits       28       28        24      served 28 of 30 numbers
+#   labels baked, + 28 dots        26       26        26      served 26 of 49 numbers
+#
+# so: <= 40 widgets in all, <= 28 NUMBER widgets, <= 26 DISTINCT channels.  The probes
+# also showed byte size is NOT the constraint (tiny atlases got no further than big
+# ones), and that widgets sharing a channel cost no extra channel.  34 or more number
+# widgets made the panel fall back to its bootloader screen.
+MAX_WIDGETS, MAX_NUMBERS, MAX_CHANNELS = 40, 28, 26
+SS_COVER_STRIPES = 2            # 480 / 2 = 240 rows each: the proven maximum
 SS_AMBER = AMBER                # the dashboard's own amber
 SS_VIOLET = 0x9999FF            # classic LCARS periwinkle, as in the reference's bars
-SS_DISC = 0x1B1B7A              # the roundel's deep-blue field
+SS_DISC_LEVEL = 102             # the roundel's field: periwinkle at 40% coverage, ~(64,64,110)
 SS_WHITE = 0xF4F4FF             # wreath and stars
 SS_MARGIN = 14
 SS_BAR_H = 18
 SS_TOP_BAR_Y = 16
-SS_EMBLEM_H, SS_EMBLEM_Y = 148, 52
-SS_TITLE_Y = 208
-SS_LINES_Y = 322
+SS_EMBLEM_H, SS_EMBLEM_Y = 164, 46
+SS_TITLE_Y = 226
+SS_LINES_Y = 326
 SS_BOTTOM_BAR_Y = PANEL_H - 16 - SS_BAR_H
 SS_FONT = "DIN Condensed Bold"
-SS_BAND_GAP = 8                 # empty rows that split a layer into separate widgets
+# Rows each colour layer is cut into, one widget per band.  Chosen by hand, because the
+# panel services at most MAX_NUMBERS widgets and the dashboard already uses 21, so the
+# whole screensaver is SEVEN: two cover stripes plus five of these.  Every band is at
+# most MAX_PROVEN_BOX tall, and a layer's bands are exactly where its ink is:
+#   violet  the header bar and the roundel's field (rows 0-199), the lines and the footer bar (320-479)
+#   amber   the header's label and cap (0-59), the title and the footer's caps (220-479)
+#   white   the wreath and stars
+SS_BANDS = {"violet": ((0, 200), (320, 480)), "amber": ((0, 60), (220, 480)),
+            "white": ((0, 480),)}
 
 
 def _ss_text(word: str, size: int) -> Image.Image:
@@ -1202,8 +1252,8 @@ def screensaver_layers() -> list[tuple[str, int, Image.Image]]:
     their drawing order is free -- which is deliberate: it is the one thing about
     overlapping widgets that is not obvious."""
     canvas = lambda: Image.new("L", (PANEL_W, PANEL_H), 0)     # noqa: E731
-    amber, violet, white, disc = canvas(), canvas(), canvas(), canvas()
-    da, dv, dd = ImageDraw.Draw(amber), ImageDraw.Draw(violet), ImageDraw.Draw(disc)
+    amber, violet, white = canvas(), canvas(), canvas()
+    da, dv = ImageDraw.Draw(amber), ImageDraw.Draw(violet)
     left, right, cap = SS_MARGIN, PANEL_W - SS_MARGIN, SS_BAR_H
 
     # header: [violet cap][LCARS ONLINE][======= violet bar =======][amber cap]
@@ -1215,21 +1265,31 @@ def screensaver_layers() -> list[tuple[str, int, Image.Image]]:
     _ss_bar(da, right - cap, y0, right, y1, False, True)
     dv.rectangle((label_x + label.width + 8, y0, right - cap - 4, y1), fill=255)
 
-    # the roundel: a deep-blue disc, then the white wreath and stars over it
+    # the roundel: the wreath and stars in white over a field.  The field is the VIOLET
+    # layer at partial coverage rather than a colour of its own -- a widget draws one
+    # colour but each pixel of its mask has its own strength, so a dim violet disc costs
+    # no widget, and widgets are what the panel runs out of.  Drawn 4x and reduced so
+    # its edge is smooth.
     emblem = _ufp_alpha()
     width = round(SS_EMBLEM_H * emblem.width / emblem.height)
     emblem = emblem.resize((width, SS_EMBLEM_H), Image.Resampling.LANCZOS)
     white.paste(255, ((PANEL_W - width) // 2, SS_EMBLEM_Y), emblem)
     diameter = round(SS_EMBLEM_H * 0.84)      # measured off the reference: ~0.84 of the wreath's height
     cx, cy = PANEL_W // 2, SS_EMBLEM_Y + SS_EMBLEM_H // 2
-    dd.ellipse((cx - diameter // 2, cy - diameter // 2, cx + diameter // 2, cy + diameter // 2), fill=255)
+    big = Image.new("L", (diameter * 4, diameter * 4), 0)
+    ImageDraw.Draw(big).ellipse((0, 0, diameter * 4 - 1, diameter * 4 - 1), fill=SS_DISC_LEVEL)
+    violet.paste(big.resize((diameter, diameter), Image.Resampling.LANCZOS),
+                 (cx - diameter // 2, cy - diameter // 2))   # nothing else violet is in this box
 
     # title, stacked: "INCOMING TRANSMISSION" does not fit across 320px in one line
+    # Spaced by INK, not by the mask: the mask carries the font's own padding, which
+    # left a 20px hole between the two lines.
     y = SS_TITLE_Y
     for word, size in (("INCOMING", 42), ("TRANSMISSION", 36)):
         mask = _ss_text(word, size)
-        amber.paste(255, ((PANEL_W - mask.width) // 2, y), mask)
-        y += mask.height + 6
+        top, bottom = mask.getbbox()[1], mask.getbbox()[3]
+        amber.paste(255, ((PANEL_W - mask.width) // 2, y - top), mask)
+        y += bottom - top + 9
 
     # the three violet lines, reflowed for portrait
     y = SS_LINES_Y
@@ -1245,37 +1305,34 @@ def screensaver_layers() -> list[tuple[str, int, Image.Image]]:
     _ss_bar(da, right - cap, y0, right, y1, False, True)
     dv.rectangle((left + cap + 4, y0, right - cap - 4, y1), fill=255)
 
-    return [("violet", SS_VIOLET, violet), ("amber", SS_AMBER, amber),
-            ("disc", SS_DISC, disc), ("white", SS_WHITE, white)]
-
-
-def _row_bands(mask: Image.Image, gap: int) -> list[tuple[int, int]]:
-    """Row ranges that carry ink, split wherever ``gap`` or more rows are empty."""
-    inked = [y for y in range(mask.height)
-             if mask.crop((0, y, mask.width, y + 1)).getbbox() is not None]
-    bands: list[tuple[int, int]] = []
-    for y in inked:
-        if bands and y - bands[-1][1] <= gap:
-            bands[-1] = (bands[-1][0], y + 1)
-        else:
-            bands.append((y, y + 1))
-    return bands
+    return [("violet", SS_VIOLET, violet), ("amber", SS_AMBER, amber), ("white", SS_WHITE, white)]
 
 
 def screensaver_pieces() -> list[tuple[str, int, int, int, Image.Image]]:
     """(label, colour, x, y, cropped mask), cover first.
 
-    A picture costs width*height bytes per widget, and the amber layer alone spans
-    the header, title and footer -- one widget would store the empty rows between
-    them too.  So each layer is split into a widget per band of rows and cropped to
-    its ink: about a third of the bytes.
+    Each layer is cut into the bands of SS_BANDS and each band cropped to its ink.
     """
-    pieces = [("cover", BG_NAVY, 0, 0, Image.new("L", (PANEL_W, PANEL_H), 255))]
+    stripe = PANEL_H // SS_COVER_STRIPES
+    assert stripe * SS_COVER_STRIPES == PANEL_H and stripe <= MAX_PROVEN_BOX[1]
+    pieces = [(f"cover {i}", BG_NAVY, 0, i * stripe, Image.new("L", (PANEL_W, stripe), 255))
+              for i in range(SS_COVER_STRIPES)]
     for name, colour, mask in screensaver_layers():
-        for y0, y1 in _row_bands(mask, SS_BAND_GAP):
-            box = mask.crop((0, y0, PANEL_W, y1)).getbbox()
-            x0, x1 = box[0], box[2]
-            pieces.append((f"{name} y{y0}", colour, x0, y0, mask.crop((x0, y0, x1, y1))))
+        for y0, y1 in SS_BANDS[name]:
+            band = mask.crop((0, y0, PANEL_W, y1))
+            box = band.getbbox()
+            assert box is not None, f"the {name} layer has no ink in rows {y0}-{y1}"
+            assert box[3] - box[1] <= MAX_PROVEN_BOX[1], \
+                f"{name} rows {y0}-{y1}: ink is {box[3] - box[1]} tall, over {MAX_PROVEN_BOX[1]}"
+            # ink that falls OUTSIDE every band would silently go missing
+            pieces.append((f"{name} y{y0}", colour, box[0], y0 + box[1],
+                           band.crop((box[0], box[1], box[2], box[3]))))
+    for name, _colour, mask in screensaver_layers():
+        covered = Image.new("L", mask.size, 0)
+        for y0, y1 in SS_BANDS[name]:
+            covered.paste(255, (0, y0, PANEL_W, y1))
+        stray = ImageChops.subtract(mask, covered).getbbox()
+        assert stray is None, f"the {name} layer has ink outside its bands at {stray}"
     return pieces
 
 
@@ -1287,7 +1344,7 @@ def add_screensaver(builder: "ThemeBuilder") -> None:
         builder.bitmap_field(CH_SCREENSAVER, atlas, colour, x, y)
 
 
-def build_widgets() -> ThemeBuilder:
+def build_widgets(screensaver: bool = True) -> ThemeBuilder:
     builder = ThemeBuilder()
 
     # --- header -----------------------------------------------------------
@@ -1338,11 +1395,23 @@ def build_widgets() -> ThemeBuilder:
                        slash_x + slash_w + SESS_GAP, row_y, digits=2)
 
     # LAST, on purpose: widgets draw in definition order and these cover the rest.
-    add_screensaver(builder)
+    # (``screensaver=False`` is for probe_count.py, which needs the bare dashboard.)
+    if screensaver:
+        add_screensaver(builder)
     return builder
 
 
-def build_bundle(background: Path) -> tuple[ThemeBundle, "ThemeBuilder"]:
+def bake_into_background(path: Path, builder: "ThemeBuilder") -> None:
+    """Paint the builder's baked labels onto the saved background image."""
+    if not builder.baked:
+        return
+    image = Image.open(path).convert("RGB")
+    for mask, x, y, colour in builder.baked:
+        image.paste(Image.new("RGB", mask.size, _rgb(colour)), (x, y), mask)
+    image.save(path)
+
+
+def build_bundle(background: Path, builder: "ThemeBuilder | None" = None) -> tuple[ThemeBundle, "ThemeBuilder"]:
     parent = WidgetParent(
         object_name="panel",
         widget_type=1,
@@ -1356,7 +1425,8 @@ def build_bundle(background: Path) -> tuple[ThemeBundle, "ThemeBuilder"]:
         background_image_path=background.name,
         image_delay=0,
     )
-    builder = build_widgets()
+    builder = builder or build_widgets()
+    bake_into_background(background, builder)
     theme = Theme(path="", widget_parents=[parent], widgets=builder.widgets)
     return ThemeBundle(ui_path="", base_dir=str(background.parent), theme=theme,
                        startup_pic=None), builder
@@ -1542,6 +1612,15 @@ def validate(data: bytes, expected_channels: list[int]) -> dict:
     # matter: the model field is built with its node's heading.)
     # The screensaver's widgets deliberately SHARE CH_SCREENSAVER (hardware-checked
     # 2026-10-19: several widgets on one channel all update), so it is counted once.
+    n_widgets = len([r for r in records if r.record_type in (0x92, 0x93)])
+    for what, have, limit in (("widgets", n_widgets, MAX_WIDGETS),
+                              ("number widgets", len(seen_channels), MAX_NUMBERS),
+                              ("distinct channels", len(set(seen_channels)), MAX_CHANNELS)):
+        if have > limit:
+            problems.append(
+                f"{have} {what}, but the most the panel has been seen to service is {limit}: "
+                "the extras are silently never drawn (and well past it the panel shows only "
+                "'boot') -- see MAX_WIDGETS")
     ss_count = seen_channels.count(CH_SCREENSAVER)
     if ss_count < 2:
         problems.append(f"the screensaver should be several widgets on ch{CH_SCREENSAVER}, "
@@ -1763,12 +1842,21 @@ def validate(data: bytes, expected_channels: list[int]) -> dict:
         )
     if overlay_slots != list(range(overlay_slots[0], overlay_slots[0] + len(overlay_slots))):
         problems.append(f"screensaver slots are not contiguous: {overlay_slots}")
-    first = next((r for r in records if overlay(r)), None)
-    if first is not None:
-        box = _record_box(first)
-        if box != (0, 0, PANEL_W, PANEL_H):
-            problems.append(f"the first screensaver widget should be the full-screen cover, "
-                            f"got box {box}")
+    ss_boxes = [_record_box(r) for r in records if overlay(r)]
+    stripe = PANEL_H // SS_COVER_STRIPES
+    want = [(0, i * stripe, PANEL_W, stripe) for i in range(SS_COVER_STRIPES)]
+    if ss_boxes[:SS_COVER_STRIPES] != want:
+        problems.append(f"the first {SS_COVER_STRIPES} screensaver widgets should be the cover, "
+                        f"tiling the screen as {want}; got {ss_boxes[:SS_COVER_STRIPES]}")
+    for record in records:
+        if record.record_type != 0x92:
+            continue
+        box = _record_box(record)
+        if box and (box[2] > MAX_PROVEN_BOX[0] or box[3] > MAX_PROVEN_BOX[1]):
+            problems.append(
+                f"slot {record.index} (ch{int(record.fields['fast_sensor'])}): box {box[2]}x{box[3]} "
+                f"is bigger than the largest proven on hardware, {MAX_PROVEN_BOX[0]}x{MAX_PROVEN_BOX[1]} "
+                f"-- a 320x480 box made the panel show only 'boot'")
 
     emblem_report = _check_emblems(data, records, problems)
 
@@ -1891,12 +1979,22 @@ def _check_emblems(data: bytes, records: list, problems: list[str]) -> list[str]
             f"(solid mean R{mean_r:.0f} G{mean_g:.0f} B{mean_b:.0f})"
         )
 
-    # The area behind the title must stay flat, or the text loses contrast.
+    # Nothing but the title may be in the title's box.  The title is baked into the
+    # background now (see ThemeBuilder.bake_labels), so the box is no longer flat navy
+    # -- it is navy plus the title's own antialiasing.  Every pixel must therefore lie
+    # on the line from the field colour to the title colour; anything off it is art
+    # that has wandered in, and would cost the text its contrast.
     title_box = TITLE_INK_BOX
     if title_box[2] > title_box[0]:
-        behind = set(_pixels(background.crop(title_box)))
-        if behind != {navy}:
-            problems.append(f"background behind the title is not flat navy: {sorted(behind)[:4]}")
+        amber = quantise_rgb565(AMBER)
+        span = [a - n for a, n in zip(amber, navy)]
+        for pixel in set(_pixels(background.crop(title_box))):
+            t = (pixel[0] - navy[0]) / span[0]
+            expected = [n + t * d for n, d in zip(navy, span)]
+            if not -0.05 <= t <= 1.05 or any(abs(p - e) > 14 for p, e in zip(pixel, expected)):
+                problems.append(f"background behind the title has {pixel}, which is neither the "
+                                f"navy field nor the title's own colour")
+                break
 
     # Every number widget repaints its whole box when its value changes, so
     # background chrome underneath it is liable to be erased.  The layout has
