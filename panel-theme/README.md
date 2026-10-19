@@ -69,16 +69,27 @@ Then, in order:
    that basis. If it fails, rebuild with `./package.sh`; skipping *that* is what
    produced `OTHER TP2` twice (2026-09-02, 2026-09-14).
 
-   ⚠️ As of 2026-10-12 `./package.sh` **cannot run on this Mac**: `@State` is a
-   macro in the current SDK and its plugin (`libSwiftUIMacros`) ships only with
-   full Xcode, which is not installed — `xcode-select` points at
-   CommandLineTools, whose plugin dir has only `libObservationMacros` and
-   `libSwiftMacros`. Every `@State` then fails with "external macro
-   implementation type ... could not be found", and the *cascade* looks like
-   ordinary code errors in whichever file uses the property next ("cannot find
-   '$loadError' in scope"), so it reads as a broken commit rather than a broken
-   toolchain. Installing Xcode and `sudo xcode-select -s` is the fix. Until
-   then the panel is pinned to whatever contract the installed binary has.
+   `./package.sh` needs the **full Xcode toolchain**, not just the command-line
+   tools: `@State` is a macro in the current SDK, and its plugin
+   (`libSwiftUIMacros`) ships only with Xcode — CommandLineTools has just
+   `libObservationMacros` and `libSwiftMacros`. With only CommandLineTools selected
+   every `@State` fails with "external macro implementation type ... could not be
+   found", and the *cascade* looks like ordinary code errors in whichever file uses
+   the property next ("cannot find '$loadError' in scope"), so it reads as a broken
+   commit rather than a broken toolchain.
+
+   You do **not** need `sudo xcode-select -s` to get past it. Point the one command
+   at Xcode instead:
+
+   ```bash
+   DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer ./package.sh
+   ```
+
+   (Built cleanly on 2026-10-19 with CommandLineTools still selected, and without
+   any prompt.) `package.sh` assembles `Starfleet Command.app` in the directory it
+   runs from and leaves any installed copy alone, so to deploy a build made
+   elsewhere — a worktree, say — quit the app and replace the installed bundle with
+   it, keeping the old one until you have seen the new one run.
 3. **Proof of life** before spending 90 s on an upload: push a datetime report
    with brightness 5, then 100. The backlight is the only field that works
    regardless of which theme is loaded, so a visible pulse proves your packets
