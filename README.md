@@ -22,6 +22,11 @@ front of 39 models and **Fleet**, a window in the app, as the control surface.
   └──────────────────────────────┘             └───────────────────────────────────┘
 ```
 
+<p align="center">
+  <img src="docs/images/fleet-window.png" width="820" alt="The Fleet window: per-node status across the top, and below it the model registry, where every model has a Machine picker, a context size, a thinking effort and Pin/Unload">
+  <br><sub><b>Fleet</b>, the control surface — per-node status above, the model registry below.</sub>
+</p>
+
 ---
 
 ## What it does
