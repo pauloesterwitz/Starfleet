@@ -1,36 +1,52 @@
-# Starfleet
+# Starfleet Command
 
-One macOS app (**Starfleet Command**) for a small home GPU cluster: three
-read-only monitoring surfaces — a **menu bar** dropdown, a **floating desktop
-widget**, and a **physical 3.5" USB panel** on the desk — plus **Fleet**, a
-window for actively pinning which models stay resident.
+A macOS app for running a small home cluster of GPU machines as one LLM service.
+It lets you decide which models stay resident, on which machine, at what context
+size and with what thinking effort — and the cluster tooling behind it **refuses a
+load the machine cannot hold** instead of letting it OOM. While it does that it
+keeps an eye on the cluster: a menu bar glyph, a floating desktop widget and, if
+you build one, a small USB panel on the desk.
 
-It watches two NVIDIA DGX Spark nodes over SSH — GPU load, temperature, power,
-memory, which models `llama-swap` currently has resident, and which coding-agent
-sessions are running on them — and reports all of it at a glance.
+It is built around two NVIDIA DGX Spark nodes, **Jean-Luc** and **Kathryn** — so the
+fleet is Starfleet — with [llama-swap](https://github.com/mostlygeek/llama-swap) in
+front of 39 models and **Fleet**, a window in the app, as the control surface.
+
+```
+  Mac                                           Spark nodes
+  ┌──────────────────────────────┐             ┌───────────────────────────────────┐
+  │ Starfleet Command.app        │   HTTP      │ Jean-Luc (head)                   │
+  │   Fleet window ──────────────┼────────────▶│   fleet-ui ─▶ llama-swap          │
+  │                              │             │                 ├─ memcheck       │
+  │   menu bar · desktop widget  │    ssh      │                 └─ ctxproxy       │
+  │   (+ optional USB panel)  ───┼────────────▶│ Kathryn (worker)                  │
+  └──────────────────────────────┘             └───────────────────────────────────┘
+```
 
 <p align="center">
-  <img src="panel-theme/theme_preview.png" width="260" alt="The USB panel showing per-node stats and agent sessions">
+  <img src="docs/images/fleet-window.png" width="820" alt="The Fleet window: per-node status across the top, and below it the model registry, where every model has a Machine picker, a context size, a thinking effort and Pin/Unload">
+  <br><sub><b>Fleet</b>, the control surface — per-node status above, the model registry below.</sub>
 </p>
-
-Named after the cluster it watches: the nodes are **Jean-Luc** and **Kathryn**,
-so the fleet is Starfleet.
 
 ---
 
-## The four surfaces
+## What it does
 
-| Surface | What it's for |
-| --- | --- |
-| **Menu bar** | Always-visible health glyph + a `⚡N` count of actively-generating sessions. Click for the full per-host breakdown, expandable session transcripts, and settings. |
-| **Desktop widget** | A borderless always-on-top panel with the same live data, for when you want it visible without clicking. Drag anywhere; position persists. |
-| **USB IPS panel** | A physical 320×480 LCARS-styled readout on the desk. Costs no extra SSH — it feeds off the same pollers. |
-| **Fleet** | A window ("Open Starfleet Command…" in the menu bar dropdown) for browsing every model and pinning one to keep it resident — see [below](#fleet--pin-models-from-a-window). The only one of the four that's a control surface, not read-only. |
-
-The first three share one set of `StatusPoller`s, so adding a surface adds
-**zero** polling load on the cluster. Fleet talks to a separate backend
-(`fleet-ui/`, running on the head node) since pinning is a fundamentally
-different job from monitoring.
+- **Manages the models.** Search the catalogue, pin a model so it stays resident,
+  choose which machine it runs on, set its context size and thinking effort, watch a
+  load's progress and cancel it. → [Fleet](#fleet--managing-the-models-from-a-window)
+- **Protects the machines.** Every load goes through a memory check that knows what
+  is free *and* what is already promised to a running image or video job, reaps
+  orphaned tensor-parallel clusters, and refuses cleanly rather than OOMing.
+  → [The memory guard](#the-memory-guard--admission-control-before-every-load)
+- **Keeps the configuration honest.** The cluster's llama-swap config, launchers and
+  guards live in this repo (`cluster/`), with a sync tool that compares them with the
+  nodes before it overwrites anything. → [Repo layout](#repo-layout)
+- **Watches the cluster.** GPU load, temperature, power and memory per node, which
+  models are resident, and which coding-agent sessions are running — in the menu bar
+  and on a desktop widget, with a notification when a session stalls.
+  → [Watching the cluster](#watching-the-cluster)
+- **Add-on: a USB panel for the desk.** A little LCARS readout, entirely optional.
+  → [Add-on: the USB panel](#add-on-a-usb-panel-for-the-desk)
 
 ---
 
@@ -114,7 +130,90 @@ enforce: `microsoft/harrier-oss-v1-0.6b` is wired as `harrier-embed-0.6b` for
 exactly that reason. Choosing the name is free; teaching two filters a list of
 exceptions is not.
 
-### Memory-aware admission control: memcheck.sh
+---
+
+## Fleet — managing the models from a window
+
+**Fleet** is the control surface, and the part of Starfleet Command that does the
+work. It is a window inside the app (`FleetView.swift`, a `WKWebView`) around
+**[`fleet-ui`](fleet-ui)**, a single-file stdlib-only Python dashboard that runs on
+the head node and drives llama-swap. It opens on demand — "Open Starfleet Command…"
+in the menu bar dropdown — rather than at launch: the app is normally a menu-bar-only
+accessory process with no Dock icon, and becomes a regular app (Dock icon, `⌘`-Tab
+entry) only while the Fleet window is open, reverting the moment it closes.
+
+From it you can:
+
+- **Browse the whole catalogue** — search, and filter by node, Starfleet TP2, Auto,
+  Resident, Pinned, Vision, Embeddings, Rerankers or Image — with each model's
+  measured tok/s.
+- **See each node**: RAM, GPU, temperature, power, load and running containers.
+- **Pin** a model so it stays resident ([what that guarantees](#what-pin-actually-guarantees)).
+- **Choose where a model runs.** A model deployed on more than one machine gets a
+  Machine picker — Jean-Luc, Kathryn, or Auto (whichever Spark has the most free
+  memory right now) — and pin, context, effort and load all apply to the machine
+  picked. TP=2 members span both nodes by definition, so there is nothing to pick.
+- **Set the context size** per model. **Max** is the largest context the model can
+  really serve — the smaller of the checkpoint's window and the KV pool measured on
+  its first load — not merely what the checkpoint declares. vLLM allocates the pool
+  at startup, so a change is one cold reload away; there is no live resize. See
+  [Context is its own budget](#context-is-its-own-budget).
+- **Set thinking effort**, where the model offers it: only the options that
+  checkpoint's chat template actually accepts are shown, and a model with no such
+  control shows nothing to pick. It takes effect by evicting the model, so it comes
+  back with the new default.
+- **Watch a load, and cancel it.** Progress is read from the engine's own log, the
+  ETA is the median of that model's last five cold loads, and cancelling unpins first
+  — otherwise the keepalive would put the model straight back.
+- **See how a member is started**: the vision flag reflects what it is *started*
+  with, not what the checkpoint could do.
+- **Run image models alongside the language models**: the ComfyUI "Image Creation"
+  rows have their own node placement, warm-up and unload.
+
+The backend also exposes the GPU job queue (a `pueue` queue and per-node capacity)
+at `/api/jobs`.
+
+### What "pin" actually guarantees
+
+llama-swap's own idle `ttl` and swap-group exclusivity (see above) still fully
+apply — Fleet doesn't and shouldn't override them, since group exclusivity is
+deliberate, memory-driven config (e.g. the `starfleet` group is `swap: true`
+because only one TP=2 model can occupy both Sparks at once). Instead, Fleet
+treats "pinned" as "bring it straight back the instant it's gone, no matter
+why it left":
+
+- A 5-second watchdog checks every pinned model against `/running`. Missing —
+  because its ttl lapsed, *or* because a different member of its swap group
+  got requested and evicted it — triggers an immediate reload, not a wait for
+  the next tick.
+- Each reload runs in its own thread. A slow cold load (TP=2 can take 20+
+  minutes) no longer blocks refreshing every *other* pin, which is what the
+  original single-threaded, one-at-a-time loop did.
+- A model that's still resident just gets a periodic ttl-refresh touch
+  (`GET /upstream/<model>/health`), well inside the shortest configured ttl.
+
+### Setup
+
+1. Copy `fleet-ui/fleet.py` and `fleet-ui/fleet.html` to the head node and run
+   `python3 fleet.py` (binds the Tailscale IP by default so it's reachable
+   from your Mac but not the LAN; see `default_host()`). A systemd user unit
+   works well for keeping it up across reboots.
+2. Point [`Sources/OpencodeMonitor/FleetView.swift`](Sources/OpencodeMonitor/FleetView.swift)'s
+   `fleetURL` and [`Sources/OpencodeMonitor/Info.plist`](Sources/OpencodeMonitor/Info.plist)'s
+   `NSExceptionDomains` entry at your own head node's address — fleet-ui serves
+   plain HTTP, so that ATS exception is what lets `WKWebView` load it.
+3. Build with `./package.sh`, same as the rest of the app (see below) — Fleet
+   ships inside `Starfleet Command.app`, not as its own bundle.
+
+---
+
+## The memory guard — admission control before every load
+
+The most important thing the cluster tooling does is **say no**. Thirty-nine models
+share ~121 GiB per node, and the failure mode of an unguarded load is an OOM kill
+mid-load, taking whatever else was resident with it. So every load passes a
+preflight gate first, and the guard rails around it were earned by real incidents,
+described below.
 
 llama-swap has no built-in idea how much memory a host actually has free before
 starting a model — there's an open ask for exactly that
@@ -153,6 +252,36 @@ systemd unit) — so llama-swap never thinks it owns something it didn't start.
 Full write-up, incident-by-incident: see the source comments in
 [`memcheck.sh`](cluster/llama-swap/memcheck.sh) and
 [`ds4-tp2-proxy-guard.sh`](cluster/llama-swap/ds4-tp2-proxy-guard.sh).
+
+---
+
+## Context is its own budget
+
+Fitting the weights is only half of it. A long context is bought with KV cache,
+and on a fixed pool that trade has to be made explicitly.
+
+Some of it is not a memory question at all. Qwen3.8-Flash-Next stops at 262,144
+tokens because of a **positional** wall, not a memory one — at mem-fraction 0.80
+its KV pool already holds ~690k tokens, so 512k costs nothing extra. A YaRN
+factor-2.0 rope override doubles the window, and that is the whole difference
+between `qwen38fn-sglang-tp2-starfleet` and its `-long` sibling. Measured at
+479,655 prompt tokens (1.83× native): needles at depths 0.10/0.50/0.90 recalled
+3/3 exactly. The cost is speed, not capacity — ~23.7 tok/s against the 262k
+member's 48.9. Roughly half, which is precisely why both members exist rather
+than one.
+
+GLM-5.3-Flash is the opposite case: there the context genuinely is a memory
+budget, and three hardcoded numbers (`NEED`, `MEMFRAC`, `CTX`) kept disagreeing
+with each other and with the machine. [`glm-size.py`](cluster/llama-swap/glm-size.py)
+replaces them — given the context actually being requested it returns the
+mem-fraction, the admission requirement, and `--max-total-tokens`, all three
+derived from one model of the pool. That last flag is not optional: left to
+itself SGLang once sized a KV cache of 1,182,720 tokens for a 32k member.
+
+Per-member context lives in `~/.gb10/ctx/<member>`, so a window can be changed
+without editing `config.yaml` — which matters more than it sounds, because
+writing that file triggers llama-swap's `-watch-config` reload and evicts every
+resident model, and a cold TP=2 load runs 26–41 minutes.
 
 ---
 
@@ -237,86 +366,53 @@ Two corollaries:
 
 ---
 
-## Context is its own budget
+## Watching the cluster
 
-Fitting the weights is only half of it. A long context is bought with KV cache,
-and on a fixed pool that trade has to be made explicitly.
+Starfleet Command also watches the cluster, read-only, over SSH: GPU load,
+temperature, power and memory per node, which models `llama-swap` currently has
+resident, and which coding-agent sessions (Claude Code and opencode) are running and
+what state they are in.
 
-Some of it is not a memory question at all. Qwen3.8-Flash-Next stops at 262,144
-tokens because of a **positional** wall, not a memory one — at mem-fraction 0.80
-its KV pool already holds ~690k tokens, so 512k costs nothing extra. A YaRN
-factor-2.0 rope override doubles the window, and that is the whole difference
-between `qwen38fn-sglang-tp2-starfleet` and its `-long` sibling. Measured at
-479,655 prompt tokens (1.83× native): needles at depths 0.10/0.50/0.90 recalled
-3/3 exactly. The cost is speed, not capacity — ~23.7 tok/s against the 262k
-member's 48.9. Roughly half, which is precisely why both members exist rather
-than one.
+| Surface | What it is |
+| --- | --- |
+| **Menu bar** | An always-visible health glyph with a `⚡N` count of actively-generating sessions. Click for the full per-host breakdown, expandable session transcripts and settings. A notification fires when a session stalls. |
+| **Desktop widget** | A borderless always-on-top panel with the same live data, for when you want it visible without clicking. Drag anywhere; position persists. |
 
-GLM-5.3-Flash is the opposite case: there the context genuinely is a memory
-budget, and three hardcoded numbers (`NEED`, `MEMFRAC`, `CTX`) kept disagreeing
-with each other and with the machine. [`glm-size.py`](cluster/llama-swap/glm-size.py)
-replaces them — given the context actually being requested it returns the
-mem-fraction, the admission requirement, and `--max-total-tokens`, all three
-derived from one model of the pool. That last flag is not optional: left to
-itself SGLang once sized a KV cache of 1,182,720 tokens for a 32k member.
-
-Per-member context lives in `~/.gb10/ctx/<member>`, so a window can be changed
-without editing `config.yaml` — which matters more than it sounds, because
-writing that file triggers llama-swap's `-watch-config` reload and evicts every
-resident model, and a cold TP=2 load runs 26–41 minutes.
+Both share one set of `StatusPoller`s, so adding a surface adds **no** polling load
+on the cluster. The details, and the known limits, are in
+[`docs/menu-bar-app.md`](docs/menu-bar-app.md).
 
 ---
 
-## Fleet — pin models from a window
+## Add-on: a USB panel for the desk
 
-**Fleet** is a window inside Starfleet Command (`FleetView.swift`, a `WKWebView`)
-around **[`fleet-ui`](fleet-ui)**, a single-file stdlib-only Python dashboard
-that runs on the head node. Opened on demand — "Open Starfleet Command…" in the menu bar
-dropdown — rather than shown at launch: the app is normally a menu-bar-only
-accessory process with no Dock icon, and switches to a regular app (Dock icon,
-`⌘`-Tab entry) only for as long as the Fleet window is open, reverting the
-moment it's closed.
+Nothing above needs it — it is a toy, and a good one. A 3.5″ 320×480 USB panel
+(`0483:0065`) sits on the desk and shows the cluster in LCARS styling: per-node GPU
+load, temperature, RAM and power; the model resident on each node (`QWEN 3.8`,
+`DEEPSEEK TP2`, …); and the two most recently active agent sessions.
 
-Fleet is the control surface for the cluster: search the whole model
-catalogue, see which node(s) a model occupies and its measured tok/s, watch
-per-node RAM/GPU/temp/power/load and running containers, and **pin** a model
-so it stays resident.
+<p align="center">
+  <img src="panel-theme/theme_preview.png" width="230" alt="The USB panel showing per-node stats, the resident model and agent sessions">
+  &nbsp;&nbsp;
+  <img src="panel-theme/theme_preview_screensaver.png" width="230" alt="The panel's Incoming Transmission screen">
+</p>
 
-### What "pin" actually guarantees
+When no Spark is reachable, or the Mac is locked, it switches to an **"Incoming
+Transmission"** screen — which doubles as its loading screen at launch — and comes
+back to the dashboard when there is something to show. GPU figures are streamed about
+twice a second; everything else feeds off the same pollers as the menu bar. That
+stream is the panel's one extra cost: a standing SSH connection and an `nvidia-smi`
+loop per node, and only while the panel is on.
 
-llama-swap's own idle `ttl` and swap-group exclusivity (see above) still fully
-apply — Fleet doesn't and shouldn't override them, since group exclusivity is
-deliberate, memory-driven config (e.g. the `starfleet` group is `swap: true`
-because only one TP=2 model can occupy both Sparks at once). Instead, Fleet
-treats "pinned" as "bring it straight back the instant it's gone, no matter
-why it left":
-
-- A 5-second watchdog checks every pinned model against `/running`. Missing —
-  because its ttl lapsed, *or* because a different member of its swap group
-  got requested and evicted it — triggers an immediate reload, not a wait for
-  the next tick.
-- Each reload runs in its own thread. A slow cold load (TP=2 can take 20+
-  minutes) no longer blocks refreshing every *other* pin, which is what the
-  original single-threaded, one-at-a-time loop did.
-- A model that's still resident just gets a periodic ttl-refresh touch
-  (`GET /upstream/<model>/health`), well inside the shortest configured ttl.
-
-### Setup
-
-1. Copy `fleet-ui/fleet.py` and `fleet-ui/fleet.html` to the head node and run
-   `python3 fleet.py` (binds the Tailscale IP by default so it's reachable
-   from your Mac but not the LAN; see `default_host()`). A systemd user unit
-   works well for keeping it up across reboots.
-2. Point [`Sources/OpencodeMonitor/FleetView.swift`](Sources/OpencodeMonitor/FleetView.swift)'s
-   `fleetURL` and [`Sources/OpencodeMonitor/Info.plist`](Sources/OpencodeMonitor/Info.plist)'s
-   `NSExceptionDomains` entry at your own head node's address — fleet-ui serves
-   plain HTTP, so that ATS exception is what lets `WKWebView` load it.
-3. Build with `./package.sh`, same as the rest of the app (see below) — Fleet
-   ships inside `Starfleet Command.app`, not as its own bundle.
+It is a USB HID "sensor panel", *not* a display: it stores a compiled theme in flash
+and renders locally while the app pushes numbers on 22 channels. Building and flashing
+the theme — the protocol, the theme format, what the firmware will and will not do —
+is in **[panel-theme/README.md](panel-theme/README.md)**. Once flashed, tick **"Send
+to USB panel"** in the dropdown; a brightness slider appears next to it.
 
 ---
 
-## Setting this up for your own cluster
+## Setting it up for your own cluster
 
 ### 1. On each node
 
@@ -387,14 +483,7 @@ it to `/Applications`. Use the `.app` rather than `swift run` — notifications 
 
 ### 6. Optional: the USB panel
 
-See **[panel-theme/README.md](panel-theme/README.md)** for the full story. Short
-version: it's a 3.5" USB HID "sensor panel" (`0483:0065`), *not* a display — it
-stores a compiled theme in flash and renders locally while the host pushes
-numbers on 22 channels. That README documents the protocol, the theme format,
-and several traps that cost real time to find.
-
-Once flashed, tick **"Send to USB panel"** in the dropdown; a brightness slider
-appears next to it.
+Not needed for anything above — see [Add-on: the USB panel](#add-on-a-usb-panel-for-the-desk).
 
 ---
 
@@ -408,12 +497,15 @@ Sources/OpencodeMonitor/   the app
   ContentView.swift         menu bar dropdown
   FleetView.swift           the Fleet window (WKWebView) + its Dock-icon-on-demand logic
   DesktopWidget*.swift      floating panel
-  Panel*.swift              USB panel driver + controller
-cluster/                   scripts that live on each node
-panel-theme/               offline tooling for the USB panel's theme
-docs/menu-bar-app.md       deep-dive on the app's behaviour and known limits
-assets/                    icon + brand mark generators
+  Panel*.swift, GPUStream.swift   the optional USB panel: driver, controller, streamed GPU figures
+cluster/                   the cluster's configuration and tooling: the llama-swap config and
+                            launchers, the memory guard (memcheck.sh and friends), the per-request
+                            context proxy, the status scripts the app runs over ssh, and
+                            sync-hosts.sh to keep this repo and the nodes in step
 fleet-ui/                  Fleet's backend: fleet.py + fleet.html, copied to the head node
+docs/menu-bar-app.md       deep-dive on the monitoring surfaces and their known limits
+panel-theme/               offline tooling for the optional USB panel's theme
+assets/                    icon + brand mark generators
 ```
 
 ---
