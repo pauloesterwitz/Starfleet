@@ -147,6 +147,9 @@ td .sub{margin-top:3px;font-size:11px;color:var(--dim);line-height:1.35}
   font-weight:700;letter-spacing:.1em;vertical-align:1px}
 .vis.on{background:var(--blue);color:#000}
 .vis.off{background:var(--grid);color:var(--dim)}
+/* embedding modality: MULTIMODAL = takes images + text, TEXT = text only */
+.vis.mm{background:var(--mauve);color:#000}
+.vis.tx{background:var(--grid);color:var(--dim)}
 .err{color:var(--red);font-size:12px;margin-top:3px;white-space:pre-wrap;word-break:break-word;
   letter-spacing:.03em}
 #banner{display:none;background:var(--red);color:#000;padding:7px 16px;border-radius:14px;
@@ -673,7 +676,10 @@ function render(s){
           st=loading?"loading":working?"working":(r?r.state:"stopped");
     if(isImg(m)) return imgRow(m, working);
     return `<tr class="${m.pinned?"pinned":r?"live":""}">
-      <td><div class="mid">${modelName(m.id)}${m.vision?`<span class="vis ${m.vision}" title="${
+      <td><div class="mid">${modelName(m.id)}${isEmbed(m)?(m.vision==="on"
+        ?`<span class="vis mm" title="Multimodal embedder: images and text share one vector space">MULTIMODAL</span>`
+        :`<span class="vis tx" title="Text-only embedder: no image input">TEXT</span>`)
+      :m.vision?`<span class="vis ${m.vision}" title="${
         m.vision==="on"?"Vision tower ACTIVE — this member accepts images"
         :"Has a vision tower, but started text-only (--limit-mm-per-prompt image:0)"
         }">IMG${m.vision==="off"?" OFF":""}</span>`:""}</div>${
