@@ -1,9 +1,14 @@
 [Unit]
 Description=Fleet — llama-swap UI + Starfleet cluster resources
-After=llama-swap.service
-Wants=llama-swap.service
+After=llama-swap.service network-online.target
+Wants=llama-swap.service network-online.target
 
 [Service]
+# ponytail: fleet.py picks its bind address once at startup (default_host ->
+# `tailscale ip -4`). At boot systemd wins the race against tailscaled, the IP is
+# empty, and it silently falls back to 127.0.0.1 — unreachable from the Mac.
+# Wait up to 2 min for the tailnet IP, then start regardless (loopback + ssh -L).
+ExecStartPre=/bin/bash -c 'for i in {1..60}; do tailscale ip -4 | grep -q . && break; sleep 2; done'
 ExecStart=/usr/bin/python3 -u /home/pauloesterwitz/fleet-ui/fleet.py --port 8090
 Restart=on-failure
 RestartSec=5
