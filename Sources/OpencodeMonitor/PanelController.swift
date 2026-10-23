@@ -152,7 +152,7 @@ final class PanelController: ObservableObject {
             case minimax = 4
             case deepseek = 5
             case glm53 = 6
-            case hunyuan = 7
+            case ornith = 7     // was hunyuan until 2026-10-23 (no hy3 member left)
             case aux = 8        // the ~1GB embedding + image-gen containers
             case other = 9      // a family added to llama-swap and not yet here
         }
@@ -222,8 +222,10 @@ final class PanelController: ObservableObject {
                 self.init(brand: .deepseek, variant: .none)
             case id.contains("glm5"):
                 self.init(brand: .glm53, variant: .none)
-            case id.hasPrefix("hy3"):
-                self.init(brand: .hunyuan, variant: .none)
+            // Ornith-1.5-122B (TP=2 across both Sparks, its only member). Hunyuan
+            // (hy3) gave up this cell; if it comes back it shows as OTHER.
+            case id.contains("ornith"):
+                self.init(brand: .ornith, variant: .none)
             // "rerank" added 2026-09-23: bge-reranker-v2-m3 and the Qwen3-Reranker
             // members carry no "embed" in their ids, so without this they fall through
             // to .other. Note the Qwen cases above do NOT catch them -- "qwen3-reranker"

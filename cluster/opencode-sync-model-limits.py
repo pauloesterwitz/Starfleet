@@ -19,6 +19,7 @@ import json, os, sys
 #   serve-nemcascade.sh   MAX_MODEL_LEN=${MML_OVERRIDE:-262144}
 #   ds4/serve-ds4.sh      --ctx 409600
 #   run-ds4-tp2-cluster.sh  MAX_MODEL_LEN=${MAX_MODEL_LEN:-32768}
+#   serve-ornith-tp2.sh   MML=${MML_OVERRIDE:-262144}
 SERVED = {
     "deepseek-v4-flash": 409600,
     "ds4-nvfp4-tp2": 32768,
@@ -32,6 +33,7 @@ SERVED = {
     "nemcascade-49tps-kathryn": 262144,
     "nemcascade-61tps-jean-luc": 262144,
     "nemotron-120b-mtp3-starfleet": 262144,
+    "ornith-1.5-122b-nvfp4-mtp3-starfleet": 262144,
     "qwen3-235b-20tps-starfleet": 40960,
     "qwen3.5-122b-mtp3-starfleet": 262144,
     "qwen3.6-35b-85tps-mtp4-jean-luc": 262144,

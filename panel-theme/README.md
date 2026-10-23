@@ -297,7 +297,7 @@ geometry, so the halves cannot drift apart unnoticed.
 | 4 | MINIMAX | 235B |
 | 5 | DEEPSEEK | 3VL |
 | 6 | GLM5.3 | CASC |
-| 7 | HUNYUAN | OTRON |
+| 7 | ORNITH (HUNYUAN until 2026-10-23) | OTRON |
 | 8 | AUX (embeddings / imagegen) | 31B |
 | 9 | OTHER | TP2 |
 

@@ -653,6 +653,59 @@ models:
     ttl: 3600
     useModelName: harrier-embed-0.6b
 
+  # Qwen/Qwen3-Embedding-0.6B and -4B, added 2026-10-01. TEXT-ONLY, multilingual, instruction-aware
+  # (queries need the "Instruct: <task>\nQuery:<text>" prefix, documents are raw; see serve-embed.sh).
+  # 1024-dim (0.6B) / 2560-dim (4B), L2-normalised. NOT drop-ins for RAG_EMBED_DIM=768 callers.
+  # The 0.6B is co-resident (embeddings group). The 4B (8 GB weights) sits in embeddings-large with
+  # swap:true so picking a machine in Fleet MOVES it instead of leaving a copy on both Sparks.
+  # useModelName on the twins: serve-embed.sh sets --served-model-name to the KEY, not the member name.
+  qwen3-embed-0.6b:
+    cmd: /home/pauloesterwitz/llama-swap/serve-embed.sh qwen3-embed-0.6b --port ${PORT}
+    proxy: http://127.0.0.1:${PORT}
+    checkEndpoint: /health
+    ttl: 3600
+
+  qwen3-embed-0.6b-kathryn:
+    cmd: /home/pauloesterwitz/llama-swap/serve-kathryn-embed.sh qwen3-embed-0.6b --port ${PORT}
+    proxy: http://127.0.0.1:${PORT}
+    checkEndpoint: /health
+    ttl: 3600
+    useModelName: qwen3-embed-0.6b
+
+  qwen3-embed-4b:
+    cmd: /home/pauloesterwitz/llama-swap/serve-embed.sh qwen3-embed-4b --port ${PORT}
+    proxy: http://127.0.0.1:${PORT}
+    checkEndpoint: /health
+    ttl: 3600
+
+  qwen3-embed-4b-kathryn:
+    cmd: /home/pauloesterwitz/llama-swap/serve-kathryn-embed.sh qwen3-embed-4b --port ${PORT}
+    proxy: http://127.0.0.1:${PORT}
+    checkEndpoint: /health
+    ttl: 3600
+    useModelName: qwen3-embed-4b
+
+  # google/embeddinggemma-2, added 2026-10-14. MULTIMODAL embedder (text + image + audio + video into one
+  # 768-d space, Matryoshka 512/256/128), 740M, Apache-2.0, 8K ctx. vLLM 0.27.1 cannot serve it (no
+  # EmbeddingGemma2 architecture), so serve-embed.sh runs serve-mm-embed.py with a transformers overlay
+  # (llama-swap/st-libs, rebuild with build-st-libs.sh). Fleet shows it MULTIMODAL: the checkpoint has a
+  # vision_config and the launcher sets no image-off flag. ASYMMETRIC caller contract, no server-side
+  # prompts: query "task: search result | query: <q>", document "title: none | text: <d>", images as
+  # {"image": "data:image/png;base64,..."} (data: URIs only). 768-d is NOT drop-in for 1024-d (harrier,
+  # qwen3-embed-0.6b) callers: re-embed required. Kathryn twin follows the same useModelName pattern.
+  embeddinggemma2:
+    cmd: /home/pauloesterwitz/llama-swap/serve-embed.sh embeddinggemma2 --port ${PORT}
+    proxy: http://127.0.0.1:${PORT}
+    checkEndpoint: /health
+    ttl: 3600
+
+  embeddinggemma2-kathryn:
+    cmd: /home/pauloesterwitz/llama-swap/serve-kathryn-embed.sh embeddinggemma2 --port ${PORT}
+    proxy: http://127.0.0.1:${PORT}
+    checkEndpoint: /health
+    ttl: 3600
+    useModelName: embeddinggemma2
+
   # ── ComfyUI image backend, moved off the always-on systemd unit and under llama-swap ──
   # so it idle-unloads instead of sitting resident forever (Paul asked for 2h auto-pause,
   # 2026-07-20). Own group below (own container, doesn't compete for GB10 pool with LLMs).
@@ -661,6 +714,22 @@ models:
     proxy: http://127.0.0.1:8188
     checkEndpoint: /system_stats
     ttl: 7200
+
+  # Ornith-1.5-122B-NVFP4 (ornith-ai; ModelOpt mixed NVFP4 + FP8, Qwen3.5-122B-A10B architecture) across BOTH Sparks,
+  # tensor parallel 2 over Ray + RoCE, like every starfleet member. Added 2026-10-23 on Paul's instruction ("Load
+  # Ornith, pin it and run the bench", then "Make sure it loads as TP2"). Replaces the single-node member of the
+  # same day (serve-ornith.sh, kept unwired as a fallback). Recipe from the same-day eager smoke test: MTP K=3, FP8 KV,
+  # text-only. CUDA graphs in PIECEWISE mode: FULL_AND_PIECEWISE hangs on 2x GB10 TP=2 (vllm#40969, reproduced in
+  # serve-starfleet.sh). ENFORCE_EAGER=1 in serve-ornith-tp2.sh is the fallback. Image vllm-ray:0.27.1 on both nodes.
+  ornith-1.5-122b-nvfp4-mtp3-starfleet:
+    cmd: /home/pauloesterwitz/llama-swap/ctx-env.sh ornith-1.5-122b-nvfp4-mtp3-starfleet /home/pauloesterwitz/llama-swap/serve-ornith-tp2.sh --port ${PORT}
+    proxy: http://127.0.0.1:${PORT}
+    checkEndpoint: /health
+    ttl: 28800
+    useModelName: ornith-1.5-122b-nvfp4-mtp3-starfleet
+    aliases:
+      - ornith-1.5-122b
+      - Ornith-1.5-122B-NVFP4
 
 routing:
   router:
@@ -733,6 +802,7 @@ routing:
           exclusive: false
           members:
             - qwen3.5-122b-mtp3-starfleet
+            - ornith-1.5-122b-nvfp4-mtp3-starfleet   # 2026-10-23: TP=2 on both Sparks, serve-ornith-tp2.sh
             - qwen3-235b-20tps-starfleet
             - minimax-awq-35tps-starfleet
             - gemma4-31b-19tps-starfleet
@@ -760,6 +830,18 @@ routing:
             - embeddinggemma-kathryn
             - harrier-embed-0.6b
             - harrier-embed-0.6b-kathryn
+            - qwen3-embed-0.6b
+            - qwen3-embed-0.6b-kathryn
+            - embeddinggemma2
+            - embeddinggemma2-kathryn
+        # Large embedders: swap:true = one copy at a time, so choosing a machine moves it.
+        # exclusive:false, the per-key memcheck in serve-embed.sh is the fit authority.
+        embeddings-large:
+          swap: true
+          exclusive: false
+          members:
+            - qwen3-embed-4b
+            - qwen3-embed-4b-kathryn
         # RERANKERS — split out of `embeddings` 2026-09-23 when the Qwen3 rerankers arrived.
         # Two reasons they are not embedders:
         #   swap:TRUE (the embeddings group is swap:false). A reranker is a CHOICE, not a

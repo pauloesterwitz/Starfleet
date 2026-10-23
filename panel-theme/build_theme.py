@@ -305,8 +305,10 @@ ATLAS_PUNCT = "-"           # atlas cells 10/11: the '.' and '-' slots
 # Between them these cover every member of the 28-model roster -- OTHER is a
 # tripwire for a family added to llama-swap and not yet added here, not a
 # bucket anything currently falls into.  Keep in sync with PanelController.swift.
+# Cell 7 was HUNYUAN until 2026-10-23: no hy3 member is served any more, and
+# the ten-cell ceiling leaves no free cell for Ornith-1.5-122B otherwise.
 MODEL_BRANDS = ("—", "QWEN", "GEMMA4", "NEM", "MINIMAX",
-                "DEEPSEEK", "GLM5.3", "HUNYUAN", "AUX", "OTHER")
+                "DEEPSEEK", "GLM5.3", "ORNITH", "AUX", "OTHER")
 MODEL_VARIANTS = ("", "3.5", "3.6", "3.8", "235B",
                   "3VL", "CASC", "OTRON", "31B", "TP2")
 

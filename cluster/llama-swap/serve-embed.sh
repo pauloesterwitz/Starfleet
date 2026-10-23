@@ -80,6 +80,30 @@ case "$KEY" in
     EXTRA=(--convert embed)
     ;;
 
+  qwen3-embed-0.6b|qwen3-embed-4b)
+    # Qwen/Qwen3-Embedding-0.6B and -4B, added 2026-10-01. TEXT-ONLY embedders (no image input;
+    # Fleet shows them with a TEXT badge). Qwen3ForCausalLM checkpoints with LAST-token pooling and
+    # L2 normalise, so --convert embed wraps them. 1024-dim (0.6B) / 2560-dim (4B), 32k native
+    # context, Matryoshka (truncate then re-normalise client-side). Multilingual, 100+ languages.
+    # KEYS carry "embed" so fleet-ui's Embeddings filter (/embed/i) picks them up.
+    #
+    # CALLER CONTRACT: ASYMMETRIC, like harrier. Queries are prefixed
+    #   "Instruct: <task description>\nQuery:<text>"      (no space after "Query:")
+    # and documents are embedded RAW. vLLM applies no prompt server-side; an unprefixed query
+    # silently costs retrieval quality (Qwen reports 1-5%) instead of erroring.
+    #
+    # GPUFRAC is a fraction of the TOTAL pool and vLLM claims it unconditionally, so NEED_MB sits
+    # above it (same reasoning as the rerankers). max-model-len 16384 keeps KV small: the 32k
+    # native window would only size cache for chunks no RAG call sends.
+    if [ "$KEY" = qwen3-embed-4b ]; then
+      BASE="/models/Qwen3-Embedding-4B"; NEED_MB=18000; GPUFRAC=0.12    # 8.0 GB weights, 14.5 GB reserved
+    else
+      BASE="/models/Qwen3-Embedding-0.6B"; NEED_MB=9000; GPUFRAC=0.06   # 1.2 GB weights, 7.3 GB reserved
+    fi
+    POOLER='{"pooling_type": "LAST", "use_activation": true}'
+    EXTRA=(--convert embed --max-model-len 16384)
+    ;;
+
   qwen3-reranker-8b|qwen3-reranker-4b)
     # Qwen3-Reranker, added 2026-09-23. NOT a native cross-encoder like bge-reranker-v2-m3:
     # upstream ships a CAUSAL LM (Qwen3ForCausalLM) that ranks by comparing the "yes" and "no"
@@ -133,8 +157,31 @@ case "$KEY" in
            --hf-overrides '{"architectures":["Qwen3ForSequenceClassification"],"classifier_from_token":["no","yes"],"is_original_qwen3_reranker":true}')
     ;;
 
+  embeddinggemma2)
+    # google/embeddinggemma-2, added 2026-10-14. MULTIMODAL (text + image + audio + video into one
+    # 768-d space, Matryoshka 512/256/128), 740M params, ~1.5 GB bf16, Apache-2.0, 8K context.
+    # NOT served by vLLM: v0.27.1 registers no EmbeddingGemma2 architecture and its transformers
+    # (5.15) predates the model. So this key launches serve-mm-embed.py inside the SAME vllm image
+    # with transformers 5.19 + sentence-transformers 6.1 overlaid from ~/llama-swap/st-libs. Retire the
+    # overlay once vLLM registers the architecture, and move the key back to the vLLM path above.
+    #
+    # CALLER CONTRACT — asymmetric AND multimodal, and the server applies no prompts:
+    #   query     "task: search result | query: <text>"
+    #   document  "title: none | text: <content>"
+    #   image     {"image": "data:image/png;base64,..."}  (data: URIs only, nothing is fetched)
+    # See the docstring in serve-mm-embed.py. `dimensions` is re-normalised after truncation.
+    #
+    # Memory: weights ~1.5 GB; GPUFRAC is a HARD torch cap inside the container, not a vLLM-style
+    # pool claim, so 0.05 (6.1 GB) covers the vision tower's activations with room to spare.
+    # NEED_MB sits above it. Key carries "embed" so fleet-ui's Embeddings filter picks it up, and
+    # the checkpoint has a vision_config, so fleet-ui reads it as MULTIMODAL with no flag needed.
+    BASE="/models/embeddinggemma-2"; NEED_MB=9000; GPUFRAC=0.05
+    MM_SERVER=1
+    EXTRA=(--max-model-len 8192)
+    ;;
+
   *)
-    echo "serve-embed: unknown key '$KEY' (want: nomic-embed-text | embeddinggemma | bge-reranker-v2-m3 | harrier-embed-0.6b | qwen3-reranker-8b | qwen3-reranker-4b)" >&2
+    echo "serve-embed: unknown key '$KEY' (want: nomic-embed-text | embeddinggemma | bge-reranker-v2-m3 | harrier-embed-0.6b | qwen3-embed-0.6b | qwen3-embed-4b | qwen3-reranker-8b | qwen3-reranker-4b | embeddinggemma2)" >&2
     exit 2
     ;;
 esac
@@ -150,6 +197,14 @@ GPUFRAC="${GPUFRAC_ENV:-$GPUFRAC}"
 # flag the L2 norm is 1.000000.
 POOLER="${POOLER:-{\"use_activation\": true\}}"
 
+# torch.compile cache, mounted from the host because the container is --rm: without this every
+# load recompiles the model from zero. Measured 2026-09-23 on qwen3-reranker-8b: weights took
+# 139s, the rest of a 5m45s cold start was compile and CUDA-graph capture. vLLM keys the cache by
+# a hash of model + config, so all keys share this one directory without colliding. Harmless for
+# the ~1 GB embedders (they compile in seconds); it is the 8 GB and 16 GB rerankers that need it.
+CACHE="$HOME/.cache/vllm-embed"
+mkdir -p "$CACHE"
+
 docker rm -f "$NAME" >/dev/null 2>&1 || true
 cleanup() { echo "serve-embed: stopping $NAME" >&2; docker stop -t 10 "$NAME" >/dev/null 2>&1 || true; }
 trap cleanup EXIT INT TERM HUP
@@ -161,6 +216,7 @@ trap cleanup EXIT INT TERM HUP
 CMD=(docker run --rm --name "$NAME" --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=all --ipc=host --init
     -p 127.0.0.1:"${PORT}":8000
     -v "$MODELS":/models:ro
+    -v "$CACHE":/root/.cache/vllm
     "$IMAGE"
     "$BASE"
       --runner pooling
@@ -169,6 +225,19 @@ CMD=(docker run --rm --name "$NAME" --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=a
       "${EXTRA[@]}"
       --gpu-memory-utilization "$GPUFRAC"
       --host 0.0.0.0 --port 8000)
+
+# Keys that vLLM cannot serve (MM_SERVER=1) replace the stock command with serve-mm-embed.py run in
+# the same image. The first /models/<dir> in this argv is what fleet-ui reads as the checkpoint.
+if [ -n "${MM_SERVER:-}" ]; then
+  CMD=(docker run --rm --name "$NAME" --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=all --ipc=host --init
+      -p 127.0.0.1:"${PORT}":8000
+      -v "$MODELS":/models:ro
+      -v "$HOME/llama-swap/st-libs":/libs:ro
+      -v "$HOME/llama-swap/serve-mm-embed.py":/serve.py:ro
+      -e PYTHONPATH=/libs -e MODEL_DIR="$BASE" -e SERVED_NAME="$NAME" -e GPUFRAC="$GPUFRAC"
+      --entrypoint python3
+      "$IMAGE" /serve.py --port 8000 "${EXTRA[@]}")
+fi
 
 # ponytail: DRYRUN=1 prints the argv and exits — the self-check for the case table above, runnable
 # with no GPU and no pool pressure. `DRYRUN=1 ./serve-embed.sh <key> --port 8000` per key.
