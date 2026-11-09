@@ -1,3 +1,5 @@
+apiKeys:
+  - "${env.PROXY_KEY}"
 # llama-swap — DGX Spark GB10 (121 GiB unified pool)
 # One OpenAI-compatible endpoint arbitrating the GB10 pool between:
 #   - spark-big  (ds4): EXCLUSIVE, one at a time — never co-resident with anything.

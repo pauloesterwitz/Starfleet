@@ -64,13 +64,25 @@ state="${GB10_STATE_DIR:-$HOME/.gb10}"
 #     to a dynamic ${PORT}, THIS PROBE MUST READ THE PORT BACK FROM THE CONTAINER the way the
 #     sglang block below does - otherwise it will find nothing on a healthy cluster and reap
 #     ~90 GiB x2 of live model. The sglang block hit exactly that bug by hardcoding 8100.
+#   - FIXED 2026-11-03: that happened. The Ornith member (serve-ornith-tp2.sh, same ds4-tp2-head
+#     container, llama-swap's dynamic --port) was reaped while healthy when bge-reranker loaded.
+#     The port is now read from the vLLM process inside the head (`docker top`; `ray start` uses
+#     `--port=N` so the "--port N" match only hits the server), and an unreadable port or a head
+#     younger than 30 min (cold start is 10-15) means NO reap (fail safe, like the sglang block).
+#     POLICY 2026-11-03 (Paul): PINNED models are never evicted by a new load. Every reap below
+#     was turned into a REFUSAL (exit 1): a false orphan now costs one aborted load, not a cluster.
+_ds4_port=8000
 if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx ds4-tp2-head; then
-  if ! curl -sf -m 5 http://127.0.0.1:8000/v1/models >/dev/null 2>&1; then
-    echo "memcheck: reaping ORPHANED ds4-tp2 cluster (head container up, nothing serving on :8000)" >&2
-    docker rm -f ds4-tp2-head >/dev/null 2>&1 || true
-    ssh -o BatchMode=yes -o ConnectTimeout=10 kathryn.fritz.box \
-      'docker rm -f ds4-tp2-worker >/dev/null 2>&1' >/dev/null 2>&1 || true
-    sleep 3
+  # `docker top` needs the pid column ("-eo args" alone errors), and this file runs under
+  # `set -euo pipefail`: a miss here must yield an EMPTY port, never abort the script (|| true).
+  _ds4_port=$(docker top ds4-tp2-head -eo pid,args 2>/dev/null | grep -oE -- '--port [0-9]+' | awk '{print $2}' | head -1 || true)
+  _ds4_age=$(( $(date +%s) - $(date -d "$(docker inspect -f '{{.State.StartedAt}}' ds4-tp2-head 2>/dev/null)" +%s 2>/dev/null || date +%s) ))
+  if [ -z "$_ds4_port" ] || [ "$_ds4_age" -lt 1800 ]; then
+    : # server not spawned yet / still cold-starting, or port unreadable: never reap
+  elif ! curl -sf -m 5 "http://127.0.0.1:${_ds4_port}/v1/models" >/dev/null 2>&1; then
+    echo "memcheck: SUSPECTED ORPHANED ds4-tp2 cluster (NOT killing) (head container up, nothing serving on :${_ds4_port})" >&2
+    echo "memcheck: REFUSING this load. A ds4-tp2 cluster looks orphaned but may be a PINNED model; a new load never kills it (policy 2026-11-03). If it is really dead, free it from Fleet." >&2
+    exit 1
   fi
 fi
 
@@ -154,19 +166,15 @@ except Exception:
   # 120s only covers the brief window where the launcher has started containers but
   # llama-swap has not yet registered the member.
   if [ "$_sgl_owned" -eq 0 ] && [ "${_sgl_age:-0}" -ge "${SGLANG_TP2_OWN_GRACE_S:-120}" ]; then
-    echo "memcheck: reaping UNOWNED sglang-tp2 cluster (age ${_sgl_age}s, llama-swap does not list it)" >&2
-    docker rm -f sglang-tp2-head >/dev/null 2>&1 || true
-    ssh -o BatchMode=yes -o ConnectTimeout=10 kathryn.fritz.box \
-      'docker rm -f sglang-tp2-worker >/dev/null 2>&1' >/dev/null 2>&1 || true
-    sleep 3
+    echo "memcheck: SUSPECTED UNOWNED sglang-tp2 cluster (NOT killing) (age ${_sgl_age}s, llama-swap does not list it)" >&2
+    echo "memcheck: REFUSING this load. A sglang-tp2 cluster looks orphaned but may be a PINNED model; a new load never kills it (policy 2026-11-03). If it is really dead, free it from Fleet." >&2
+    exit 1
   elif [ "${_sgl_age:-0}" -lt "${SGLANG_TP2_GRACE_S:-1500}" ]; then
     : # still inside the cold-start window AND owned — never reap, it is loading
   elif [ -n "$_sgl_port" ] && ! curl -sf -m 5 "http://127.0.0.1:${_sgl_port}/health" >/dev/null 2>&1; then
-    echo "memcheck: reaping ORPHANED sglang-tp2 cluster (head up, nothing serving on :${_sgl_port})" >&2
-    docker rm -f sglang-tp2-head >/dev/null 2>&1 || true
-    ssh -o BatchMode=yes -o ConnectTimeout=10 kathryn.fritz.box \
-      'docker rm -f sglang-tp2-worker >/dev/null 2>&1' >/dev/null 2>&1 || true
-    sleep 3
+    echo "memcheck: SUSPECTED ORPHANED sglang-tp2 cluster (NOT killing) (head up, nothing serving on :${_sgl_port})" >&2
+    echo "memcheck: REFUSING this load. A sglang-tp2 cluster looks orphaned but may be a PINNED model; a new load never kills it (policy 2026-11-03). If it is really dead, free it from Fleet." >&2
+    exit 1
   elif [ -z "$_sgl_port" ]; then
     echo "memcheck: sglang-tp2-head up but its --port could not be read; NOT reaping (fail safe)" >&2
   fi
