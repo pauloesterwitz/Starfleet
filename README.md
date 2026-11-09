@@ -13,13 +13,13 @@ front of 39 models and **Fleet**, a window in the app, as the control surface.
 
 ```
   Mac                                           Spark nodes
-  ┌──────────────────────────────┐             ┌───────────────────────────────────┐
-  │ Starfleet Command.app        │   HTTP      │ Jean-Luc (head)                   │
-  │   Fleet window ──────────────┼────────────▶│   fleet-ui ─▶ llama-swap          │
-  │                              │             │                 ├─ memcheck       │
-  │   menu bar · desktop widget  │    ssh      │                 └─ ctxproxy       │
-  │   (+ optional USB panel)  ───┼────────────▶│ Kathryn (worker)                  │
-  └──────────────────────────────┘             └───────────────────────────────────┘
+  ┌──────────────────────────────┐             ┌────────────────────────────────────────┐
+  │ Starfleet Command.app        │   HTTP      │ Jean-Luc (head)                        │
+  │   Fleet window ──────────────┼────────────▶│   fleet-ui ─▶ ctxproxy ─▶ llama-swap   │
+  │                              │             │                            └─ memcheck │
+  │   menu bar · desktop widget  │    ssh      │                                        │
+  │   (+ optional USB panel)  ───┼────────────▶│ Kathryn (worker)                       │
+  └──────────────────────────────┘             └────────────────────────────────────────┘
 ```
 
 <p align="center">
@@ -33,10 +33,16 @@ front of 39 models and **Fleet**, a window in the app, as the control surface.
 
 - **Manages the models.** Search the catalogue, pin a model so it stays resident,
   choose which machine it runs on, set its context size and thinking effort, watch a
-  load's progress and cancel it. → [Fleet](#fleet--managing-the-models-from-a-window)
+  load's progress and cancel it, and, when everything has to stop, call a Red Alert.
+  → [Fleet](#fleet--managing-the-models-from-a-window)
+- **Keeps loading in human hands.** A key gate in front of llama-swap refuses every
+  load and unload that does not carry the Starfleet key, so loading is something a
+  person does at the Fleet window, not something an agent does on its own.
+  → [The Starfleet key](#the-starfleet-key)
 - **Protects the machines.** Every load goes through a memory check that knows what
-  is free *and* what is already promised to a running image or video job, reaps
-  orphaned tensor-parallel clusters, and refuses cleanly rather than OOMing.
+  is free *and* what is already promised to a running image or video job, refuses to
+  start on top of a cluster that looks orphaned, and refuses cleanly rather than
+  OOMing.
   → [The memory guard](#the-memory-guard--admission-control-before-every-load)
 - **Keeps the configuration honest.** The cluster's llama-swap config, launchers and
   guards live in this repo (`cluster/`), with a sync tool that compares them with the
@@ -60,6 +66,9 @@ Two **NVIDIA DGX Spark** nodes, each a GB10 with ~121 GiB of unified memory and
 | **Jean-Luc** | Head node. Runs [llama-swap](https://github.com/mostlygeek/llama-swap), which fronts every model behind a single OpenAI-compatible endpoint. |
 | **Kathryn** | Worker. Serves models of her own, and pairs with Jean-Luc for tensor-parallel jobs. |
 
+The launchers reach Kathryn over ssh at her ConnectX-7 fabric address, `10.100.0.1`.
+The bare tailnet name hits Tailscale SSH, which wants a browser and breaks `BatchMode`.
+
 ### llama-swap holds the fleet together
 
 **[llama-swap](https://github.com/mostlygeek/llama-swap)** (by
@@ -73,6 +82,10 @@ That matters here because 39 models are defined but only ~121 GiB per node is
 available. Without it you'd be manually starting and stopping vLLM. With it,
 everything — the coding agents, this monitor, any OpenAI-compatible client —
 talks to **one endpoint on the head node** and never thinks about placement.
+
+One rule overrides load-on-request here: only a person with the Starfleet key may load
+or unload a model. A client that names a model which is not resident gets a 403 instead
+of a load ([The Starfleet key](#the-starfleet-key)).
 
 Three features do the heavy lifting for a cluster:
 
@@ -109,10 +122,13 @@ Twelve of the 39 never generate a token. Six are embedders — `nomic-embed-text
 `bge-reranker-v2-m3` cross-encoder and `qwen3-reranker-4b`/`-8b` — each with a
 twin on the other node. All twelve are served by
 [`serve-embed.sh`](cluster/llama-swap/serve-embed.sh) through vLLM's pooling
-runner, in two groups that both set `swap: false` and `exclusive: false`: a
-retrieval call must never evict a language model, and must never be evicted by
-one. They are separate groups because retrieval usually wants an embedder and a
-reranker resident at the same time.
+runner, in groups that all set `exclusive: false`: a retrieval call must never
+evict a language model, and must never be evicted by one. Embedders and rerankers are
+separate groups because retrieval usually wants one of each resident at the same
+time, and the rerankers are split once more, one group per family (BGE and Qwen), so
+that loading a Qwen reranker does not evict the BGE one. Inside a family the group is
+`swap: true`: picking another member, such as Kathryn's twin or the 4b instead of the
+8b, replaces the current one.
 
 The twins are not redundancy. Jean-Luc's pool can be genuinely too full for a
 1 GiB model while a TP=2 member occupies it — on 2026-09-23 `harrier-embed-0.6b`
@@ -163,12 +179,21 @@ From it you can:
   control shows nothing to pick. It takes effect by evicting the model, so it comes
   back with the new default.
 - **Watch a load, and cancel it.** Progress is read from the engine's own log, the
-  ETA is the median of that model's last five cold loads, and cancelling unpins first
-  — otherwise the keepalive would put the model straight back.
+  ETA is the median of that model's last five cold loads, and cancelling drops the
+  pin too.
 - **See how a member is started**: the vision flag reflects what it is *started*
   with, not what the checkpoint could do.
 - **Run image models alongside the language models**: the ComfyUI "Image Creation"
   rows have their own node placement, warm-up and unload.
+- **Queue the light loads.** Embedders, rerankers and image models load one at a time,
+  and only while no language-model load is in flight; a language-model load never
+  waits. A waiting model shows `queued #N` with a Dequeue button, and a bar above the
+  table lists the queue.
+- **Unload, and know it worked.** Unload waits until llama-swap no longer lists the
+  model, then reports how much RAM came back on that machine. A model that is still
+  loading is cancelled instead.
+- **Stop everything.** Red Alert frees both Sparks; Auto Destruct does that and then
+  reboots them. → [Red Alert and Auto Destruct](#red-alert-and-auto-destruct)
 
 The backend also exposes the GPU job queue (a `pueue` queue and per-node capacity)
 at `/api/jobs`.
@@ -179,30 +204,141 @@ llama-swap's own idle `ttl` and swap-group exclusivity (see above) still fully
 apply — Fleet doesn't and shouldn't override them, since group exclusivity is
 deliberate, memory-driven config (e.g. the `starfleet` group is `swap: true`
 because only one TP=2 model can occupy both Sparks at once). Instead, Fleet
-treats "pinned" as "bring it straight back the instant it's gone, no matter
-why it left":
+treats "pinned" as "keep it alive while it is resident":
 
-- A 5-second watchdog checks every pinned model against `/running`. Missing —
-  because its ttl lapsed, *or* because a different member of its swap group
-  got requested and evicted it — triggers an immediate reload, not a wait for
-  the next tick.
-- Each reload runs in its own thread. A slow cold load (TP=2 can take 20+
-  minutes) no longer blocks refreshing every *other* pin, which is what the
-  original single-threaded, one-at-a-time loop did.
-- A model that's still resident just gets a periodic ttl-refresh touch
-  (`GET /upstream/<model>/health`), well inside the shortest configured ttl.
+- A pinned model that is resident gets a periodic ttl-refresh touch
+  (`GET /upstream/<model>/health`, every 240 seconds), well inside the shortest
+  configured ttl. Each touch runs in its own thread, so a slow one cannot hold up
+  refreshing every *other* pin.
+- A pin that has left, because its ttl lapsed *or* because a different member of its
+  swap group was requested and evicted it, is **not** reloaded on its own. Loading
+  needs the Starfleet key ([below](#the-starfleet-key)), which only a person at the
+  page supplies, so the pin waits for a keyed Load. Before the gate existed, a
+  5-second watchdog reloaded it at once.
+- Pinning a model that is not resident is a keyed Load: it needs the key and starts
+  the load. Pinning one twin of a model (say the Kathryn copy of an embedder) moves
+  the pin off its siblings, so the other twin is not left pinned.
+
+### The Starfleet key
+
+Only Starfleet Command may load or unload a model, and the rule is enforced in front
+of llama-swap, not in the page. llama-swap listens privately on `:28079` and demands
+an internal key (`apiKeys` in [`config.yaml`](cluster/llama-swap/config.yaml), taken
+from the `PROXY_KEY` environment variable). [`ctxproxy.py`](cluster/llama-swap/ctxproxy.py)
+answers on `:28080` and `:28081` and is the only client that holds that key. Unless
+the request carries an `X-Starfleet-Key` header whose SHA-256 matches the hash in
+`~/.config/starfleet/key.sha256`, it refuses anything that would load or unload a
+model, or change a model's context size in a way that reloads it, with a 403 and the
+policy text: *"Only Starfleet Command may load models and Agents may not load models
+on their own. This is a policy!"* Everything else passes through, including a request
+for a model that is already loaded, `/running` and `/v1/models`.
+
+Only the hash is stored on the node, and it is read on every request, so replacing
+the key needs no restart. The key itself is shown once, when it is made. In the Fleet
+window, paste it into the **Starfleet key** field and press **Save key**: the page
+keeps it in that browser's `localStorage` and sends it as `X-Starfleet-Key` with
+every `POST` to `/api/`. `fleet.py` passes it on to the gate and never stores it.
+Without it, Load, Pin of a model that is not resident, Unload, Cancel, and an effort
+or context change on a resident model all answer with the 403.
+
+To set up your own:
+
+```bash
+mkdir -p ~/.config/starfleet && cd ~/.config/starfleet
+KEY=$(python3 -c 'import secrets; print(secrets.token_urlsafe(24))')
+echo "$KEY"                    # your Starfleet key: copy it now, it is not stored
+printf %s "$KEY" | sha256sum | cut -d' ' -f1 > key.sha256
+printf 'PROXY_KEY=%s\n' "$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')" > proxy.env && chmod 600 proxy.env
+```
+
+Then give `llama-swap.service` and `llama-swap-ctxproxy.service` the line
+`EnvironmentFile=%h/.config/starfleet/proxy.env` through one systemd drop-in each, and
+in the llama-swap drop-in repeat the `ExecStart` of
+[`llama-swap.service`](cluster/systemd/llama-swap.service) with `-listen localhost:28079`
+in place of `:28080`. `config.yaml` and `ctxproxy.py` already expect that.
+
+### Red Alert and Auto Destruct
+
+Two buttons in the Fleet window's left rail. Both need the Starfleet key, and both open
+a full-screen overlay in the style of a Star Trek (LCARS) console, with a cancel window
+and a looping klaxon, before they touch anything.
+
+**Red Alert** frees both Sparks.
+
+1. The page first sends `{"check": true}`, which checks the key with a no-op unload, so
+   a missing or wrong key is refused up front and not after the countdown.
+2. A 5-second cancel window follows ("Nothing has been stopped yet"). **Return to
+   green alert** cancels it and nothing is touched.
+3. Then the server unloads every model through llama-swap, clears every pin and the
+   load queue, waits up to 90 seconds until llama-swap lists nothing, and runs
+   `docker stop` on every container that still holds a GPU on either node: vLLM,
+   SGLang and Ray heads and workers, embedders, rerankers, ComfyUI. On Jean-Luc it also
+   stops containers started with `docker run -i` (MCP, Model Context Protocol, servers)
+   whose client is gone, and those whose session has been idle for over 24 hours.
+4. The overlay lists what was stopped: models, GPU containers per node, orphaned and
+   dormant-session containers, the memory freed on Jean-Luc, and any errors.
+
+**Auto Destruct** is a Red Alert followed by a reboot of both Sparks.
+
+1. The overlay says what it will do and asks for an authorization code. The code is not
+   in this repo and the page never prints it: `fleet.py` reads it from the
+   `STARFLEET_AUTODESTRUCT_CODE` environment variable, which belongs in the Fleet UI
+   service's environment (for example an `EnvironmentFile=` line in a systemd drop-in
+   for `fleet-ui.service`, pointing at a file that stays out of any repository). With
+   the variable unset or empty, Auto Destruct is disabled: both calls answer 503 and
+   name the variable, and the overlay shows that message. The code is a type-to-confirm
+   speed bump; the Starfleet key is the real gate.
+2. **Authorize** sends `{"code": ..., "check": true}` (the page upper-cases what you
+   typed, and the server ignores case), which proves the code and the key and executes
+   nothing. A wrong code answers `ACCESS DENIED` and shakes the overlay.
+3. A 10-second cancel window follows. **Cancel auto destruct** ends it with no model
+   stopped.
+4. If it runs, the server does a Red Alert, then schedules a reboot of Kathryn in 3
+   seconds and of Jean-Luc in 10, each with `sudo -n systemd-run --on-active=<seconds>
+   --unit=starfleet-autodestruct systemctl reboot` (a graceful reboot: systemd stops
+   units and containers first). That needs passwordless `sudo` for it on both nodes,
+   and key-based ssh from Jean-Luc to Kathryn. Kathryn goes first because Fleet itself
+   runs on Jean-Luc. If Kathryn cannot be scheduled, the call fails with a 502 (`reboot
+   NOT scheduled`) and Jean-Luc is left alone.
+5. The page counts down, then shows "Systems rebooting" until Jean-Luc answers
+   `/api/boot` with a new boot id and Kathryn's probe is healthy again. **Return to
+   command** is there the whole time.
+
+| Call | Body | Does |
+| --- | --- | --- |
+| `POST /api/redalert` | `{"check": true}` | checks the key, runs nothing |
+| `POST /api/redalert` | `{}` | runs Red Alert; returns `ok`, `unloaded`, `stopped`, `orphans`, `dormant`, `errors`, `freed_mb` |
+| `POST /api/autodestruct` | `{"code": "...", "check": true}` | checks the code and the key, runs nothing |
+| `POST /api/autodestruct` | `{"code": "..."}` | Red Alert, then both reboots; returns `ok`, `red_alert`, `kathryn_in_s`, `jean_luc_in_s` |
+
+All four take the `X-Starfleet-Key` header. A wrong key answers 403 with the policy
+text, a wrong code 403 with `Authorization code rejected.`, and Auto Destruct with no
+code configured 503 with a message that names `STARFLEET_AUTODESTRUCT_CODE`.
+
+**The klaxon.** While a cancel window is open the page loops `/sounds/tng_red_alert1.mp3`,
+which `fleet.py` serves from `fleet-ui/sounds/tng_red_alert1.mp3`, next to itself. The
+clip is copyrighted and is not in this repo (`.gitignore` keeps `fleet-ui/sounds/`
+out), so supply your own audio file under that name. If the file is missing, or the
+browser cannot play it, the page falls back to a synthesized two-tone klaxon (880 Hz
+and 660 Hz sine tones).
 
 ### Setup
 
 1. Copy `fleet-ui/fleet.py` and `fleet-ui/fleet.html` to the head node and run
    `python3 fleet.py` (binds the Tailscale IP by default so it's reachable
    from your Mac but not the LAN; see `default_host()`). A systemd user unit
-   works well for keeping it up across reboots.
-2. Point [`Sources/OpencodeMonitor/FleetView.swift`](Sources/OpencodeMonitor/FleetView.swift)'s
+   works well for keeping it up across reboots. Fleet reaches llama-swap through
+   ctxproxy on `:28081` (`FLEET_SWAP` overrides it), so set up
+   [the Starfleet key](#the-starfleet-key) first.
+2. For Red Alert's klaxon, put your own audio clip at `fleet-ui/sounds/tng_red_alert1.mp3`
+   next to `fleet.py` on the head node; without one the page plays a synthesized
+   klaxon. Auto Destruct also needs the `sudo` and ssh access described
+   [above](#red-alert-and-auto-destruct).
+3. Point [`Sources/OpencodeMonitor/FleetView.swift`](Sources/OpencodeMonitor/FleetView.swift)'s
    `fleetURL` and [`Sources/OpencodeMonitor/Info.plist`](Sources/OpencodeMonitor/Info.plist)'s
    `NSExceptionDomains` entry at your own head node's address — fleet-ui serves
    plain HTTP, so that ATS exception is what lets `WKWebView` load it.
-3. Build with `./package.sh`, same as the rest of the app (see below) — Fleet
+4. Build with `./package.sh`, same as the rest of the app (see below); Fleet
    ships inside `Starfleet Command.app`, not as its own bundle.
 
 ---
@@ -235,12 +371,19 @@ unified memory pool. Two more things it does before that arithmetic, both
 earned by real incidents: drops page cache before a big load (`MemAvailable`
 counts reclaimable cache that a large burst allocation can't reclaim fast
 enough on its own — this caused two OOMs while the check reported 114 GiB
-free), and reaps orphaned two-node TP clusters (`ds4-tp2`, `sglang-tp2`) that
+free), and looks for orphaned two-node TP clusters (`ds4-tp2`, `sglang-tp2`) that
 survive their own teardown trap and silently strand ~90–100 GiB each,
-otherwise invisible to everything else. The orphan check requires two
-independent signals to agree — llama-swap's own `/running` list *and* a
-launcher-pid ownership label on the container — because a fully healthy,
-fully responsive orphan once held memory for two hours before this existed.
+otherwise invisible to everything else.
+
+It used to kill what it found. Since 2026-11-03 it only refuses: a probe that
+assumed port 8000 took a healthy member for an orphan and reaped it when an
+unrelated reranker loaded, so a suspected orphan now costs one aborted load, and the
+message says to free it from Fleet. The cleanup that remains is the timer-driven
+[`reap-orphan-sglang.sh`](cluster/llama-swap/reap-orphan-sglang.sh), which runs every
+five minutes and tears down an sglang cluster only when its launcher's pid is dead,
+llama-swap does not list the model and the container is past a ten-minute grace
+period. A cluster once held 107 GB for two hours with its launcher dead and
+llama-swap reporting idle.
 
 The `ds4-nvfp4-tp2` member (a two-Spark Ray cluster, not a single process)
 adds [`ds4-tp2-proxy-guard.sh`](cluster/llama-swap/ds4-tp2-proxy-guard.sh) on
@@ -499,10 +642,11 @@ Sources/OpencodeMonitor/   the app
   DesktopWidget*.swift      floating panel
   Panel*.swift, GPUStream.swift   the optional USB panel: driver, controller, streamed GPU figures
 cluster/                   the cluster's configuration and tooling: the llama-swap config and
-                            launchers, the memory guard (memcheck.sh and friends), the per-request
-                            context proxy, the status scripts the app runs over ssh, and
-                            sync-hosts.sh to keep this repo and the nodes in step
+                            launchers, the memory guard (memcheck.sh and friends), the context proxy
+                            that also gates every load, the status scripts the app runs over ssh,
+                            and sync-hosts.sh to keep this repo and the nodes in step
 fleet-ui/                  Fleet's backend: fleet.py + fleet.html, copied to the head node
+                            (fleet-ui/sounds/ holds your own Red Alert clip and stays out of git)
 docs/menu-bar-app.md       deep-dive on the monitoring surfaces and their known limits
 panel-theme/               offline tooling for the optional USB panel's theme
 assets/                    icon + brand mark generators
