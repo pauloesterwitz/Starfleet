@@ -1,0 +1,13 @@
+[Unit]
+Description=Memory floor guard for the GLM-5.3-Flash member (kills only that model)
+After=llama-swap.service
+
+[Service]
+Type=simple
+Environment=FLOOR_GB=3
+ExecStart=/home/pauloesterwitz/llama-swap/glm-memfloor-service.sh
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=default.target

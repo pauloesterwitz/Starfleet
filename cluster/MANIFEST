@@ -8,10 +8,12 @@
 # ~/bin is NOT mirrored, hence both nodes for the status tools the app runs over ssh.
 #
 # The boundary is "everything the running fleet executes": the closure of what
-# config.yaml, ctxproxy, fleet.py and the systemd timers invoke. Deliberately not
-# tracked: the llama-swap binary, the ~40 bench / retest / diag one-offs, run logs,
-# result tables and notes in ~/llama-swap, and obsolete launchers (m3ar, minimax-tp2,
-# ollama) that no member uses.
+# config.yaml, ctxproxy, fleet.py and the systemd timers and services invoke.
+# Deliberately not tracked: the llama-swap binary, the ~40 bench / retest / diag
+# one-offs, run logs, result tables and notes in ~/llama-swap, obsolete launchers
+# (m3ar, minimax-tp2, ollama) that no member uses, serve-ornith.sh (an unwired
+# fallback), one-shot migration scripts, and tg-notify.sh, the private Telegram
+# notifier that glm-memfloor-service.sh calls when its guard fires.
 
 # ---- Fleet UI (served by fleet-ui.service)
 fleet-ui/fleet.py                               ~/fleet-ui/fleet.py                            jean-luc
@@ -46,11 +48,16 @@ cluster/llama-swap/serve-kathryn-nemcascade.sh  ~/llama-swap/serve-kathryn-nemca
 cluster/llama-swap/serve-kathryn-ds4.sh         ~/llama-swap/serve-kathryn-ds4.sh              jean-luc
 cluster/llama-swap/serve-embed.sh               ~/llama-swap/serve-embed.sh                    jean-luc
 cluster/llama-swap/serve-kathryn-embed.sh       ~/llama-swap/serve-kathryn-embed.sh            jean-luc
+cluster/llama-swap/serve-mm-embed.py            ~/llama-swap/serve-mm-embed.py                 jean-luc
 cluster/llama-swap/ds4-tp2-proxy-guard.sh       ~/llama-swap/ds4-tp2-proxy-guard.sh            jean-luc
 cluster/llama-swap/run-single-node.sh           ~/llama-swap/run-single-node.sh                jean-luc
 cluster/llama-swap/run-sglang-tp2-cluster.sh    ~/llama-swap/run-sglang-tp2-cluster.sh         jean-luc
 cluster/llama-swap/run-ds4-tp2-cluster.sh       ~/llama-swap/run-ds4-tp2-cluster.sh            jean-luc
 cluster/ds4/serve-ds4.sh                        ~/ds4/serve-ds4.sh                             jean-luc
+
+# ---- GLM memory floor: kills only the GLM cluster when either node drops below 3 GB free
+cluster/llama-swap/glm-memfloor-service.sh      ~/llama-swap/glm-memfloor-service.sh           jean-luc
+cluster/llama-swap/watchdog-memfloor.py         ~/llama-swap/watchdog-memfloor.py              jean-luc
 
 # ---- Jean-Luc -> Kathryn mirror
 cluster/kathryn-sync.sh                         ~/.local/bin/kathryn-sync.sh                   jean-luc
@@ -59,6 +66,7 @@ cluster/kathryn-sync.sh                         ~/.local/bin/kathryn-sync.sh    
 cluster/systemd/llama-swap.service              ~/.config/systemd/user/llama-swap.service          jean-luc
 cluster/systemd/llama-swap-ctxproxy.service     ~/.config/systemd/user/llama-swap-ctxproxy.service jean-luc
 cluster/systemd/fleet-ui.service                ~/.config/systemd/user/fleet-ui.service            jean-luc
+cluster/systemd/glm-memfloor.service            ~/.config/systemd/user/glm-memfloor.service        jean-luc
 cluster/systemd/reap-orphan-sglang.service      ~/.config/systemd/user/reap-orphan-sglang.service  jean-luc
 cluster/systemd/reap-orphan-sglang.timer        ~/.config/systemd/user/reap-orphan-sglang.timer    jean-luc
 cluster/systemd/kathryn-sync.service            ~/.config/systemd/user/kathryn-sync.service        jean-luc
