@@ -21,8 +21,8 @@ PORT=8000
 while [ $# -gt 0 ]; do case "$1" in --port) PORT="${2:-8000}"; shift 2 || shift;; *) shift;; esac; done
 
 # LAN name, NOT the bare tailnet name: `kathryn` hits Tailscale SSH, which wants a browser re-auth
-# and breaks BatchMode. `kathryn.fritz.box` hits real OpenSSH.
-HOST=kathryn.fritz.box
+# and breaks BatchMode. `10.100.0.1` hits real OpenSSH.
+HOST=10.100.0.1
 
 # Context size, if ctx-env.sh set one for this member on THIS node: carry it across the ssh so
 # Kathryn serves the requested --max-model-len too. Digits only (it is interpolated into a remote

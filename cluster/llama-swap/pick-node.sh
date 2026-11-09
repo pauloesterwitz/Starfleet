@@ -15,7 +15,7 @@
 set -uo pipefail
 
 LS=/home/pauloesterwitz/llama-swap
-HOST=kathryn.fritz.box
+HOST=10.100.0.1
 KEY="${1:?usage: pick-node.sh <key> <need_mb> --port <port>}"
 NEED="${2:?usage: pick-node.sh <key> <need_mb> --port <port>}"
 shift 2

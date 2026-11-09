@@ -13,7 +13,7 @@ PORT=8000
 while [ $# -gt 0 ]; do case "$1" in --port) PORT="${2:-8000}"; shift 2 || shift;; *) shift;; esac; done
 
 # LAN name, NOT the bare tailnet name: see serve-kathryn.sh for why.
-HOST=kathryn.fritz.box
+HOST=10.100.0.1
 
 CTX="${MML_OVERRIDE:-}"
 case "$CTX" in ""|*[!0-9]*) CTX="" ;; esac

@@ -24,7 +24,7 @@ LS="$(cd "$(dirname "$0")" && pwd)"
 GRACE_S="${ORPHAN_GRACE_S:-600}"
 CTR=sglang-tp2-head
 WCTR=sglang-tp2-worker
-WORKER_HOST="${WORKER_HOST:-kathryn.fritz.box}"
+WORKER_HOST="${WORKER_HOST:-10.100.0.1}"
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=10"
 reap(){  # $1 = reason. REAPER_DRYRUN=1 prints the decision instead of acting.
   if [ "${REAPER_DRYRUN:-0}" = 1 ]; then echo "DRYRUN, would reap: $1"; return; fi

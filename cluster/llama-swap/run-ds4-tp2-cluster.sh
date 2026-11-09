@@ -63,7 +63,7 @@ GPU_UTIL="${GPU_UTIL:-0.72}"                          # MEASURED: weights=77.9GB
 
 # fabric (from `ip -o addr show` on each node)
 HEAD_IP="${HEAD_IP:-10.100.0.2}";   HEAD_IF="${HEAD_IF:-enp1s0f1np1}"    # Jean-Luc
-WORKER_HOST="${WORKER_HOST:-kathryn.fritz.box}"                          # LAN name: bare tailnet name breaks BatchMode
+WORKER_HOST="${WORKER_HOST:-10.100.0.1}"                          # ConnectX-7 fabric IP (the bare tailnet name breaks BatchMode: Tailscale SSH wants a browser)
 WORKER_IP="${WORKER_IP:-10.100.0.1}"                                     # Kathryn fabric IP
 WORKER_IF="${WORKER_IF:-}"                                               # auto-detected on Kathryn if empty
 RAY_PORT="${RAY_PORT:-6379}"
