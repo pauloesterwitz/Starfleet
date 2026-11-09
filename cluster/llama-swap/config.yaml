@@ -853,12 +853,20 @@ routing:
         #   copy resident on both Sparks, the same reasoning the spark-big group documents for ds4.
         #   exclusive:false, so a reranker still never evicts an LLM group and is never evicted by
         #   one — serve-embed.sh's per-key memcheck (26000MB / 16000MB) is the fit authority.
-        rerankers:
+        # 2026-11-04 (Paul): BGE and Qwen rerankers must be able to run TOGETHER. One swap:true group
+        # held a single member, so loading Qwen silently evicted BGE. Now one swap:true group PER
+        # FAMILY: within a family a choice is still a choice (picking Kathryn MOVES it, 8b<->4b swap),
+        # across families both stay resident. exclusive:false as before; memcheck gates each fit.
+        rerankers-bge:
           swap: true
           exclusive: false
           members:
             - bge-reranker-v2-m3
             - bge-reranker-v2-m3-kathryn
+        rerankers-qwen:
+          swap: true
+          exclusive: false
+          members:
             - qwen3-reranker-8b
             - qwen3-reranker-8b-kathryn
             - qwen3-reranker-4b
