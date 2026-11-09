@@ -24,3 +24,7 @@ panel-theme/theme_assets/starfleet_bg.bmp
 
 # Machine-local: which theme contract is flashed on THIS panel (written by upload_theme.py)
 panel-theme/.flashed-contract.json
+
+# Red Alert's klaxon: fleet.py serves fleet-ui/sounds/tng_red_alert1.mp3 from next to itself. The
+# clip is copyrighted, so it is never committed; without it the page plays a synthesized klaxon.
+fleet-ui/sounds/

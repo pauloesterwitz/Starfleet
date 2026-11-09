@@ -123,13 +123,17 @@ td .sub{margin-top:3px;font-size:11px;color:var(--dim);line-height:1.35}
 .st{font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.08em}
 .st.ready{color:var(--blue)} .st.starting{color:var(--amber)}
 .st.stopped{color:var(--dim)} .st.working{color:var(--magenta)}
-.st.loading{color:var(--peach)}
+.st.loading{color:var(--peach)} .st.queued{color:var(--amber)}
+#queuebar{display:none;background:#1a1204;border-left:6px solid var(--amber);color:var(--amber);padding:8px 14px;margin:8px 0;
+  font-size:13px;letter-spacing:.08em;text-transform:uppercase}
 .act{text-align:right;white-space:nowrap}
 .act button{font-family:var(--lcars);font-size:12px;font-weight:600;letter-spacing:.08em;
   text-transform:uppercase;border:0;border-radius:11px;padding:4px 14px;margin-left:4px;
   background:var(--grid);color:var(--text);cursor:pointer}
 .act button:hover{background:var(--peach);color:#000}
 .act button.on{background:var(--magenta);color:#000}
+.act button.unl:not(:disabled){background:#8a2222;color:#fff}
+.act button.unl:not(:disabled):hover{background:#e04444;color:#000}
 .act button:disabled{opacity:.32;cursor:default;background:var(--grid);color:var(--dim)}
 .ctx select{font-family:var(--lcars);font-size:12px;font-weight:600;letter-spacing:.06em;
   border:0;border-radius:11px;padding:3px 8px;background:var(--grid);color:var(--text);
@@ -154,14 +158,126 @@ td .sub{margin-top:3px;font-size:11px;color:var(--dim);line-height:1.35}
   letter-spacing:.03em}
 #banner{display:none;background:var(--red);color:#000;padding:7px 16px;border-radius:14px;
   margin:10px 0;font-size:14px;font-weight:600;text-transform:uppercase}
+#adov{display:none;position:fixed;inset:0;z-index:100;background:rgba(0,0,0,.86);align-items:center;justify-content:center}
+#adov.on{display:flex}
+#adov .box{width:min(560px,92vw);display:grid;grid-template-columns:70px 1fr;grid-template-rows:46px auto 34px;gap:6px}
+#adov .e1{background:var(--red);border-radius:46px 0 0 0;grid-row:1}
+#adov .hd{background:var(--red);color:#000;font-size:22px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;
+  padding:8px 18px;border-radius:0 22px 0 0;display:flex;align-items:center}
+#adov .side{background:var(--orange);grid-row:2;display:flex;flex-direction:column;justify-content:flex-end}
+#adov .side b{display:block;color:#000;font-size:11px;padding:6px 8px;text-align:right}
+#adov .bd{background:#000;border:2px solid var(--red);padding:20px;text-transform:uppercase;grid-row:2}
+#adov .bd p{margin:0 0 14px;color:var(--amber);font-size:15px;line-height:1.4}
+#adov input{width:100%;height:40px;background:#000;color:var(--blue);border:2px solid var(--orange);border-radius:20px;
+  padding:0 18px;font:inherit;font-size:20px;letter-spacing:.12em;text-align:center}
+#adov input:focus{outline:0;border-color:var(--amber)}
+#adov .hint{margin:0 0 10px;text-align:center;color:var(--blue);font-size:13px;letter-spacing:.16em}
+#adov .msg{min-height:22px;margin:10px 0 0;color:var(--red);font-size:15px;font-weight:700;text-align:center}
+#adov .btns{display:flex;gap:6px;margin-top:8px}
+#adov .btns button{flex:1;height:38px;border:0;font:inherit;font-size:15px;font-weight:700;letter-spacing:.12em;
+  text-transform:uppercase;cursor:pointer;color:#000}
+#adov #adgo{background:var(--red);border-radius:19px 0 0 19px}
+#adov #adno{background:var(--blue);border-radius:0 19px 19px 0}
+#adov button:disabled{opacity:.4;cursor:default}
+#adov .e2{background:var(--red);border-radius:0 0 0 46px;grid-row:3}
+#adov .ft{background:var(--red);grid-row:3;border-radius:0 0 22px 0}
+#adov .st{display:none;text-align:center}
+#adov.armed .frm,#adov.loading .frm{display:none}
+#adov.armed .st,#adov.loading .st{display:block}
+#adov .st .lbl{color:var(--amber);font-size:18px;font-weight:700;letter-spacing:.2em;text-transform:uppercase;animation:adblink 1s steps(2) infinite}
+#adov .st .cnt{color:var(--red);font-size:104px;line-height:1.05;font-weight:700;letter-spacing:.06em;font-variant-numeric:tabular-nums;margin:6px 0}
+#adov .st .cnt.crit{animation:adblink .5s steps(2) infinite}
+#adov .st .bar{height:14px;background:var(--grid);border-radius:7px;overflow:hidden;margin:6px 0 10px}
+#adov .st .bar i{display:block;height:100%;width:100%;background:var(--red);transition:width 1s linear}
+#adov .st .bar.busy i{width:35%;animation:adscan 1.1s ease-in-out infinite alternate}
+#adov .st .sub{color:var(--blue);font-size:14px;min-height:20px;text-transform:uppercase;letter-spacing:.12em}
+#adov.armed{animation:adbg 1s ease-in-out infinite}
+#adov.armed .e1,#adov.armed .hd,#adov.armed .e2,#adov.armed .ft{animation:adflash 1s steps(2) infinite}
+#adov.armed .bd{border-color:var(--red);animation:adedge 1s steps(2) infinite}
+#adov.armed .side{background:repeating-linear-gradient(180deg,var(--orange) 0 16px,var(--red) 16px 32px);
+  background-size:100% 64px;animation:adstripe 1.2s linear infinite}
+@keyframes adflash{50%{background:#5a1a1a}}
+@keyframes adedge{50%{border-color:#5a1a1a}}
+@keyframes adblink{50%{opacity:.15}}
+@keyframes adbg{50%{background:rgba(70,0,0,.9)}}
+@keyframes adscan{to{margin-left:65%}}
+@keyframes adstripe{to{background-position:0 64px}}
+#adov #adcancel{display:none;width:100%;height:42px;margin-top:8px;border:0;border-radius:21px;background:var(--blue);color:#000;
+  font:inherit;font-size:17px;font-weight:700;letter-spacing:.16em;text-transform:uppercase;cursor:pointer}
+#adov.window #adcancel{display:block}
+#adov.done .frm,#adov.done .st,#adov.done .cx{display:none}
+#adov .rs{display:none}
+#adov.done .rs{display:block}
+#adov .rs h2{margin:0 0 8px;color:var(--blue);font-size:26px;letter-spacing:.14em;text-transform:uppercase}
+#adov .rs .lst{max-height:300px;overflow:auto;text-align:left;font-size:14px;letter-spacing:.06em;text-transform:uppercase;
+  border-top:1px solid var(--grid);padding-top:6px}
+#adov .rs h3{margin:10px 0 3px;color:var(--amber);font-size:14px;letter-spacing:.16em}
+#adov .rs li{list-style:none;color:var(--text);padding:1px 0}
+#adov .rs ul{margin:0;padding:0 0 0 6px}
+#adov .rs .none{color:var(--dim)}
+#adov .rs button{margin-top:12px;height:38px;padding:0 28px;border:0;border-radius:19px;background:var(--orange);color:#000;font:inherit;
+  font-size:15px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;cursor:pointer}
+#adov.done .e1,#adov.done .hd,#adov.done .e2,#adov.done .ft,#adov.done .side{background:var(--blue);animation:none}
+#adov.done .bd{border-color:var(--blue)}
+#adov.done{animation:none}
+#adov.cancelled .frm,#adov.cancelled .st{display:none}
+#adov .cx{display:none;text-align:center;padding:10px 0}
+#adov.cancelled .cx{display:block}
+#adov .cx h2{margin:0 0 8px;color:var(--blue);font-size:32px;line-height:1.15;letter-spacing:.14em;text-transform:uppercase}
+#adov .cx p{margin:0 0 14px;color:var(--amber)}
+#adov .cx button{height:38px;padding:0 28px;border:0;border-radius:19px;background:var(--orange);color:#000;font:inherit;
+  font-size:15px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;cursor:pointer}
+#adov.cancelled .e1,#adov.cancelled .hd,#adov.cancelled .e2,#adov.cancelled .ft{background:var(--blue);animation:none}
+#adov.cancelled .bd{border-color:var(--blue)}
+#adov.cancelled .side{background:var(--blue)}
+#adov.cancelled{animation:none}
+#adov #adexit{display:none;width:100%;height:36px;margin-top:8px;border:0;border-radius:18px;background:var(--orange);color:#000;
+  font:inherit;font-size:14px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;cursor:pointer}
+#adov.exitable #adexit{display:block}
+#adov.loading{animation:none}
+#adov.loading .e1,#adov.loading .hd,#adov.loading .e2,#adov.loading .ft{background:var(--orange);animation:none}
+#adov.loading .bd{border-color:var(--orange);animation:none}
+#adov.loading .side{background:repeating-linear-gradient(180deg,var(--orange) 0 16px,var(--blue) 16px 32px);
+  background-size:100% 64px;animation:adstripe 2.4s linear infinite}
+#adov.loading .st .lbl{color:var(--orange)}
+#adov.loading .st .cnt{color:var(--blue);font-size:72px}
+#adov.loading .st .bar i{background:var(--orange)}
+#adov.shake .bd{animation:adshake .3s}
+@keyframes adshake{25%{transform:translateX(-8px)}75%{transform:translateX(8px)}}
 .empty{color:var(--dim);font-size:14px;padding:14px 10px;text-transform:uppercase}
 </style></head><body>
+<div id="adov"><div class="box">
+  <div class="e1"></div><div class="hd" id="adhd">Auto Destruct Sequence</div>
+  <div class="side"><b id="adside">CODE<br>REQUIRED</b></div>
+  <div class="bd">
+    <div class="frm">
+    <p>Command authorization required.<br>This reboots Kathryn and Jean-Luc after every model is stopped.</p>
+    <div class="hint">Authorization code required</div>
+    <input id="adcode" type="text" autocomplete="off" spellcheck="false" placeholder="ENTER CODE" style="text-transform:uppercase">
+    <div class="msg" id="admsg"></div>
+    <div class="btns"><button id="adgo" type="button">Authorize</button><button id="adno" type="button">Abort</button></div>
+    </div>
+    <div class="st"><div class="lbl" id="adlbl"></div><div class="cnt" id="adcnt"></div>
+      <div class="bar busy" id="adbarw"><i id="adbar"></i></div><div class="sub" id="adsub"></div>
+      <button id="adcancel" type="button">Cancel auto destruct</button>
+      <button id="adexit" type="button">Return to command</button></div>
+    <div class="rs"><h2>Red alert complete</h2><div class="lst" id="rslst"></div>
+      <button id="rsclose" type="button">Return to command</button></div>
+    <div class="cx"><h2 id="adcxh">Auto destruction<br>cancelled</h2><p id="adcxp">No model was stopped. Both machines remain online.</p>
+      <button id="adclose" type="button">Return to command</button></div>
+  </div>
+  <div class="e2"></div><div class="ft"></div>
+</div></div>
 <div class="frame">
   <div class="rail">
     <div class="blk elbow-t"><div class="n" id="r-mdl">--</div><div class="l">Models</div></div>
     <div class="blk c3"><div class="n" id="r-res">--</div><div class="l">Resident</div></div>
     <div class="blk c5"><div class="n" id="r-pin">--</div><div class="l">Pinned</div></div>
     <div class="blk c4"><div class="n" id="r-node">--</div><div class="l">Nodes</div></div>
+    <button id="redalert" type="button" class="blk" title="Unpin and unload every model, then stop every GPU container on both Sparks"
+      style="background:var(--red);border:0;cursor:pointer;font:inherit;text-transform:uppercase;letter-spacing:.08em;font-weight:700;font-size:14px;padding:10px">Red Alert</button>
+    <button id="autod" type="button" class="blk" title="Red Alert, then gracefully reboot Kathryn and Jean-Luc"
+      style="background:#5a0000;color:#fff;border:0;cursor:pointer;font:inherit;text-transform:uppercase;letter-spacing:.08em;font-weight:700;font-size:14px;padding:10px">Auto Destruct</button>
     <div class="blk fill"></div>
     <div class="blk elbow-b"><div class="n" id="r-free">--</div><div class="l">GB Free</div></div>
   </div>
@@ -169,10 +285,11 @@ td .sub{margin-top:3px;font-size:11px;color:var(--dim);line-height:1.35}
   <div class="main">
     <div class="top">
       <div class="title">Starfleet <span>Command</span></div>
-      <div class="bar"><span id="clock">--:--:--</span></div>
+      <div class="bar"><input id="skey" type="password" placeholder="Starfleet key" autocomplete="off" style="margin:6px 16px 0 22px;width:200px;height:24px;background:#000;color:#fff;border:1px solid #fff4;border-radius:12px;padding:0 10px;font:inherit;font-size:13px"><button id="ksave" type="button" style="margin:6px 8px 0 -8px;height:24px;background:#000;color:#fff;border:1px solid #fff4;border-radius:12px;padding:0 12px;font:inherit;font-size:13px;cursor:pointer">Save key</button><span id="clock">--:--:--</span></div>
     </div>
 
     <div id="banner"></div>
+    <div id="queuebar"></div>
     <div id="loading"></div>
 
     <div class="sec"><div class="cap"></div><h2>Node Status</h2><div class="rule"></div></div>
@@ -202,6 +319,25 @@ td .sub{margin-top:3px;font-size:11px;color:var(--dim);line-height:1.35}
 </div>
 
 <script>
+/* Starfleet key: saved in this browser (localStorage) by the Save key button and sent with every
+   /api/ POST. The server passes it through to the gate and never stores it. */
+const _fetch=window.fetch.bind(window), skey=document.getElementById("skey");
+try{ skey.value=localStorage.getItem("starfleetKey")||sessionStorage.getItem("starfleetKey")||""; }catch(e){}
+const ksave=document.getElementById("ksave"), kshow=()=>{ ksave.textContent=skey.value?"Key saved ✓":"Save key"; };
+kshow();
+skey.addEventListener("input",()=>{ ksave.textContent="Save key"; });
+ksave.addEventListener("click",()=>{
+  /* Saved in THIS browser (localStorage) so it survives closing the tab; clear the field and save to forget it. */
+  try{ const k=skey.value.trim(); skey.value=k;
+    if(k) localStorage.setItem("starfleetKey",k); else localStorage.removeItem("starfleetKey");
+    sessionStorage.removeItem("starfleetKey"); }catch(e){ alert("Browser refused to store the key: "+e.message); }
+  kshow(); });
+window.fetch=(url,opt={})=>{
+  if(String(url).startsWith("/api/")&&opt.method==="POST"&&skey.value.trim())
+    opt.headers={...opt.headers,"X-Starfleet-Key":skey.value.trim()};
+  return _fetch(url,opt);
+};
+var queuedPos={};   /* model id -> 1-based place in the load queue; declared early because render() runs before later top-level lines */
 const TAG={"jean-luc":["jl","JEAN-LUC"],"kathryn":["ka","KATHRYN"],"dynamic":["dy","AUTO"]};
 const gb=kb=>(kb/1048576).toFixed(1);
 const busy=new Set();
@@ -274,7 +410,16 @@ function familyBase(m){
 }
 const machineSel={};   // base name -> sticky machine pick across renders
 const MACHINE_ORDER=["jean-luc","kathryn","dynamic"];
-function setMachine(base,node){ machineSel[base]=node; render(last); }
+function setMachine(base,node){
+  machineSel[base]=node;
+  /* The picker keeps focus after a change, and render() skips the table while a ctxsel/effsel has
+     focus (so a poll can't snap an open dropdown shut). That left the OLD machine's row on screen
+     with its Pin/Load buttons still bound to the old member: pick Kathryn, press Pin, pin Jean-Luc. */
+  if(document.activeElement&&document.activeElement.blur) document.activeElement.blur();
+  /* A node filter pill (or #jean-luc in the URL) outranks the picker in groupModels, so picking
+     Kathryn while viewing Jean-Luc snapped straight back. Follow the pick instead. */
+  if(["jean-luc","kathryn","dynamic"].includes(filter)) setFilter(node); else render(last);
+}
 
 /* The Node column is a picker on EVERY row, so the column reads the same way the whole way
    down instead of alternating between a control and a couple of tags. Where there is no real
@@ -400,14 +545,14 @@ function imgRow(m, working){
     <td class="mid">&mdash;</td>
     <td class="mid">&mdash;</td>
     <td class="mid">&mdash;</td>
-    <td><span class="st ${busyNow?"loading":loaded?"ready":"stopped"}">${
-        busyNow?"loading":loaded?"loaded":"stopped"}</span></td>
+    <td><span class="st ${busyNow?"loading":queuedPos[m.id]?"queued":loaded?"ready":"stopped"}">${
+        busyNow?"loading":queuedPos[m.id]?"queued #"+queuedPos[m.id]:loaded?"loaded":"stopped"}</span></td>
     <td class="mid">&mdash;</td>
     <td class="act">
       <button class="${loaded?"on":""}" ${busyNow?"disabled":""}
         onclick="loadImg('${m.id}')">${loaded?"Loaded":"Load"}</button>
-      <button ${busyNow||!loaded?"disabled":""}
-        onclick="unloadImg('${m.id}')">Unload</button></td></tr>`;
+      <button ${busyNow||(!loaded&&!queuedPos[m.id])?"disabled":""}
+        onclick="unloadImg('${m.id}')">${queuedPos[m.id]&&!loaded?"Dequeue":"Unload"}</button></td></tr>`;
 }
 
 const imgBusy=new Set();
@@ -578,10 +723,198 @@ async function act(url,model,pin){
   try{
     const r=await fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},
       body:JSON.stringify({model,pin})});
-    if(!r.ok) alert((await r.json()).error||"failed");
+    const j=await r.json();
+    if(!r.ok) alert(j.error||"failed");
+    else if(url==="/api/unload"&&j.freed_mb!=null) toast(`${modelName(model)} evicted: ${j.freed_mb} MB RAM freed on this machine`);
   }catch(e){ alert(e.message); }
   busy.delete(model); refresh();
 }
+
+function toast(msg){
+  let t=document.getElementById("toast");
+  if(!t){ t=document.createElement("div"); t.id="toast";
+    t.style.cssText="position:fixed;right:16px;bottom:16px;background:#000;color:#fff;border:1px solid #fff6;border-radius:12px;padding:8px 14px;font-size:13px;z-index:99";
+    document.body.appendChild(t); }
+  t.textContent=msg; t.style.display="block";
+  clearTimeout(t._h); t._h=setTimeout(()=>t.style.display="none",8000);
+}
+
+/* Red-alert sound: loops sounds/tng_red_alert1.mp3 (the clip Paul chose, kept local to this UI); falls back to a
+   synthesized two-tone klaxon. start() must come from a click (browsers keep audio locked until a gesture). */
+const alarm=(()=>{
+  let ac,osc,gain,iv;
+  const cycle=()=>{ const t=ac.currentTime;
+    [[880,0],[660,.55]].forEach(([f,d])=>{ osc.frequency.setValueAtTime(f,t+d);
+      gain.gain.setValueAtTime(0,t+d); gain.gain.linearRampToValueAtTime(.16,t+d+.03);
+      gain.gain.setValueAtTime(.16,t+d+.45); gain.gain.linearRampToValueAtTime(0,t+d+.5); }); };
+  let clip=null;
+  return {
+    /* The red-alert clip loops; the synthesized klaxon below is only the fallback if it cannot play. */
+    start(){ try{ this.stop(); clip=new Audio("/sounds/tng_red_alert1.mp3"); clip.loop=true; clip.volume=.85;
+      clip.play().catch(()=>{ clip=null; this.synth(); }); }catch(e){ this.synth(); } },
+    synth(){ try{ this.stop(); ac=ac||new (window.AudioContext||window.webkitAudioContext)();
+      if(ac.state==="suspended") ac.resume();
+      osc=ac.createOscillator(); gain=ac.createGain(); osc.type="sine"; gain.gain.value=0;
+      osc.connect(gain).connect(ac.destination); osc.start(); cycle(); iv=setInterval(cycle,1100); }catch(e){} },
+    stop(){ clearInterval(iv); try{ osc&&osc.stop(); }catch(e){} osc=null;
+      if(clip){ clip.pause(); clip.currentTime=0; clip=null; } }
+  };
+})();
+
+(function(){
+  const $=id=>document.getElementById(id);
+  const ov=$("adov"), inp=$("adcode"), msg=$("admsg"), go=$("adgo"), no=$("adno"), btn=$("autod"),
+        cancelBtn=$("adcancel");
+  let timer=null, executing=false, run=0;   /* run: bumped by reset(), so late callbacks of an abandoned sequence stay quiet */
+  const reset=()=>{ run++; clearTimeout(timer); timer=null; executing=false; alarm.stop();
+    ov.classList.remove("on","armed","window","cancelled","done","exitable","loading","shake"); inp.value=""; msg.textContent="";
+    go.disabled=false; cancelBtn.style.display=""; btn.disabled=false; btn.textContent="Auto Destruct"; };
+  const deny=t=>{ msg.textContent=t; ov.classList.remove("shake"); void ov.offsetWidth; ov.classList.add("shake");
+                  go.disabled=false; inp.select(); };
+  const phase=(lbl,cnt,sub,busy,crit)=>{ $("adlbl").textContent=lbl; $("adcnt").textContent=cnt; $("adsub").textContent=sub;
+    $("adbarw").classList.toggle("busy",!!busy); $("adcnt").classList.toggle("crit",!!crit); };
+  const post=body=>fetch("/api/autodestruct",{method:"POST",headers:{"Content-Type":"application/json"},
+                                              body:JSON.stringify(body)});
+  const cancel=()=>{ if(executing||!ov.classList.contains("window")) return;
+    clearTimeout(timer); timer=null; alarm.stop();
+    ov.classList.remove("armed","window"); ov.classList.add("cancelled");
+    $("adcxh").innerHTML=mode.cxh; $("adcxp").textContent=mode.cxp;
+    $("adclose").focus(); timer=setTimeout(reset,6000); };
+  const MODES={
+    destruct:{hd:"Auto Destruct Sequence",side:"CODE<br>REQUIRED",secs:10,label:"Auto destruct initiated - cancel now",
+      cancelLbl:"Cancel auto destruct",
+      cxh:"Auto destruction<br>cancelled",cxp:"No model was stopped. Both machines remain online."},
+    red:{hd:"Red Alert",side:"RED<br>ALERT",secs:5,label:"Red alert for 5 seconds - cancel now",
+      cancelLbl:"Return to green alert",
+      cxh:"Green alert<br>restored",cxp:"Red alert cancelled. No model was stopped."}
+  };
+  let mode=MODES.destruct;
+  const setMode=m=>{ mode=m; $("adhd").textContent=m.hd; $("adside").innerHTML=m.side; cancelBtn.textContent=m.cancelLbl; };
+  /* The shared cancel window: klaxon + countdown, then run() -- unless cancel() got there first. */
+  function startWindow(run){
+    alarm.start();                                    /* inside the click chain: audio is allowed */
+    ov.classList.add("on","armed","window"); msg.textContent=""; $("adclose").blur();
+    let left=mode.secs;
+    const tick=()=>{
+      if(left<=0){ run(); return; }
+      phase(mode.label,String(left).padStart(2,"0"),"Nothing has been stopped yet",false,left<=3);
+      $("adbar").style.width=(left/mode.secs*100)+"%"; $("adbarw").classList.remove("busy");
+      left--; timer=setTimeout(tick,1000); };
+    tick();
+  }
+
+  btn.onclick=()=>{ setMode(MODES.destruct); ov.classList.add("on"); inp.focus(); };
+  /* Red Alert: no code, but the same cancel window. The key is proven first so a missing key is
+     refused up front instead of after the countdown. */
+  const rb=$("redalert");
+  /* What Red Alert actually stopped, as a list: models unloaded, GPU containers per machine, orphans. */
+  const esc=t=>String(t).replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+  function showResult(j){
+    const sec=(title,items)=>`<h3>${title} (${items.length})</h3>`+
+      (items.length?`<ul>${items.map(x=>`<li>${esc(x)}</li>`).join("")}</ul>`:`<div class="none">none</div>`);
+    const gpu=Object.entries(j.stopped||{});
+    let h=sec("Models unloaded",j.unloaded||[]);
+    gpu.forEach(([node,names])=>{ h+=sec("GPU containers stopped on "+node,names); });
+    h+=sec("Orphaned containers stopped",j.orphans||[]);
+    h+=sec("Dormant-session containers stopped (session idle over 24 h)",j.dormant||[]);
+    h+=`<h3>Memory freed on Jean-Luc</h3><div>${j.freed_mb??"?"} MB</div>`;
+    const errs=Object.entries(j.errors||{});
+    if(errs.length) h+=`<h3>Errors</h3><ul>${errs.map(([k,v])=>`<li>${esc(k)}: ${esc(v)}</li>`).join("")}</ul>`;
+    $("rslst").innerHTML=h;
+    ov.classList.remove("armed","window"); ov.classList.add("on","done"); $("rsclose").focus();
+  }
+  $("rsclose").onclick=reset;
+  async function runRed(){
+    const me=run; executing=true; cancelBtn.style.display="none"; ov.classList.remove("window"); ov.classList.add("exitable");
+    phase("Red alert - stopping all models","--","Do not power off",true);
+    try{
+      const r=await fetch("/api/redalert",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"});
+      const j=await r.json();
+      if(me!==run){ refresh(); return; }
+      if(!r.ok){ alert(j.error||"failed"); }
+      else{ alarm.stop(); showResult(j); cancelBtn.style.display=""; refresh(); return; }
+    }catch(e){ alert(e.message); }
+    cancelBtn.style.display=""; reset(); refresh();
+  }
+  rb.onclick=async()=>{
+    setMode(MODES.red); rb.disabled=true;
+    try{
+      const r=await fetch("/api/redalert",{method:"POST",headers:{"Content-Type":"application/json"},
+                                           body:JSON.stringify({check:true})});
+      if(!r.ok){ const j=await r.json(); alert(j.error||"failed"); return; }
+    }catch(e){ alert(e.message); return; }
+    finally{ rb.disabled=false; }
+    startWindow(runRed);
+  };
+  no.onclick=reset; $("adclose").onclick=reset; $("adexit").onclick=reset; cancelBtn.onclick=cancel;
+  ov.addEventListener("keydown",e=>{
+    if(e.key==="Escape"){ ov.classList.contains("window") ? cancel() : reset(); }
+    if(e.key==="Enter"&&!go.disabled&&ov.classList.contains("on")&&!ov.classList.contains("armed")) go.click(); });
+
+  /* After the countdown both machines go down. Poll until Jean-Luc answers with a NEW boot id (or came back
+     after being unreachable) and Kathryn's probe is healthy again, showing a loading screen meanwhile.
+     "Return to command" is available the whole time, so the screen is never a trap. */
+  function waitForReboot(me,boot0){
+    alarm.stop(); ov.classList.remove("armed"); ov.classList.add("loading");
+    $("adhd").textContent="Systems rebooting"; $("adside").innerHTML="PLEASE<br>STAND BY";
+    const t0=Date.now(); let jlUp=false, sawDown=false;
+    const poll=async()=>{
+      if(me!==run) return;
+      let boot=null, ka=false;
+      try{ boot=(await (await fetch("/api/boot",{cache:"no-store"})).json()).boot; }catch(e){}
+      if(me!==run) return;
+      if(!boot) sawDown=true;
+      else if((boot0&&boot!==boot0)||sawDown) jlUp=true;
+      if(jlUp&&boot){
+        try{ const k=((await (await fetch("/api/state",{cache:"no-store"})).json()).nodes||{}).kathryn;
+             ka=!!(k&&!k.error&&k.mem_total_kb); }catch(e){}
+        if(me!==run) return;
+      }
+      const done=jlUp&&ka;
+      phase(done?"All systems online":jlUp?"Jean-Luc online - waiting for Kathryn":"Systems rebooting",
+        mmss((Date.now()-t0)/1000),
+        `Jean-Luc: ${jlUp?"online":"rebooting"}  /  Kathryn: ${ka?"online":jlUp?"connecting":"rebooting"}`,!done,false);
+      $("adbarw").classList.toggle("busy",!done); $("adbar").style.width=done?"100%":"";
+      if(done){ setTimeout(()=>{ if(me===run){ reset(); refresh(); } },2500); return; }
+      timer=setTimeout(poll,3000);
+    };
+    poll();
+  }
+
+  async function execute(){
+    const me=run; executing=true; cancelBtn.style.display="none"; ov.classList.remove("window"); ov.classList.add("exitable");
+    phase("Red alert - stopping all models","--","Do not power off",true);
+    let boot0=null;
+    try{ boot0=(await (await fetch("/api/boot",{cache:"no-store"})).json()).boot; }catch(e){}
+    try{
+      const r=await post({code:inp.value.trim().toUpperCase()}), j=await r.json();
+      if(me!==run) return;
+      if(!r.ok){ executing=false; alarm.stop(); ov.classList.remove("armed","exitable"); cancelBtn.style.display="";
+        deny(r.status===403&&/code/i.test(j.error||"")?"ACCESS DENIED":(j.error||"failed")); return; }
+      btn.disabled=true; btn.textContent="Rebooting...";
+      let left=j.jean_luc_in_s||10; const total=left, kat=j.kathryn_in_s||3;
+      $("adbar").style.width="100%";
+      const tick=()=>{
+        if(me!==run) return;
+        $("adbarw").classList.remove("busy"); $("adbar").style.width=(left/total*100)+"%";
+        if(left<=0){ waitForReboot(me,boot0); return; }
+        phase("Self-destruct in",String(left).padStart(2,"0"),
+          (total-left>=kat?"Kathryn: rebooting":"Kathryn: reboot imminent")+" / Jean-Luc: standing by",false,left<=5);
+        left--; timer=setTimeout(tick,1000); };
+      tick();
+    }catch(e){ if(me!==run) return; executing=false; alarm.stop(); ov.classList.remove("armed","exitable");
+      cancelBtn.style.display=""; deny(e.message); }
+  }
+
+  go.onclick=async()=>{
+    go.disabled=true; msg.textContent="Verifying...";
+    try{
+      const r=await post({code:inp.value.trim().toUpperCase(),check:true}), j=await r.json();      /* proves code + key, runs nothing */
+      if(!r.ok){ deny(r.status===403&&/code/i.test(j.error||"")?"ACCESS DENIED":(j.error||"failed")); return; }
+    }catch(e){ deny(e.message); return; }
+    startWindow(execute);
+  };
+})();
 
 async function cancelLoad(model){
   /* Cancel also unpins, server-side: a pinned model that is merely unloaded comes
@@ -660,6 +993,13 @@ function render(s){
   else b.style.display="none";
 
   const loadingIds=new Set((s.loading||[]).map(l=>l.model));
+  queuedPos={}; (s.queued||[]).forEach((id,i)=>{ queuedPos[id]=i+1; });
+  const qb=document.getElementById("queuebar");
+  if((s.queued||[]).length){
+    qb.style.display="block";
+    qb.textContent=((s.llm_loading||[]).length?`LLM loading (${s.llm_loading.join(", ")}) - `:"")+
+      `Queue, one at a time: ${(s.queued||[]).map((id,i)=>`${i+1}. ${modelName(id)}`).join("  |  ")}`;
+  }else qb.style.display="none";
   const shown=grouped.filter(m=>keep(m,run)).sort((a,c)=>
     (c.pinned-a.pinned)||((run[c.id]?1:0)-(run[a.id]?1:0))||a.id.localeCompare(c.id));
   document.getElementById("count").textContent=
@@ -673,7 +1013,7 @@ function render(s){
 
   if(!_picking) document.getElementById("rows").innerHTML = shown.length ? shown.map(m=>{
     const r=run[m.id], working=busy.has(m.id), loading=loadingIds.has(m.id),
-          st=loading?"loading":working?"working":(r?r.state:"stopped");
+          st=loading?"loading":working?"working":queuedPos[m.id]?"queued":(r?r.state:"stopped");
     if(isImg(m)) return imgRow(m, working);
     return `<tr class="${m.pinned?"pinned":r?"live":""}">
       <td><div class="mid">${modelName(m.id)}${isEmbed(m)?(m.vision==="on"
@@ -696,13 +1036,14 @@ function render(s){
         title="Thinking default applied at load time (a request may still override it)"
         onchange="setEffort('${m.id}',this.value,${!!r})">${effortOptions(m)}</select>`
         :"&mdash;"}</td>
-      <td><span class="st ${st}">${st}</span></td>
+      <td><span class="st ${st}">${st==="queued"?"queued #"+queuedPos[m.id]:st}</span></td>
       <td class="mid">${r&&r.ttl?Math.round(r.ttl/60)+" MIN":"&mdash;"}</td>
       <td class="act">
         <button class="${m.pinned?"on":""}" ${working?"disabled":""}
           onclick="act('/api/pin','${m.id}',${!m.pinned})">${m.pinned?"Pinned":"Pin"}</button>
-        <button ${working||!r?"disabled":""}
-          onclick="act('/api/unload','${m.id}')">Unload</button></td></tr>`;
+        <button class="unl" ${working||(!r&&!m.pinned&&!queuedPos[m.id])?"disabled":""}
+          title="${r?"Unload this model and drop its pin":"Not loaded: drop the pin (cancels a load in progress)"}"
+          onclick="act('/api/unload','${m.id}')">${r||(!m.pinned&&!queuedPos[m.id])?"Unload":queuedPos[m.id]&&!r?"Dequeue":"Unpin"}</button></td></tr>`;
   }).join("") : `<tr><td colspan="8" class="empty">No models match this filter</td></tr>`;
 
   document.getElementById("clock").textContent=new Date().toLocaleTimeString();

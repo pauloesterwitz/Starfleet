@@ -19,6 +19,10 @@ stdlib only.  Run:  python3 fleet.py
 """
 
 import argparse
+import glob
+import datetime
+import hmac
+import io
 import json
 import os
 import re
@@ -31,12 +35,16 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-SWAP = os.environ.get("FLEET_SWAP", "http://127.0.0.1:28080")
+# All llama-swap traffic goes through ctxproxy (:28081). Loads/unloads need the Starfleet key, which this
+# process only passes through from the browser (X-Starfleet-Key) and never stores.
+SWAP = os.environ.get("FLEET_SWAP", "http://127.0.0.1:28081")
+KEY_HDR = "X-Starfleet-Key"
+POLICY = "Only Starfleet Command may load models and Agents may not load models on their own. This is a policy!"
 
 # None = run the probe locally.  Anything else is an ssh host.
 # Use the *.fritz.box name, never the bare tailnet name: the latter hits
 # Tailscale SSH, which wants a browser and breaks BatchMode.
-NODES = {"jean-luc": None, "kathryn": "kathryn.fritz.box"}
+NODES = {"jean-luc": None, "kathryn": "10.100.0.1"}
 
 PIN_FILE = os.path.expanduser("~/.config/fleet-ui/pins.json")
 LOAD_TIMES_FILE = os.path.expanduser("~/.config/fleet-ui/load-times.json")
@@ -243,6 +251,17 @@ def unload_image_models(node):
         return False, f"{node}: {str(e)[:150]}"
 
 
+def _family_base(model):
+    """Python twin of fleet.html's modelName(): the model with node suffix, -tp2 and tps removed."""
+    m = re.sub(r"-(jean-luc|kathryn|fastest-node|starfleet)$", "", model)
+    return re.sub(r"-\d+(?:\.\d+)?tps(?=-|$)", "", re.sub(r"-tp2(?=-|$)", "", m))
+
+
+def _same_family(a, b):
+    """Same logical model deployed once per machine (the Machine picker's families)."""
+    return len(node_of(a)) == 1 == len(node_of(b)) and _family_base(a) == _family_base(b)
+
+
 def node_of(model):
     """Which machines a model occupies. Encoded in the name suffix by config.yaml."""
     for suffix, nodes in (
@@ -340,19 +359,298 @@ def parse_probe(text):
     return out if "mem_total_kb" in out else None
 
 
-def swap_get(path, timeout=10):
-    with urllib.request.urlopen(SWAP + path, timeout=timeout) as r:
+def _err_text(e):
+    """HTTPError body (the gate's policy message) or the plain error text."""
+    if isinstance(e, urllib.error.HTTPError):
+        try:
+            return json.loads(e.read()).get("error", {}).get("message") or str(e)
+        except (ValueError, AttributeError):
+            return str(e)
+    return str(e)
+
+
+def swap_get(path, timeout=10, key=None):
+    req = urllib.request.Request(SWAP + path, headers={KEY_HDR: key} if key else {})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.read().decode()
 
 
-def swap_unload(model, timeout=30):
+def swap_unload(model, timeout=30, key=None):
     """Evict ONE model. llama-swap's plain GET /unload ignores ?model= and unloads
     EVERY member, which killed the pinned Starfleet model whenever any other model was
     unpinned (2026-10-02). The per-model route is POST /api/models/unload/<model>."""
     req = urllib.request.Request(
-        SWAP + "/api/models/unload/" + urllib.parse.quote(model, safe=""), method="POST")
+        SWAP + "/api/models/unload/" + urllib.parse.quote(model, safe=""), method="POST",
+        headers={KEY_HDR: key} if key else {})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.read().decode()
+
+
+def _mem_avail_mb():
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) // 1024
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def swap_running():
+    """Model ids llama-swap still lists as resident (any state), straight from /running."""
+    return {r.get("model") for r in json.loads(swap_get("/running")).get("running", [])}
+
+
+def evict(model, key=None, wait=90):
+    """Unload `model`, then PROVE it: poll llama-swap until it no longer lists it, so a
+    green button means the process (and its container, via the serve script's stop trap)
+    is gone, not merely that the request was accepted. Returns MB of RAM freed on this
+    machine (a Kathryn member frees memory over there, so ~0 here is normal for those).
+    Raises OSError if the model is still resident after `wait` seconds."""
+    before = _mem_avail_mb()
+    swap_unload(model, timeout=wait, key=key)
+    deadline = time.time() + wait
+    while model in swap_running():
+        if time.time() > deadline:
+            raise OSError(f"{model} is still resident {wait}s after unload; memory NOT freed")
+        time.sleep(1)
+    time.sleep(2)                       # let the kernel return the pages
+    after = _mem_avail_mb()
+    return max(0, after - before) if None not in (before, after) else None
+
+
+_GPU_PS = ("docker ps -q | xargs -r docker inspect -f "
+           "'{{.Name}} {{.HostConfig.Runtime}} {{len .HostConfig.DeviceRequests}}'")
+
+
+def gpu_containers(host):
+    """Names of running containers that hold a GPU (nvidia runtime or a device request) on one
+    node. That is every model server this stack starts -- vLLM/SGLang/Ray heads and workers,
+    embedders, rerankers, ComfyUI -- and none of the plain service containers."""
+    cmd = ["bash", "-lc", _GPU_PS] if host is None else [
+        "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host, _GPU_PS]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        raise OSError((r.stderr or "docker ps failed").strip()[:200])
+    names = []
+    for line in r.stdout.splitlines():
+        f = line.split()
+        if len(f) == 3 and (f[1] == "nvidia" or f[2] != "0"):
+            names.append(f[0].lstrip("/"))
+    return names
+
+
+def _mcp_containers():
+    """[(container name, pid of its `docker run` client or None)] for local containers started with
+    `docker run -i` (MCP-style servers). A container belongs to a client when a live `docker run`
+    process names it (--name) or started within 4 s of it with the same image. Services without an
+    open stdin (qdrant, postgres, open-webui, ...) are never listed."""
+    ps = subprocess.run(["ps", "-eo", "pid=,etimes=,args="], capture_output=True, text=True, timeout=20).stdout
+    clients = []
+    for line in ps.splitlines():
+        f = line.split(None, 2)
+        if len(f) == 3 and f[0].isdigit() and f[1].isdigit() and f[2].startswith("docker run"):
+            clients.append((int(f[0]), int(f[1]), f[2]))
+    ids = subprocess.run(["docker", "ps", "-q"], capture_output=True, text=True, timeout=30).stdout.split()
+    if not ids:
+        return []
+    fmt = "{{.Name}}\t{{.Config.OpenStdin}}\t{{.Config.Image}}\t{{.State.StartedAt}}"
+    out = subprocess.run(["docker", "inspect", "-f", fmt, *ids], capture_output=True, text=True,
+                         timeout=30).stdout
+    now, found = time.time(), []
+    for line in out.splitlines():
+        try:
+            name, stdin, image, started = line.split("\t")
+            if stdin != "true":
+                continue
+            ts = datetime.datetime.fromisoformat(re.sub(r"(\.\d{6})\d*Z$", r"\1+00:00", started)).timestamp()
+        except ValueError:
+            continue
+        name, age = name.lstrip("/"), now - ts
+        owner = next((pid for pid, e, a in clients
+                      if f"--name {name} " in a + " " or (abs(e - age) <= 4 and image in a)), None)
+        found.append((name, owner))
+    return found
+
+
+def orphaned_containers():
+    """MCP-style containers whose `docker run` client is gone: nothing can talk to them any more."""
+    return [name for name, owner in _mcp_containers() if owner is None]
+
+
+def session_idle_s(launcher_pid):
+    """Seconds since the session that launched an MCP container was last active, or None if unknown.
+    Claude Code (ccd-cli): age of its session transcript. opencode: age of last input on its terminal.
+    Unknown never counts as dormant."""
+    try:
+        with open(f"/proc/{launcher_pid}/cmdline") as f:
+            cmd = f.read().replace("\0", " ")
+        if "ccd-cli" in cmd:
+            for u in re.findall(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", cmd):
+                for t in glob.glob(os.path.expanduser(f"~/.claude/projects/*/{u}.jsonl")):
+                    return time.time() - os.stat(t).st_mtime
+        elif "opencode" in cmd:
+            tty = subprocess.run(["ps", "-o", "tty=", "-p", str(launcher_pid)], capture_output=True,
+                                 text=True, timeout=10).stdout.strip()
+            if tty.startswith("pts"):
+                return time.time() - os.stat("/dev/" + tty).st_atime
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return None
+
+
+def dormant_session_containers(hours=24):
+    """MCP containers whose launching session has been inactive for more than `hours`. The session
+    process itself keeps running; only its container tools go away until it is restarted."""
+    out = []
+    for name, owner in _mcp_containers():
+        if owner is None:
+            continue
+        try:
+            with open(f"/proc/{owner}/stat") as f:
+                launcher = int(f.read().rsplit(")", 1)[1].split()[1])     # ppid of the docker client
+        except (OSError, ValueError, IndexError):
+            continue
+        idle = session_idle_s(launcher)
+        if idle is not None and idle > hours * 3600:
+            out.append(name)
+    return out
+
+
+def _docker_stop(host, names):
+    if not names:
+        return
+    script = "docker stop -t 10 " + " ".join(names)
+    cmd = ["bash", "-lc", script] if host is None else [
+        "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host, script]
+    subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+
+
+DORMANT_HOURS = 24      # Red Alert stops MCP containers of sessions inactive for longer than this
+
+
+def red_alert(key):
+    """Stop everything that holds a model in memory, on every node. Order matters:
+    1. the key is proven by llama-swap's unload-all (the gate refuses it otherwise);
+    2. pins are cleared, else keepalive/pins would reload them;
+    3. wait until llama-swap lists nothing (its serve-script traps stop their containers);
+    4. docker stop whatever GPU container is still up -- orphans llama-swap no longer knows."""
+    if not key:
+        raise urllib.error.HTTPError(SWAP, 403, POLICY, {}, io.BytesIO(
+            json.dumps({"error": {"message": POLICY}}).encode()))
+    with _load_cv:
+        _load_q.clear()                          # queued loads must not start after a Red Alert
+    before = _mem_avail_mb()
+    with _loading_lock:
+        loading = list(_loading)
+    with _cancel_lock:
+        _cancelled.update(loading)               # their health probes die: not a fault
+    try:
+        unloaded = sorted(swap_running())
+    except (OSError, ValueError):
+        unloaded = []
+    swap_get("/unload", timeout=120, key=key)
+    save_pins(set())
+    deadline = time.time() + 90
+    while swap_running() and time.time() < deadline:
+        time.sleep(1)
+    stopped, errors = {}, {}
+    for node, host in NODES.items():
+        try:
+            names = gpu_containers(host)
+            _docker_stop(host, names)
+            stopped[node] = names
+        except (subprocess.SubprocessError, OSError) as e:
+            errors[node] = str(e)[:200]
+    orphans, dormant = [], []
+    try:
+        orphans = orphaned_containers()
+        dormant = dormant_session_containers(DORMANT_HOURS)
+        _docker_stop(None, orphans + dormant)
+    except (subprocess.SubprocessError, OSError) as e:
+        errors["orphans"] = str(e)[:200]
+    with LOCK:
+        STATE["errors"].clear()
+    time.sleep(2)
+    after = _mem_avail_mb()
+    freed = max(0, after - before) if None not in (before, after) else None
+    return {"ok": not errors and not swap_running(), "unloaded": unloaded, "stopped": stopped,
+            "orphans": orphans, "dormant": dormant, "errors": errors, "freed_mb": freed}
+
+
+def _sudo_reboot(host, delay):
+    """Schedule a graceful reboot (systemd stops units and containers first) `delay` seconds
+    out, so this call returns before the machine goes down."""
+    script = f"sudo -n systemd-run --on-active={delay} --unit=starfleet-autodestruct systemctl reboot"
+    cmd = ["bash", "-lc", script] if host is None else [
+        "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host, script]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    if r.returncode != 0:
+        raise OSError((r.stderr or "reboot scheduling failed").strip()[:200])
+
+
+# Auto Destruct's typed confirmation. It comes from the service environment and is never in the repo;
+# unset means Auto Destruct is disabled. A speed bump only: the Starfleet key is the real gate.
+AUTODESTRUCT_CODE = os.environ.get("STARFLEET_AUTODESTRUCT_CODE", "").strip().upper()
+
+
+JEAN_LUC_REBOOT_S = 10      # Jean-Luc reboots this long after the request returns (Kathryn: 3 s)
+
+
+class AutoDestructOff(Exception):
+    """No code is configured, so Auto Destruct refuses everything."""
+
+
+def _check_code(code):
+    if not AUTODESTRUCT_CODE:      # fail closed: "" would otherwise equal an empty submitted code
+        raise AutoDestructOff("Auto Destruct is disabled: set STARFLEET_AUTODESTRUCT_CODE in the "
+                              "Fleet UI service environment.")
+    if not hmac.compare_digest(str(code or "").strip().upper().encode(), AUTODESTRUCT_CODE.encode()):
+        raise PermissionError("Authorization code rejected.")
+
+
+def auto_destruct_check(key, code):
+    """Pre-flight for the 10 s cancel window: prove the code and the Starfleet key, execute nothing.
+    The key is proven with a no-op unload of a model that is not resident."""
+    _check_code(code)
+    return key_check(key)
+
+
+def key_check(key):
+    """Prove the Starfleet key with a no-op unload of a model that is not resident."""
+    with LOCK:
+        running = {r.get("model") for r in STATE["running"]}
+        idle = next((m for m in STATE["models"] if m not in running), None)
+    if not key or (idle and not key_ok(idle, key)):
+        raise urllib.error.HTTPError(SWAP, 403, POLICY, {}, io.BytesIO(
+            json.dumps({"error": {"message": POLICY}}).encode()))
+    return {"ok": True}
+
+
+def auto_destruct(key, code=None):
+    """Red Alert (clean stop of every model and GPU container), then reboot Kathryn, then
+    Jean-Luc. Kathryn is scheduled first and Jean-Luc JEAN_LUC_REBOOT_S later: this UI runs on Jean-Luc, so
+    it must be the last thing to go. If Kathryn cannot be scheduled, Jean-Luc is left alone."""
+    _check_code(code)
+    alert = red_alert(key)                      # raises 403 without the key
+    _sudo_reboot(NODES["kathryn"], 3)
+    _sudo_reboot(NODES["jean-luc"], JEAN_LUC_REBOOT_S)
+    return {"ok": True, "red_alert": alert, "kathryn_in_s": 3, "jean_luc_in_s": JEAN_LUC_REBOOT_S}
+
+
+def key_ok(model, key):
+    """Cheap key check with no side effect: unloading a model that is not resident is a no-op
+    at llama-swap, but the gate answers 403 to a missing or wrong key before it gets there."""
+    if not key:
+        return False
+    try:
+        swap_unload(model, key=key)
+    except urllib.error.HTTPError as e:
+        return e.code != 403
+    except OSError:
+        return True          # gate unreachable is not a key problem; the load will report it
+    return True
 
 
 def load_pins():
@@ -393,15 +691,21 @@ def load_times():
         return {}
 
 
+_load_times_lock = threading.Lock()
+
+
 def record_load_time(model, secs):
     """Append one cold-load duration, keeping only the last LOAD_HISTORY."""
-    hist = load_times()
-    hist[model] = (hist.get(model, []) + [round(secs, 1)])[-LOAD_HISTORY:]
-    os.makedirs(os.path.dirname(LOAD_TIMES_FILE), exist_ok=True)
-    tmp = LOAD_TIMES_FILE + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(hist, f, indent=2, sort_keys=True)
-    os.replace(tmp, LOAD_TIMES_FILE)  # atomic -- never leave a half-written file
+    # Two loads finishing together shared one .tmp: the first os.replace consumed it and the
+    # second raised ENOENT. The lock also covers the read-modify-write, so neither sample is lost.
+    with _load_times_lock:
+        hist = load_times()
+        hist[model] = (hist.get(model, []) + [round(secs, 1)])[-LOAD_HISTORY:]
+        os.makedirs(os.path.dirname(LOAD_TIMES_FILE), exist_ok=True)
+        tmp = LOAD_TIMES_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(hist, f, indent=2, sort_keys=True)
+        os.replace(tmp, LOAD_TIMES_FILE)  # atomic -- never leave a half-written file
 
 
 def eta_for(model, hist=None):
@@ -1056,7 +1360,7 @@ def read_effort(member):
     return raw[:40]        # set by hand / no longer offered -- show it rather than lie
 
 
-def apply_effort(model, label):
+def apply_effort(model, label, key=None):
     """Record the chat-template kwargs for `label` and evict the model if resident, so
     it comes back with the new default. Returns True if a running model was unloaded.
 
@@ -1087,11 +1391,11 @@ def apply_effort(model, label):
             resident = any(r.get("model") == model for r in STATE["running"])
         if not resident:
             return False
-        swap_unload(model)
+        swap_unload(model, key=key)
         return True
 
 
-def apply_ctx(model, ctx):
+def apply_ctx(model, ctx, key=None):
     """Record a context size for `model` (None clears it, back to the deployed
     default) and evict it if it is resident, so it comes back at the new size.
 
@@ -1120,7 +1424,7 @@ def apply_ctx(model, ctx):
             resident = any(r.get("model") == model for r in STATE["running"])
         if not resident:
             return False
-        swap_unload(model)
+        swap_unload(model, key=key)
         return True
 
 
@@ -1161,7 +1465,7 @@ def poll_swap():
         time.sleep(3)
 
 
-def touch(model):
+def touch(model, key=None):
     """Load `model` (or reset its ttl). Blocks until the backend is ready — call in a thread.
 
     memcheck.sh inside llama-swap refuses a load that will not fit and returns a
@@ -1187,7 +1491,7 @@ def touch(model):
         # below only if THIS attempt actually fails.
         STATE["errors"].pop(model, None)
     try:
-        swap_get(f"/upstream/{q}/health", timeout=LOAD_TIMEOUT)
+        swap_get(f"/upstream/{q}/health", timeout=LOAD_TIMEOUT, key=key)
         elapsed = time.time() - started
         # MIN_COLD_LOAD guards the history against a "cold" touch that was in
         # fact served instantly -- the model came up between poll_swap's 3s
@@ -1198,7 +1502,7 @@ def touch(model):
             STATE["errors"].pop(model, None)
         return True
     except urllib.error.HTTPError as e:
-        msg = e.read().decode(errors="replace")[:400] or f"HTTP {e.code}"
+        msg = _err_text(e)[:400] or f"HTTP {e.code}"
     except (urllib.error.URLError, OSError) as e:
         msg = str(e)[:400]
     finally:
@@ -1221,7 +1525,7 @@ _cancelled = set()        # models whose in-flight cold load the user aborted
 _cancel_lock = threading.Lock()
 
 
-def cancel_load(model):
+def cancel_load(model, key=None):
     """Abort a cold load in flight.
 
     Unpin FIRST -- otherwise keepalive puts the model straight back, which is what
@@ -1238,11 +1542,131 @@ def cancel_load(model):
         _cancelled.add(model)
     with _loading_lock:
         _loading.pop(model, None)
-    swap_unload(model)
+    swap_unload(model, key=key)
 
 
 _reloading = set()        # pins currently being re-touched, so we don't double-fire
 _reloading_lock = threading.Lock()
+
+
+# ---------------------------------------------------------------- load queue
+# Embedding, reranker and image models are "light": they must never start loading while an LLM
+# is loading (they fight it for memory and bandwidth). Their loads go through ONE queue and run
+# one after the other, each only when no LLM load is in flight. An LLM load never waits.
+# The Starfleet key rides along in memory only until the job runs; nothing is written to disk.
+
+_LIGHT = re.compile(r"embed|rerank", re.I)
+_load_q = []                    # FIFO of {"model", "key", "job"}
+_load_cv = threading.Condition()
+_llm_busy = set()               # LLM members whose load request is in flight
+_q_current = None               # light model the worker is loading right now
+
+
+def is_light(model):
+    return bool(_LIGHT.search(model)) or model in {m["id"] for m in image_models()}
+
+
+def _set_llm_busy(model, on):
+    with _load_cv:
+        (_llm_busy.add if on else _llm_busy.discard)(model)
+        _load_cv.notify_all()
+
+
+def enqueue_light(model, key, job):
+    """Queue `job(model, key)`. Returns its 1-based position, or None if it is already queued/running."""
+    with _load_cv:
+        if _q_current == model or any(j["model"] == model for j in _load_q):
+            return None
+        _load_q.append({"model": model, "key": key, "job": job})
+        _load_cv.notify_all()
+        return len(_load_q)
+
+
+def dequeue(model):
+    """Drop a not-yet-started job (unpin / unload / cancel of a queued model). True if one was removed."""
+    with _load_cv:
+        before = len(_load_q)
+        _load_q[:] = [j for j in _load_q if j["model"] != model]
+        return len(_load_q) != before
+
+
+def queued_ids():
+    with _load_cv:
+        return [j["model"] for j in _load_q] + ([_q_current] if _q_current else [])
+
+
+def _next_job(wait=2.0):
+    """The next queued job, or None while the queue is empty or an LLM is loading."""
+    global _q_current
+    with _load_cv:
+        if (not _load_q or _llm_busy) and wait:
+            _load_cv.wait(timeout=wait)
+        if not _load_q or _llm_busy:
+            return None
+        j = _load_q.pop(0)
+        _q_current = j["model"]
+        return j
+
+
+def load_queue_worker():
+    global _q_current
+    while True:
+        j = _next_job()
+        if j is None:
+            continue
+        try:
+            j["job"](j["model"], j["key"])
+        except Exception as e:                   # a failed light load must not stop the queue
+            with LOCK:
+                STATE["errors"][j["model"]] = str(e)[:300]
+        finally:
+            with _load_cv:
+                _q_current = None
+                _load_cv.notify_all()
+
+
+def _comfy_wait(node, timeout=900):
+    """Block until ComfyUI on `node` has nothing running or pending (the warm-up graph finished)."""
+    url, end = COMFY_ENDPOINTS[node] + "/queue", time.time() + timeout
+    while time.time() < end:
+        try:
+            with urllib.request.urlopen(url, timeout=10) as r:
+                q = json.load(r)
+        except (OSError, ValueError):
+            return
+        if not q.get("queue_running") and not q.get("queue_pending"):
+            return
+        time.sleep(2)
+
+
+def _warm_job(model, key, node):
+    ok, msg = warm_image_model(model, node)
+    if not ok:
+        with LOCK:
+            STATE["errors"][model] = msg
+        return
+    _comfy_wait(node)
+    prefs = load_img_nodes()
+    prefs.setdefault(model, {})["node"] = node
+    prefs[model]["loaded_at"] = time.time()
+    save_img_nodes(prefs)
+
+
+def request_load(model, key):
+    """Start loading `model` on behalf of the UI. LLMs start at once; light models are queued.
+    Returns the queue position for a queued model, else 0."""
+    if is_light(model):
+        return enqueue_light(model, key, lambda m, k: touch(m, k)) or 0
+    _set_llm_busy(model, True)
+
+    def run():
+        try:
+            touch(model, key)
+        finally:
+            _set_llm_busy(model, False)
+
+    threading.Thread(target=run, daemon=True).start()
+    return 0
 
 
 def _touch_async(model):
@@ -1290,7 +1714,10 @@ def keepalive():
             running_ids = {r.get("model") for r in STATE["running"]}
         due_for_refresh = time.time() - last_refresh >= KEEPALIVE
         for model in _pins_needing_touch(pins, running_ids, due_for_refresh):
-            _touch_async(model)
+            # Policy: only a human with the Starfleet key loads. Resident pins get their ttl
+            # refreshed; a pin that is not resident waits for a keyed Load in the UI.
+            if model in running_ids:
+                _touch_async(model)
         if due_for_refresh:
             last_refresh = time.time()
         time.sleep(RECHECK)
@@ -1411,18 +1838,28 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(data)
 
     def do_GET(self):
         if self.path == "/":
             return self._send(200, page(), "text/html; charset=utf-8")
+        if self.path == "/sounds/tng_red_alert1.mp3":
+            with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "sounds",
+                                  "tng_red_alert1.mp3"), "rb") as f:
+                return self._send(200, f.read(), "audio/mpeg")
+        if self.path == "/api/boot":
+            with open("/proc/sys/kernel/random/boot_id") as f:
+                return self._send(200, json.dumps({"boot": f.read().strip()}), "application/json")
         if self.path == "/api/jobs":
             return self._send(200, json.dumps(jobs_snapshot()), "application/json")
         if self.path == "/api/state":
             with LOCK:
                 snap = json.loads(json.dumps(STATE))
             snap["pins"] = load_pins()
+            snap["queued"] = queued_ids()
+            snap["llm_loading"] = sorted(_llm_busy)
             times = load_times()  # read once, not once per model
             ctxs, wired = read_all_ctx(), wired_members()
             with _ctx_max_lock:
@@ -1517,6 +1954,30 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             return self._send(400, '{"error":"bad json"}', "application/json")
         model = body.get("model")
+        key = self.headers.get(KEY_HDR)
+        if self.path == "/api/autodestruct":
+            try:
+                res = (auto_destruct_check if body.get("check") else auto_destruct)(key, body.get("code"))
+            except AutoDestructOff as e:
+                return self._send(503, json.dumps({"error": str(e)}), "application/json")
+            except PermissionError as e:
+                return self._send(403, json.dumps({"error": str(e)}), "application/json")
+            except urllib.error.HTTPError as e:
+                return self._send(403, json.dumps({"error": _err_text(e)}), "application/json")
+            except (urllib.error.URLError, OSError, subprocess.SubprocessError) as e:
+                return self._send(502, json.dumps({"error": f"reboot NOT scheduled: {str(e)[:180]}"}),
+                                  "application/json")
+            print(f"AUTO DESTRUCT: {res}", flush=True)
+            return self._send(200, json.dumps(res), "application/json")
+        if self.path == "/api/redalert":
+            try:
+                res = key_check(key) if body.get("check") else red_alert(key)
+            except urllib.error.HTTPError as e:
+                return self._send(403, json.dumps({"error": _err_text(e)}), "application/json")
+            except (urllib.error.URLError, OSError, subprocess.SubprocessError) as e:
+                return self._send(502, json.dumps({"error": str(e)[:200]}), "application/json")
+            print(f"RED ALERT: {res}", flush=True)
+            return self._send(200, json.dumps(res), "application/json")
         known = STATE["models"]
         img_ids = {m["id"] for m in image_models()}
         # image models are not llama-swap members, so they are never in STATE["models"]
@@ -1526,11 +1987,21 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/api/pin":
             pins = set(load_pins())
             if body.get("pin"):
+                with LOCK:
+                    resident = any(r.get("model") == model for r in STATE["running"])
+                if not resident and not key_ok(model, key):
+                    return self._send(403, json.dumps({"error": POLICY}), "application/json")
+                # Pins are per member, and the Machine picker only switches which twin a row
+                # shows. A pin left on the other twin was re-touched by keepalive and evicted
+                # this one (rerankers share a swap:true group), so the model bounced back to its
+                # old machine. Pinning one twin moves the pin off its siblings.
+                pins -= {s for s in pins if s != model and _same_family(s, model)}
                 pins.add(model)
                 save_pins(pins)
-                threading.Thread(target=touch, args=(model,), daemon=True).start()
+                request_load(model, key)
             else:
                 pins.discard(model)
+                dequeue(model)
                 save_pins(pins)
             return self._send(200, '{"ok":true}', "application/json")
 
@@ -1540,9 +2011,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(400, '{"error":"effort must be a string or null"}',
                                   "application/json")
             try:
-                reloaded = apply_effort(model, label)
+                reloaded = apply_effort(model, label, key)
             except ValueError as e:
                 return self._send(400, json.dumps({"error": str(e)}), "application/json")
+            except urllib.error.HTTPError as e:
+                return self._send(403, json.dumps({"error": _err_text(e)}), "application/json")
             except OSError as e:
                 return self._send(500, json.dumps({"error": str(e)[:200]}), "application/json")
             return self._send(200, json.dumps({"ok": True, "reloaded": reloaded}),
@@ -1568,25 +2041,43 @@ class Handler(BaseHTTPRequestHandler):
                                   f"config.yaml is not wired through ctx-env.sh"}),
                         "application/json")
             try:
-                reloaded = apply_ctx(model, ctx)
+                reloaded = apply_ctx(model, ctx, key)
+            except urllib.error.HTTPError as e:
+                return self._send(403, json.dumps({"error": _err_text(e)}), "application/json")
             except OSError as e:
                 return self._send(500, json.dumps({"error": str(e)[:200]}), "application/json")
             return self._send(200, json.dumps({"ok": True, "reloaded": reloaded}),
                               "application/json")
 
         if self.path == "/api/unload":
+            dequeue(model)
             pins = set(load_pins())
             pins.discard(model)          # unpin too, else keepalive reloads it
             save_pins(pins)
+            with LOCK:
+                resident = any(r.get("model") == model for r in STATE["running"])
+            with _loading_lock:
+                loading = model in _loading
             try:
-                swap_unload(model)
+                if loading:
+                    cancel_load(model, key)      # a pinned model still starting: abort the load
+                elif resident:
+                    freed = evict(model, key)
+                    print(f"unload {model}: evicted, {freed} MB freed on this machine", flush=True)
+                    return self._send(200, json.dumps({"ok": True, "freed_mb": freed}),
+                                      "application/json")
+            except urllib.error.HTTPError as e:
+                return self._send(403, json.dumps({"error": _err_text(e)}), "application/json")
             except (urllib.error.URLError, OSError) as e:
                 return self._send(502, json.dumps({"error": str(e)[:200]}), "application/json")
             return self._send(200, '{"ok":true}', "application/json")
 
         if self.path == "/api/cancel":
+            dequeue(model)
             try:
-                cancel_load(model)
+                cancel_load(model, key)
+            except urllib.error.HTTPError as e:
+                return self._send(403, json.dumps({"error": _err_text(e)}), "application/json")
             except (urllib.error.URLError, OSError) as e:
                 return self._send(502, json.dumps({"error": str(e)[:200]}), "application/json")
             return self._send(200, '{"ok":true}', "application/json")
@@ -1597,6 +2088,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(400, json.dumps(
                     {"error": f"unknown node {node!r}; have {sorted(COMFY_ENDPOINTS)}"}),
                     "application/json")
+            if body.get("warm", True):                    # a warm-up IS a load: same key rule as llama-swap
+                try:
+                    key_check(key)
+                except urllib.error.HTTPError as e:
+                    return self._send(403, json.dumps({"error": _err_text(e)}), "application/json")
             prefs = load_img_nodes()
             entry = prefs.setdefault(model, {})
             moved = entry.get("node") not in (None, node)
@@ -1610,19 +2106,16 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, json.dumps({"ok": True, "node": node}),
                                   "application/json")
 
-            ok, msg = warm_image_model(model, node)
-            if ok:
-                prefs = load_img_nodes()
-                prefs.setdefault(model, {})["node"] = node
-                prefs[model]["loaded_at"] = time.time()
-                save_img_nodes(prefs)
-            # A failed warm is not a failed assignment: the preference is saved either
-            # way, so a render still routes correctly once the node is reachable.
-            return self._send(200, json.dumps({"ok": True, "node": node,
-                                               "warmed": ok, "message": msg}),
+            # The warm-up waits its turn behind any LLM load and other light loads. A failed warm
+            # is not a failed assignment: the preference is saved either way, so a render still
+            # routes correctly once the node is reachable.
+            pos = enqueue_light(model, key, lambda m, k, n=node: _warm_job(m, k, n))
+            return self._send(200, json.dumps({"ok": True, "node": node, "queued": pos or 0}),
                               "application/json")
 
         if self.path == "/api/imgunload":
+            if dequeue(model):
+                return self._send(200, '{"ok":true}', "application/json")
             prefs = load_img_nodes()
             node = img_node(model, prefs)
             ok, msg = unload_image_models(node)
@@ -1654,6 +2147,7 @@ def page():
 # ---------------------------------------------------------------- entry
 
 def selfcheck():
+    global _q_current, AUTODESTRUCT_CODE
     # A pin missing from `running` (evicted by ttl, or by llama-swap swapping in a
     # different member of its swap:true group) must be touched immediately, same
     # tick, regardless of the refresh clock -- that's the whole fix.
@@ -1661,6 +2155,63 @@ def selfcheck():
     assert _pins_needing_touch(["a", "b"], {"a", "b"}, due_for_refresh=False) == []
     assert _pins_needing_touch(["a", "b"], {"a", "b"}, due_for_refresh=True) == ["a", "b"]
     assert _pins_needing_touch([], {"a"}, due_for_refresh=True) == []
+
+    # Auto Destruct fails closed. With no code configured an empty submitted code must not match an
+    # empty configured one; with one configured, the case and padding of what was typed do not matter.
+    _code = AUTODESTRUCT_CODE
+    try:
+        AUTODESTRUCT_CODE = ""
+        for sent in ("", None, "ANY"):
+            try:
+                _check_code(sent)
+                raise AssertionError("an unset code must refuse everything")
+            except AutoDestructOff:
+                pass
+        AUTODESTRUCT_CODE = "AB-1"
+        _check_code(" ab-1 ")
+        for sent in ("", None, "AB-2"):
+            try:
+                _check_code(sent)
+                raise AssertionError("a wrong code must be rejected")
+            except PermissionError:
+                pass
+    finally:
+        AUTODESTRUCT_CODE = _code
+
+    # Light loads wait for any LLM load, then run strictly one after the other, FIFO.
+    assert is_light("embeddinggemma2") and is_light("qwen3-reranker-8b-kathryn") and not is_light("ornith-1.5-122b")
+    _llm_busy.add("some-llm")
+    assert enqueue_light("e1", "k", None) == 1 and enqueue_light("r1", "k", None) == 2
+    assert enqueue_light("e1", "k", None) is None                 # no duplicates
+    assert _next_job(wait=0) is None                              # held back while an LLM loads
+    assert dequeue("r1") and not dequeue("r1")
+    _llm_busy.clear()
+    assert enqueue_light("r2", "k", None) == 2
+    assert _next_job(wait=0)["model"] == "e1" and _q_current == "e1"
+    assert enqueue_light("e1", "k", None) is None                 # still running: not queueable again
+    _q_current = None
+    assert _next_job(wait=0)["model"] == "r2"
+    _q_current = None
+    assert _next_job(wait=0) is None
+
+    # evict() must only return once llama-swap has stopped listing the model, and must
+    # raise (not pretend) if it never does.
+    global swap_unload, swap_running
+    _u, _r = swap_unload, swap_running
+    try:
+        calls, listed = [], [True, True, False]
+        swap_unload = lambda m, timeout=30, key=None: calls.append((m, key))
+        swap_running = lambda: {"m"} if listed.pop(0) else set()
+        evict("m", "k", wait=30)
+        assert calls == [("m", "k")] and not listed
+        swap_running = lambda: {"m"}
+        try:
+            evict("m", "k", wait=0)
+            raise AssertionError("evict must fail while the model is still resident")
+        except OSError:
+            pass
+    finally:
+        swap_unload, swap_running = _u, _r
 
     # ETA maths: median (not mean) of recorded cold loads, and None while a
     # model has no history -- the page shows an indeterminate bar for that.
@@ -1868,7 +2419,7 @@ def main():
         return selfcheck()
 
     host = a.host or default_host()
-    for fn in (poll_nodes, poll_swap, keepalive, ctx_max_worker):
+    for fn in (poll_nodes, poll_swap, keepalive, ctx_max_worker, load_queue_worker):
         threading.Thread(target=fn, daemon=True).start()
     pins = load_pins()
     print(f"Fleet on http://{host}:{a.port}   (llama-swap {SWAP})", flush=True)
