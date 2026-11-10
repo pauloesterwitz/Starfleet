@@ -257,12 +257,17 @@ IMAGE="${IMAGE_OVERRIDE:-$IMAGE}"
 if [ -n "$DRAFT" ]; then NAME="${KEY}-dflash"; else NAME="${KEY}-nvfp4"; fi
 
 # Remove any stale container holding the GPU; tear down on swap-out so its VRAM is freed.
-docker rm -f "$NAME" >/dev/null 2>&1 || true
 cleanup() { echo "serve-vllm-dflash: stopping $NAME" >&2; docker stop -t 10 "$NAME" >/dev/null 2>&1 || true; }
 # HUP matters when this runs over ssh (the kathryn members): llama-swap kills the local ssh, the
 # remote pty closes, and bash gets SIGHUP — not TERM. Without HUP here the trap never fires and the
 # container is orphaned, holding 64GB of Kathryn's pool that her memcheck cannot reclaim.
-trap cleanup EXIT INT TERM HUP
+# A dry run is a read-only probe: fleet-ui runs every launcher with DRYRUN=1 at startup to read its
+# checkpoint. It must neither remove nor stop a live container that has the same name, so both the
+# `docker rm -f` and the stop trap are for real runs only.
+if [ -z "${DRYRUN:-}" ]; then
+  docker rm -f "$NAME" >/dev/null 2>&1 || true
+  trap cleanup EXIT INT TERM HUP
+fi
 
 # DFlash draft via --speculative-config (num_speculative_tokens=15), only for models that have a
 # draft checkpoint — an empty --speculative-config model path makes vLLM abort at startup.

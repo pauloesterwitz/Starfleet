@@ -205,9 +205,14 @@ POOLER="${POOLER:-{\"use_activation\": true\}}"
 CACHE="$HOME/.cache/vllm-embed"
 mkdir -p "$CACHE"
 
-docker rm -f "$NAME" >/dev/null 2>&1 || true
 cleanup() { echo "serve-embed: stopping $NAME" >&2; docker stop -t 10 "$NAME" >/dev/null 2>&1 || true; }
-trap cleanup EXIT INT TERM HUP
+# A dry run is a read-only probe: fleet-ui runs every launcher with DRYRUN=1 at startup to read its
+# checkpoint. It must neither remove nor stop a live container that has the same name, so both the
+# `docker rm -f` and the stop trap are for real runs only.
+if [ -z "${DRYRUN:-}" ]; then
+  docker rm -f "$NAME" >/dev/null 2>&1 || true
+  trap cleanup EXIT INT TERM HUP
+fi
 
 # --init so SIGTERM reaches vLLM (PID 1); --rm auto-cleans.
 # --served-model-name = the llama-swap member so proxied requests match.
