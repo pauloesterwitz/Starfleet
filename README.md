@@ -686,7 +686,7 @@ saved even when an answer fails or the browser goes away.
 
 <p align="center">
   <img src="docs/images/memory-core.png" width="820" alt="Memory Core: the wiki as a network of coloured dots joined by links, with a Computer session drawn on top (search-term pills wired to the pages they matched, numbered reads, cited pages); sessions, search terms and most consulted pages on the left, the access log on the right and the replay bar under the map">
-  <br><sub><b>Memory Core</b>: the wiki as a zoomable network; a Computer session as search terms, hits, relation hops, numbered reads and cited pages, with the access log and the replay bar. Example data.</sub>
+  <br><sub><b>Memory Core</b>: the wiki as a zoomable network; a Computer session as search terms, hits, numbered reads and cited pages, with the access log and the replay bar. Example data from a generated wiki.</sub>
 </p>
 
 Memory Core draws the LLM wiki as a map you can zoom and move: every page is a dot
@@ -694,20 +694,23 @@ Memory Core draws the LLM wiki as a map you can zoom and move: every page is a d
 relation). In the **Network** layout a force simulation pulls linked pages together, so
 clusters are topics; it settles once and the browser keeps it, so pages stay where they
 were. The **Core** layout is the ship's memory core: one ring per page type (other,
-concepts, entities, sources, from the centre out). Wheel, pinch or the buttons zoom,
-dragging moves the map, and page names appear as you zoom in.
+concepts, entities, sources, from the centre out). Wheel, pinch or the buttons zoom and
+dragging moves the map. The overview stays quiet: it draws the related links and a few
+page names, and the plain links and more names appear as you zoom in. Until a Computer
+chat has used the wiki, the side panels and the replay bar stay hidden.
 
 - **Connections.** Hover a page for its links, click it for its neighbourhood,
   double-click to zoom to it, Shift-click a second page (or **Path to…**) for the
   shortest chain of links between the two.
 - **Term probe.** Type terms: each becomes a pill wired to the pages whose title, tags
   or summary contain it. Pages that several terms share are the bridges between them.
-- **Computer.** A chat that used the wiki is drawn as its search: term pills to the
-  pages they matched, dashed lines to pages reached over a relation, dotted lines to
-  full-text hits, the pages read (numbered) and the pages the answer cited. The bar
-  under the map replays it step by step with the camera following, and counts
-  searches, hits, reads and cited pages. A web search refused after a wiki read shows
-  as **Locked**.
+- **Computer.** A chat that used the wiki is drawn as a summary: its search terms, the
+  pages they matched, the pages read (numbered) and the pages the answer cited. Hover a
+  step or replay the chat for the full picture of a search: term pills to the pages they
+  matched, dashed lines to pages reached over a relation, dotted lines to full-text
+  hits. The bar under the map replays it step by step with the camera following, and
+  counts searches, hits, reads and cited pages. A web search refused after a wiki read
+  shows as **Locked**.
 
 It is read-only. [`wikicore.py`](fleet-ui) exports the graph with the wiki MCP server's
 own link scanner, run inside its container with `docker exec` (`FLEET_WIKI_CONTAINER`),

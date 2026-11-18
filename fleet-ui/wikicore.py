@@ -211,13 +211,13 @@ def trails(chat_dir):
 
 
 if __name__ == "__main__":       # self-check: python3 wikicore.py
-    s = _step("wiki_search", {"query": "llama swap"},
-              "Search \"x\"\n1. `wiki/entities/llama-swap.md` | llama-swap | entity | entry (catalogue match: title)\n"
-              "2. `wiki/entities/ds4 (DwarfStar).md` | ds4 (DwarfStar) | entity | via [[llama-swap]] (related): x\n", 1.0)
-    assert [h["p"] for h in s["hits"]] == ["wiki/entities/llama-swap.md", "wiki/entities/ds4 (DwarfStar).md"]
-    assert s["hits"][1]["via"] == "llama-swap" and s["hits"][1]["rel"] == "related" and s["hits"][0]["via"] is None
-    r = _step("wiki_read", {"path": "llama-swap"}, "# wiki/entities/llama-swap.md\nOpen in browser: x", 2.0)
-    assert r["target"] == "wiki/entities/llama-swap.md"
+    s = _step("wiki_search", {"query": "example router"},
+              "Search \"x\"\n1. `wiki/entities/Example Router.md` | Example Router | entity | entry (catalogue match: title)\n"
+              "2. `wiki/entities/Example Server (v2).md` | Example Server (v2) | entity | via [[Example Router]] (related): x\n", 1.0)
+    assert [h["p"] for h in s["hits"]] == ["wiki/entities/Example Router.md", "wiki/entities/Example Server (v2).md"]
+    assert s["hits"][1]["via"] == "Example Router" and s["hits"][1]["rel"] == "related" and s["hits"][0]["via"] is None
+    r = _step("wiki_read", {"path": "Example Router"}, "# wiki/entities/Example Router.md\nOpen in browser: x", 2.0)
+    assert r["target"] == "wiki/entities/Example Router.md"
     w = _step("google_search", {"q": "x"}, "Refused: web search is off for the rest of this answer", 3.0)
     assert w["tool"] == "web" and w["blocked"]
     assert _paths("open: http://h/p/wiki/concepts/A%20B%20%28c%29.md)") == ["wiki/concepts/A B (c).md"]

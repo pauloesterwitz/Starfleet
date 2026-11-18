@@ -21,7 +21,7 @@ const EDGE={r:["related","#c9c"],l:["link","#6f93bd"],s:["source","#a4855f"]};
 const TERMC=["#ff9900","#99ccff","#ffcc66","#cc99cc","#ff9966","#d46ab8"];
 const KIND={ask:"Query",overview:"Scan",search:"Search",related:"Related",read:"Read",answer:"Answer",web:"Web"};
 const C={course:"#f90",hit:"#f90",read:"#fff",readRing:"#9cf",cite:"#d46ab8",rel:"#c9c",dim:"#3a2c18",path:"#fff"};
-const CORE_R=600, KMAX=9, LINK=24, CHARGE=-70, GRAV=.035, DMAX2=260*260, LSTR=1.7, TAU=Math.PI*2;
+const CORE_R=600, KMAX=9, LINK=28, CHARGE=-90, GRAV=.03, DMAX2=300*300, LSTR=1.7, POS="mcPos2", TAU=Math.PI*2;
 const STOP=new Set(("the a an and or of in on at for to is are was be what which how why do does did my me i you with from about into "+
   "der die das und oder ein eine einen für mit von zu ist sind was wie warum im in auf den dem").split(" "));
 const $=id=>document.getElementById(id);
@@ -56,22 +56,22 @@ function build(){
           <span class="sep"></span>
           <button class="pill" id="mclinks" type="button" title="Draw every link of the wiki">Links</button>
           <button class="pill" id="mcheat" type="button" title="Colour pages by how often Computer consulted them, over all sessions">Heat</button>
-          <span id="mclegend"></span></div>
+          <span class="grow"></span><span id="mcnos" title="Ask Computer about your notes. Its search then shows here: sessions, search terms, an access log and a replay bar.">No Computer session yet</span><span id="mcnote"></span></div>
         <div id="mcbox"><canvas id="mccv"></canvas><canvas id="mcov"></canvas><div id="mccap"></div><div id="mctip"></div>
-          <div id="mchint">Scroll or pinch: zoom · Drag: move · Click: page · Double-click: focus · Shift-click: path</div>
-          <div id="mczoom"><button class="zb" id="mczo" type="button" title="Zoom out (-)">&minus;</button><button class="zb" id="mczf" type="button"
+          <div id="mclegend"></div>
+          <div id="mchint">Scroll or pinch: zoom · Drag: move · Click a page: its neighbourhood · Double-click: zoom to it · Shift-click a second page: shortest path</div>
+          <div id="mczoom"><button class="zb" id="mczh" type="button" title="How to move around the map">?</button><button class="zb" id="mczo" type="button" title="Zoom out (-)">&minus;</button><button class="zb" id="mczf" type="button"
             title="Fit the whole wiki (0)">Fit</button><button class="zb" id="mczi" type="button" title="Zoom in (+)">+</button><span id="mczl">100%</span></div></div>
         <div id="mctl"></div></div>
-      <div id="mcr"><div id="mcprobe"></div><div id="mcpage"></div><div class="mch">Access log</div><div id="mclog"></div></div>
+      <div id="mcr"><div id="mcprobe"></div><div id="mcpage"></div><div class="mch" id="mclogh">Access log</div><div id="mclog"></div></div>
     </div>`;
-  $("mclegend").innerHTML=ORDER.map(k=>`<span><i style="background:${TYPES[k][1]}"></i>${TYPES[k][0]}</span>`).join("")+
-    Object.values(EDGE).map(([n,c])=>`<span><i class="ln" style="background:${c}"></i>${n}</span>`).join("")+
-    `<span><i class="ln" style="background:${C.course}"></i>Course</span><span><i style="background:${C.cite}"></i>Cited</span>`;
+  $("mczh").onclick=()=>$("mchint").classList.toggle("on");
   bctx=$("mccv").getContext("2d"); octx=$("mcov").getContext("2d");
   const pills=()=>{ $("mcnet").classList.toggle("on",mode==="net"); $("mccore").classList.toggle("on",mode==="core");
     $("mclinks").classList.toggle("on",showLinks); $("mcheat").classList.toggle("on",showHeat); };
   const setMode=m=>{ mode=m; LS.set("mcMode",m); userCam=false; if(G) camTo=fitAll(); pills(); touch(); };
   $("mcnet").onclick=()=>setMode("net"); $("mccore").onclick=()=>setMode("core");
+  $("mclinks").title="Related links always show; plain links appear as you zoom in";
   $("mclinks").onclick=()=>{ showLinks=!showLinks; LS.set("mcLinks",showLinks); pills(); touch(); };
   $("mcheat").onclick=()=>{ showHeat=!showHeat; pills(); touch(); };
   pills();
@@ -90,7 +90,22 @@ function build(){
   $("wikiview").addEventListener("pointermove",()=>{ const idle=performance.now()-lastAct>20000; lastAct=performance.now(); if(idle) kick(); });
   built=true;
 }
-function msg(t,err){ const m=$("mcmsg"); m.textContent=t||""; m.style.display=t?"block":"none"; m.classList.toggle("err",!!(t&&err)); }
+function msg(t,err){   /* an error is a bar across the view; a note (wiki service stopped, map still shown) is a small chip */
+  const m=$("mcmsg"), c=$("mcnote"); m.textContent=err?t:""; m.style.display=t&&err?"block":"none"; m.classList.toggle("err",!!(t&&err));
+  c.textContent=t&&!err?"Wiki service stopped":""; c.title=t&&!err?t:""; c.style.display=t&&!err?"inline-block":"none";
+}
+function shape(){
+  if(!built) return;
+  const none=!trails.length, m=$("mc");
+  m.classList.toggle("nol",none); m.classList.toggle("nor",none&&!sel&&!probe.length);
+  $("mcnos").style.display=none?"inline-block":"none";
+  touch();
+}
+function legend(){
+  const cnt=k=>G?G.nodes.filter(n=>n.ty===k).length:"";
+  $("mclegend").innerHTML=["concept","entity","source","other"].map(k=>`<span><i style="background:${TYPES[k][1]}"></i>${TYPES[k][0]} <b>${cnt(k)}</b></span>`).join("")+
+    ["r","l"].map(k=>`<span><i class="ln" style="background:${EDGE[k][1]}"></i>${EDGE[k][0]}</span>`).join("");   /* one line: page types and the two common relations */
+}
 function resize(){
   const box=$("mcbox"), w=box.clientWidth, h=box.clientHeight, d=devicePixelRatio||1;
   if(!w||!h||(w===W&&h===H&&d===dpr)) return false;
@@ -124,7 +139,7 @@ async function loadTrails(){
   }catch(e){ msg(e.message,true); }
 }
 function setGraph(g){
-  const old=G?Object.fromEntries(G.nodes.map(n=>[n.p,n])):{}, saved=LS.get("mcPos",{}), keepSel=sel&&sel.p;
+  const old=G?Object.fromEntries(G.nodes.map(n=>[n.p,n])):{}, saved=LS.get(POS,{}), keepSel=sel&&sel.p;
   byPath={}; byName={};
   const nodes=g.nodes.map(([p,t,type,tags,w,sum],i)=>({i,p,t:t||p,type,tags:tags||[],w:w||0,sum:sum||"",ty:TYPES[type]?type:"other",
     adj:[],r:2.6+1.5*Math.sqrt(w||0),h:hash(p)}));
@@ -146,9 +161,8 @@ function setGraph(g){
   resize();
   if(!userCam){ cam=fit(nodes,24,null,true); camTo=fitAll(); }
   $("mcql").innerHTML=nodes.map(n=>`<option value="${esc(n.t)}">`).join("");
-  const cnt=k=>nodes.filter(n=>n.ty===k).length;
-  $("mcmeta").textContent=`${nodes.length} pages · ${g.edges.length} links · `+ORDER.map(k=>`${cnt(k)} ${TYPES[k][0]}`).join(" · ")+
-    (g.log_mtime?` · last change ${ago(g.log_mtime)}`:"");
+  $("mcmeta").textContent=`${nodes.length} pages · ${g.edges.length} links`+(g.log_mtime?` · last change ${ago(g.log_mtime)}`:"");
+  legend();
   if(probe.length) setProbe($("mcq").value);
   paintCard();
 }
@@ -206,27 +220,30 @@ function sectorLabels(){
 function startSim(alpha){
   const N=G.nodes, n=N.length, E=G.edges, m=E.length, deg=new Float64Array(n);
   const s={alpha,n,m,X:new Float64Array(n),Y:new Float64Array(n),VX:new Float64Array(n),VY:new Float64Array(n),
-    eu:new Int32Array(m),ev:new Int32Array(m),es:new Float64Array(m),eb:new Float64Array(m)};
-  N.forEach((p,i)=>{ s.X[i]=p.nx; s.Y[i]=p.ny; });
+    eu:new Int32Array(m),ev:new Int32Array(m),es:new Float64Array(m),eb:new Float64Array(m),R:new Float64Array(n)};
+  N.forEach((p,i)=>{ s.X[i]=p.nx; s.Y[i]=p.ny; s.R[i]=p.r*1.5+1.5; });      /* the room a dot needs at overview zoom */
   E.forEach(([u,v])=>{ deg[u]++; deg[v]++; });
   E.forEach(([u,v],i)=>{ s.eu[i]=u; s.ev[i]=v; s.es[i]=Math.min(1,LSTR/Math.min(deg[u],deg[v])); s.eb[i]=deg[u]/(deg[u]+deg[v]); });
   sim=s;
 }
 function simTick(){
-  const s=sim,{X,Y,VX,VY,n,m,eu,ev,es,eb}=s, a=s.alpha;
+  const s=sim,{X,Y,VX,VY,n,m,eu,ev,es,eb,R}=s, a=s.alpha;
   for(let i=0;i<m;i++){ const u=eu[i], v=ev[i]; let dx=X[v]+VX[v]-X[u]-VX[u]||1e-6, dy=Y[v]+VY[v]-Y[u]-VY[u]||1e-6;
     const d=Math.sqrt(dx*dx+dy*dy), l=(d-LINK)/d*a*es[i]; dx*=l; dy*=l;
     VX[v]-=dx*eb[i]; VY[v]-=dy*eb[i]; VX[u]+=dx*(1-eb[i]); VY[u]+=dy*(1-eb[i]); }
   for(let i=0;i<n;i++){ const xi=X[i], yi=Y[i]; let fx=0, fy=0;
     for(let j=i+1;j<n;j++){ let dx=X[j]-xi, dy=Y[j]-yi, d2=dx*dx+dy*dy;
       if(d2>DMAX2) continue;
-      if(d2<16){ if(d2===0){ dx=.3+(j%5)*.1; dy=.3+(i%5)*.1; } d2=16; }
+      if(d2===0){ dx=.3+(j%5)*.1; dy=.3+(i%5)*.1; d2=dx*dx+dy*dy; }
+      const rr=R[i]+R[j];
+      if(d2<rr*rr){ const d=Math.sqrt(d2), q=(rr-d)/d*.3; fx-=dx*q; fy-=dy*q; VX[j]+=dx*q; VY[j]+=dy*q; }   /* dots never sit on each other */
+      if(d2<16) d2=16;
       const f=CHARGE*a/d2; fx+=dx*f; fy+=dy*f; VX[j]-=dx*f; VY[j]-=dy*f; }
     VX[i]+=fx; VY[i]+=fy; }
   const N=G.nodes;
   for(let i=0;i<n;i++){ VX[i]=(VX[i]-X[i]*GRAV*a)*.6; VY[i]=(VY[i]-Y[i]*GRAV*a)*.6; X[i]+=VX[i]; Y[i]+=VY[i]; N[i].nx=X[i]; N[i].ny=Y[i]; }
   s.alpha-=s.alpha*.0228;
-  if(s.alpha<.004){ sim=null; const o={}; N.forEach(p=>o[p.h]=[Math.round(p.nx*10)/10,Math.round(p.ny*10)/10]); LS.set("mcPos",o); }
+  if(s.alpha<.004){ sim=null; const o={}; N.forEach(p=>o[p.h]=[Math.round(p.nx*10)/10,Math.round(p.ny*10)/10]); LS.set(POS,o); try{ localStorage.removeItem("mcPos"); }catch(e){} }
 }
 
 /* ---------------------------------------------------------------- camera */
@@ -295,8 +312,9 @@ function drawBase(){
   if(coreAmt>.01) drawCore(ctx,k);
   const off=(A,B)=>(A.sx<0&&B.sx<0)||(A.sx>W&&B.sx>W)||(A.sy<0&&B.sy<0)||(A.sy>H&&B.sy>H);
   if(showLinks){
-    const d=(F?.3:1)*(1-.45*coreAmt), al={l:Math.min(.45,.06+.05*z)*d,s:Math.min(.5,.1+.05*z)*d,r:Math.min(.7,.13+.08*z)*d};
-    for(const kind of ["l","s","r"]){ ctx.beginPath();
+    const d=(F?.3:1)*(1-.45*coreAmt), near=clamp((z-1.15)/1.1,0,1);   /* plain links fade in between 115 % and 225 % zoom */
+    const al={l:Math.min(.45,.06+.05*z)*d*near,s:Math.min(.5,.1+.05*z)*d*near,r:Math.min(.7,.12+.08*z)*d};
+    for(const kind of ["l","s","r"]){ if(al[kind]<.01) continue; ctx.beginPath();
       for(const [A,B] of G.ek[kind]) if(!off(A,B)) seg(ctx,A,B,1);
       ctx.strokeStyle=EDGE[kind][1]; ctx.globalAlpha=al[kind]; ctx.lineWidth=kind==="r"?1.1:.8; ctx.stroke(); }
   }
@@ -309,7 +327,8 @@ function drawBase(){
   const tick=coreAmt>.98, hmax=Math.max(1,...Object.values(heat));
   const shape=n=>{ if(tick){ const L=(13+Math.min(30,7*Math.log2(1+n.w)))*k, ca=Math.cos(n.a-Math.PI/2), sa=Math.sin(n.a-Math.PI/2);
       ctx.moveTo(n.sx-L*ca,n.sy-L*sa); ctx.lineTo(n.sx+L*ca,n.sy+L*sa); } else { ctx.moveTo(n.sx+n.sr,n.sy); ctx.arc(n.sx,n.sy,n.sr,0,TAU); } };
-  const paint=col=>{ if(tick){ ctx.strokeStyle=col; ctx.lineWidth=Math.max(1.5,2.4*k); ctx.stroke(); } else { ctx.fillStyle=col; ctx.fill(); } };
+  const paint=col=>{ if(tick){ ctx.strokeStyle=col; ctx.lineWidth=Math.max(1.5,2.4*k); ctx.stroke(); }
+    else { ctx.fillStyle=col; ctx.fill(); ctx.strokeStyle="#000"; ctx.lineWidth=1; ctx.stroke(); } };
   if(showHeat){ for(const n of N){ if(!n.vis) continue; const h=heat[n.i]||0; ctx.beginPath(); shape(n);
       ctx.globalAlpha=h?1:.5; paint(h?`hsl(${34-30*h/hmax},100%,${48+18*h/hmax}%)`:C.dim); } }
   else for(const dim of [true,false]) for(const ty of ORDER){
@@ -321,9 +340,9 @@ function drawBase(){
   const forced=new Set([sel,...(pathSel||[])].filter(Boolean)), st=probe.length&&stepHot==null?[]:shown();
   courseOf(st).forEach(p=>forced.add(p.n)); st.forEach(([s])=>s._cites.forEach(n=>forced.add(n)));
   forced.forEach(n=>{ if(n.vis) label(ctx,n,n===sel?"#fff":TYPES[n.ty][1],13,true); });
-  let left=F?46:0;
+  let left=F?30:0;
   if(F) for(const n of G.byW){ if(left<=0) break; if(F.has(n)&&n.vis&&label(ctx,n,TYPES[n.ty][1],12,false)) left--; }
-  left=Math.round(clamp(14*Math.pow(z,1.6),14,80)); let dimLeft=F?Math.round(left*.3):0;
+  left=Math.round(clamp(8*Math.pow(z,1.5),8,60)); let dimLeft=F?Math.round(left*.15):0;
   for(const n of G.byW){ if(left<=0) break; if(!n.vis) continue;
     if(F&&!F.has(n)){ if(dimLeft>0&&label(ctx,n,"#7d6a4f",11,false)){ dimLeft--; left--; } }
     else if(label(ctx,n,TYPES[n.ty][1],11,false)) left--; }
@@ -402,7 +421,7 @@ function drawOverlay(now){
         ctx.fillStyle="rgba(255,204,102,.10)"; ctx.fill(); ctx.beginPath(); ctx.moveTo(W/2,H/2); ctx.lineTo(W/2+R*Math.cos(a),H/2+R*Math.sin(a));
         ctx.strokeStyle="rgba(255,204,102,.7)"; ctx.lineWidth=2; ctx.stroke(); }
       if(s.tool==="search"&&s._hits.length){
-        const direct=s._hits.filter(h=>!h.via), entry=direct.filter(h=>!h.text), T=s._terms, p2=clamp(p*2-1,0,1);
+        const full=k===last, direct=s._hits.filter(h=>!h.via&&(full||!h.text)), entry=direct.filter(h=>!h.text), T=s._terms, p2=clamp(p*2-1,0,1);
         const row=T.length&&s._hits.some(h=>h.n.vis)?pillRow(ctx,T,(entry.length?entry:s._hits).map(h=>h.n),26*si++,s._nodes):null, used=[];
         if(row) T.forEach((term,i)=>{ for(const text of [false,true]){ ctx.beginPath(); let any=false;
             direct.forEach(h=>{ if(h.text!==text||!(has(h.n,term)||!T.some(q=>has(h.n,q)))) return; any=true;
@@ -411,12 +430,12 @@ function drawOverlay(now){
             used[i]=1;
             if(text){ ctx.strokeStyle=TERMC[i%6]; ctx.lineWidth=1.2; ctx.globalAlpha=.7; ctx.setLineDash([1.5,5]); ctx.stroke(); ctx.setLineDash([]); ctx.globalAlpha=1; }
             else flowing(TERMC[i%6],1.5,.85); } });
-        ctx.beginPath(); s._hits.forEach(h=>{ if(h.via&&h.via!==h.n) seg(ctx,h.via,h.n,p2); }); flowing(C.rel,1.4,.85*Math.min(1,p2*3));
-        s._hits.forEach(h=>ring(ctx,h.n,h.n.sr+(h.via?3.5:5),h.via?C.rel:C.hit,h.via?1.3:2,h.text?[2,3]:null,h.via?p2:p));
+        if(full){ ctx.beginPath(); s._hits.forEach(h=>{ if(h.via&&h.via!==h.n) seg(ctx,h.via,h.n,p2); }); flowing(C.rel,1.4,.85*Math.min(1,p2*3)); }
+        s._hits.forEach(h=>{ if(full||(!h.via&&!h.text)) ring(ctx,h.n,h.n.sr+(h.via?3.5:5),h.via?C.rel:C.hit,h.via?1.3:1.8,h.text?[2,3]:null,h.via?p2:p); });
         if(row) T.forEach((term,i)=>pillAt(ctx,row.xs[i],row.y,term.toUpperCase(),TERMC[i%6],used[i]?1:.4));
         if(k===last||stepHot===k) s._hits.slice(0,12).forEach(h=>olab.push([h.n,h.via?C.rel:C.hit]));
       }
-      if(s.tool==="related"&&s._n){
+      if(s.tool==="related"&&s._n&&k===last){
         ctx.beginPath(); s._hits.forEach(h=>seg(ctx,s._n,h.n,p)); flowing(C.rel,1.5,.85);
         s._hits.forEach(h=>ring(ctx,h.n,h.n.sr+3.5,C.rel,1.3,null,p)); ring(ctx,s._n,s._n.sr+6,C.rel,2.2);
         if(k===last||stepHot===k) s._hits.slice(0,12).forEach(h=>olab.push([h.n,C.rel]));
@@ -474,7 +493,7 @@ function pointer(ov){
   });
   const up=e=>{ const had=ptr.delete(e.pointerId); ov.classList.remove("drag");
     if(had&&drag&&!drag.moved&&ptr.size===0&&e.type==="pointerup"){ const p=xy(e), n=pick(p[0],p[1]);
-      if(n&&sel&&n!==sel&&(e.shiftKey||pathMode)) setPath(sel,n); else select(n); }
+      if(n&&sel&&n!==sel&&(e.shiftKey||pathMode)) setPath(sel,n); else if(!(pathMode&&!n)) select(n); }   /* a miss in path mode keeps the selection */
     if(ptr.size<2&&drag) drag.d=0; };
   ov.addEventListener("pointerup",up); ov.addEventListener("pointercancel",up);
   ov.addEventListener("pointerleave",()=>{ if(hov){ hov=null; kick(); } tip(null,null); });
@@ -599,6 +618,7 @@ function paintCard(pathTo){
     $("mcpp").onclick=()=>{ pathMode=!pathMode; $("mcpp").classList.toggle("on",pathMode); $("mcov").classList.toggle("path",pathMode); };
     el.querySelectorAll(".tg u").forEach(u=>u.onclick=()=>{ $("mcq").value=u.textContent; setProbe(u.textContent); });
   }
+  shape();
   document.querySelectorAll("#mcr .nb a").forEach(a=>{ const m=byPath[a.dataset.p]; if(!m) return;
     a.onclick=()=>select(m,!m.vis); a.onmouseenter=()=>{ hov=m; kick(); }; a.onmouseleave=()=>{ hov=null; kick(); }; });
 }
@@ -624,7 +644,7 @@ function paintLists(){
   $("mctop").innerHTML=top.length?top.map(([i,v])=>`<div class="mci pg" data-i="${i}" title="Score: read 3, cited 2, search hit 1, over all sessions"><b>${v}</b>${esc(G.nodes[i].t)}</div>`).join("")
     :`<div class="mcempty">Nothing consulted yet.</div>`;
   $("mctop").querySelectorAll(".mci").forEach(el=>el.onclick=()=>select(G.nodes[+el.dataset.i],true));
-  paintLog(); paintTl();
+  paintLog(); paintTl(); legend(); shape();
 }
 function hotStep(k){ if(stepHot===k) return; stepHot=k; refocus();
   document.querySelectorAll("#mcsegs i,#mclog .mcs").forEach(el=>el.classList.toggle("hot",k!=null&&+el.dataset.k===k)); }
