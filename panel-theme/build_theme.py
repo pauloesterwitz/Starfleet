@@ -313,17 +313,18 @@ MODEL_VARIANTS = ("", "3.5", "3.6", "3.8", "235B",
                   "3VL", "CASC", "OTRON", "31B", "TP2")
 
 # Only used to draw theme_preview.png -- never written to the device.
+# A real snapshot (2026-11-18): both Sparks' opencode-status.py output put through
+# PanelController.swift's rules -- Qwen3.8 Flash TP=2 resident on both nodes,
+# seven sessions generating, the two newest without a todo list.
 SAMPLE_VALUES = {
-    CH_JL_GPU: 96, CH_JL_TEMP: 71, CH_JL_RAM: 63, CH_JL_PWR: 112,
-    CH_KT_GPU: 42, CH_KT_TEMP: 58, CH_KT_RAM: 37, CH_KT_PWR: 74,
-    CH_AGENTS: 2,
-    CH_S1_STATUS: 1, CH_S1_AGE: 3, CH_S1_DONE: 4, CH_S1_TOTAL: 9,      # WORKING
-    CH_S2_STATUS: 3, CH_S2_AGE: 47, CH_S2_DONE: 12, CH_S2_TOTAL: 12,   # WAITING
-    # A composed pair on one node and the widest brand on the other, so the
-    # preview shows the seam and the longest string the field can hold.
+    CH_JL_GPU: 96, CH_JL_TEMP: 67, CH_JL_RAM: 94, CH_JL_PWR: 32,
+    CH_KT_GPU: 95, CH_KT_TEMP: 63, CH_KT_RAM: 83, CH_KT_PWR: 29,
+    CH_AGENTS: 7,
+    CH_S1_STATUS: 1, CH_S1_AGE: 0, CH_S1_DONE: 0, CH_S1_TOTAL: 0,      # WORKING
+    CH_S2_STATUS: 1, CH_S2_AGE: 0, CH_S2_DONE: 0, CH_S2_TOTAL: 0,      # WORKING
     CH_SCREENSAVER: 0,                      # the dashboard; the second preview sets this to 1
-    CH_JL_BRAND: 1, CH_JL_VARIANT: 2,                                  # QWEN3.6
-    CH_KT_BRAND: 5, CH_KT_VARIANT: 9,                                  # DEEPSEEK TP2
+    CH_JL_BRAND: 1, CH_JL_VARIANT: 3,                                  # QWEN3.8
+    CH_KT_BRAND: 1, CH_KT_VARIANT: 3,                                  # QWEN3.8
 }
 
 
