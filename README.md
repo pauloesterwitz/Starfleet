@@ -349,6 +349,27 @@ Where a browser refuses or ignores the request, the same layout fills the window
 instead. The app's `WKWebView` allows element full screen
 (`isElementFullscreenEnabled`, macOS 12.3 and later).
 
+### On the Mac and on the iPhone
+
+Both apps are thin shells around the same page: Fleet's address is the only thing they
+store (UserDefaults, asked for on first open), and the Starfleet key stays in the
+page's own `localStorage`, as in a browser.
+
+- **Over HTTPS.** Point them at the address `tailscale serve` publishes Fleet on,
+  `https://<head-node>.<tailnet>.ts.net:<port>`. The page gets the microphone only in a
+  secure context; the Mac window still loads a plain `http://` address, without voice.
+- **Microphone.** The web views grant the microphone to Fleet's own origin and nothing
+  else; macOS and iOS ask once (`NSMicrophoneUsageDescription`).
+- **Dialogs.** The page's `alert()` and `confirm()` show as native alerts. Before, the
+  Mac window dropped them and answered every `confirm()` with Cancel.
+- **`⌃⌥C` on the Mac**, from any app: brings the Fleet window to the front, opens the
+  Computer view and starts voice input (press again to stop), the same as the page's
+  own hotkey (Ctrl+Shift+Space by default), which only works while the window has focus.
+  A global hotkey through Carbon's `RegisterEventHotKey`, so no Accessibility permission.
+- **iPhone:** pull down to reload; when Fleet can't be reached (Tailscale off, head node
+  down) an error card with Retry, and coming back from the Tailscale app retries by
+  itself. Layout stays inside the safe area.
+
 ### What "pin" actually guarantees
 
 llama-swap's own idle `ttl` and swap-group exclusivity (see above) still fully
@@ -490,10 +511,10 @@ and 660 Hz sine tones).
    next to `fleet.py` on the head node; without one the page plays a synthesized
    klaxon. Auto Destruct also needs the `sudo` and ssh access described
    [above](#red-alert-and-auto-destruct).
-4. Point [`Sources/OpencodeMonitor/FleetView.swift`](Sources/OpencodeMonitor/FleetView.swift)'s
-   `fleetURL` and [`Sources/OpencodeMonitor/Info.plist`](Sources/OpencodeMonitor/Info.plist)'s
-   `NSExceptionDomains` entry at your own head node's address — fleet-ui serves
-   plain HTTP, so that ATS exception is what lets `WKWebView` load it.
+4. Nothing to edit in the source for the address: the Fleet window asks for it on
+   first open (or `defaults write com.oesterwitz.starfleetcommand fleetURL https://…`).
+   Give it Fleet's HTTPS address from `tailscale serve`, see
+   [On the Mac and on the iPhone](#on-the-mac-and-on-the-iphone).
 5. Build with `./package.sh`, same as the rest of the app (see below); Fleet
    ships inside `Starfleet Command.app`, not as its own bundle.
 
@@ -778,9 +799,34 @@ deliberately — see [Known limits](docs/menu-bar-app.md#notes--known-limits).
 
 Produces `Starfleet Command.app` (release build, ad-hoc signed). Open it, or drag
 it to `/Applications`. Use the `.app` rather than `swift run` — notifications and
-"Launch at Login" both need a real bundle identity.
+"Launch at Login" both need a real bundle identity. The ad-hoc signature changes with
+every build, so macOS may ask for the microphone again after a rebuild.
 
-### 6. Optional: the USB panel
+### 6. The iPhone app
+
+In [`ios/`](ios): an Xcode project, `ios/Starfleet.xcodeproj`, with one SwiftUI file and
+the app icon. Needs Xcode 16 or later, an iPhone with the Tailscale app on the same
+tailnet, and an Apple ID; a free one works, but its "Personal Team" signature expires
+after 7 days, then build and install again.
+
+1. Open `ios/Starfleet.xcodeproj` in Xcode.
+2. Target **Starfleet** → **Signing & Capabilities** → **Team**: pick yours. If the
+   bundle ID is taken, change it there to your own reverse domain.
+3. Connect the iPhone by cable and trust the Mac. First time only: on the iPhone,
+   **Settings → Privacy & Security → Developer Mode** on, restart.
+4. Choose the iPhone as the run destination and press `⌘R`. With a free team, the first
+   start needs **Settings → General → VPN & Device Management** → trust your developer
+   profile.
+5. In the app, enter Fleet's HTTPS address and tap **Connect**.
+
+Picking the team writes your Team ID into `project.pbxproj`. To keep it out of git, move
+it into the gitignored `ios/Local.xcconfig`, which `ios/Starfleet.xcconfig` includes:
+
+```bash
+cd ios && grep -m1 -o 'DEVELOPMENT_TEAM = [A-Z0-9]*' Starfleet.xcodeproj/project.pbxproj > Local.xcconfig && git checkout Starfleet.xcodeproj/project.pbxproj
+```
+
+### 7. Optional: the USB panel
 
 Not needed for anything above — see [Add-on: the USB panel](#add-on-a-usb-panel-for-the-desk).
 
@@ -794,9 +840,10 @@ Sources/OpencodeMonitor/   the app
   StatusPoller.swift        SSH polling, stall detection, Tailscale re-auth
   Models.swift              payload decoding + session ordering
   ContentView.swift         menu bar dropdown
-  FleetView.swift           the Fleet window (WKWebView) + its Dock-icon-on-demand logic
+  FleetView.swift           the Fleet window (WKWebView), its Dock-icon-on-demand logic, the ⌃⌥C hotkey
   DesktopWidget*.swift      floating panel
   Panel*.swift, GPUStream.swift   the optional USB panel: driver, controller, streamed GPU figures
+ios/                       the iPhone app: Starfleet.xcodeproj, Starfleet/StarfleetApp.swift, the icon
 cluster/                   the cluster's configuration and tooling: the llama-swap config and
                             launchers, the memory guard (memcheck.sh and friends), the context proxy
                             that also gates every load, the status scripts the app runs over ssh,

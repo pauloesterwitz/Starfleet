@@ -25,10 +25,15 @@ struct ContentView: View {
             .frame(maxHeight: 420)
 
             Divider()
+            // The app's own Fleet window (FleetView.swift), never the browser. Activate too:
+            // an already-open window behind another app's windows would stay behind it.
             Button("Open Starfleet Command…") {
                 openWindow(id: "fleet")
+                NSApp.activate(ignoringOtherApps: true)
             }
             .font(.caption)
+            // Second hand-over of openWindow to ⌃⌥C, in case the menu bar label's never ran.
+            .onAppear { ComputerHotKey.openWindow = openWindow }
 
             Toggle("Show desktop widget", isOn: $widgetController.isVisible)
                 .toggleStyle(.checkbox)

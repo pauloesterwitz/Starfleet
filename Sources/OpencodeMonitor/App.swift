@@ -14,6 +14,7 @@ struct StarfleetCommandApp: App {
         // bare `swift run` often can't register for notifications. Requested once here
         // (not per-StatusPoller) now that there are two of them.
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        ComputerHotKey.register()
         let jeanLuc = StatusPoller(host: "jean-luc", label: "Jean-Luc")
         let kathryn = StatusPoller(host: "kathryn", label: "Kathryn")
         _jeanLuc = StateObject(wrappedValue: jeanLuc)
@@ -49,6 +50,7 @@ struct StarfleetCommandApp: App {
                 }
             }
             .help("Jean-Luc: \(jeanLuc.lastError ?? "ok") · Kathryn: \(kathryn.lastError ?? "ok")")
+            .background(HotKeyBridge())
         }
         .menuBarExtraStyle(.window)
         .commands {

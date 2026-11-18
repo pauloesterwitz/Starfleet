@@ -1,0 +1,4 @@
+// Your signing team stays out of the public repo: put the line
+//   DEVELOPMENT_TEAM = <your Team ID>
+// into Local.xcconfig next to this file (gitignored). See the README.
+#include? "Local.xcconfig"

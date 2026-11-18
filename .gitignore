@@ -32,3 +32,9 @@ fleet-ui/sounds/
 # Deep Space NAS backdrop: fleet.py serves fleet-ui/ds9.jpg when it exists. A real photo of the
 # station is copyrighted, so it is never committed; without it the page draws its own station.
 fleet-ui/ds9.jpg
+
+# The iPhone app's Xcode project IS tracked (the Mac app builds with SwiftPM instead);
+# per-user Xcode state and the local signing team are not.
+!ios/Starfleet.xcodeproj/
+xcuserdata/
+ios/Local.xcconfig

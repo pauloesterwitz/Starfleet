@@ -1,19 +1,27 @@
 import SwiftUI
 import WebKit
 import AppKit
+import Carbon.HIToolbox
 
-// Fleet's own dashboard (fleet.py on jean-luc) only ever serves plain HTTP,
-// bound to the tailnet IP -- see NSAppTransportSecurity exception in Info.plist.
-private let fleetURL = URL(string: "http://100.105.20.79:8090")!
+/// Where Fleet lives, e.g. `https://<head-node>.<tailnet>.ts.net:<port>` (tailscale serve
+/// in front of fleet.py). Not in the source -- the repo is public -- but in UserDefaults:
+/// typed into the Fleet window's setup card, or
+/// `defaults write com.oesterwitz.starfleetcommand fleetURL https://…`.
+/// HTTPS matters: the page only gets the microphone (Computer's voice input) in a
+/// secure context. A plain-HTTP address still loads (NSAllowsArbitraryLoadsInWebContent).
+let fleetURLKey = "fleetURL"
 
 extension Notification.Name {
     static let fleetReload = Notification.Name("fleetReload")
+    static let fleetVoice = Notification.Name("fleetVoice")
 }
 
 /// The Fleet dashboard window: llama-swap model pinning + per-node resources.
 /// Lives in the same app/menu-bar-extra as the session monitor, opened on
-/// demand from ContentView's "Open Fleet" button, not shown at launch.
+/// demand from ContentView's "Open Fleet" button (or ⌃⌥C), not shown at launch.
 struct FleetDashboardView: View {
+    @AppStorage(fleetURLKey) private var address = ""
+    @State private var draft = UserDefaults.standard.string(forKey: fleetURLKey) ?? ""
     @State private var webView: WKWebView = {
         // Off by default in WKWebView: without it the page's Full screen button
         // (requestFullscreen) is silently ignored. Needs macOS 12.3+.
@@ -25,32 +33,39 @@ struct FleetDashboardView: View {
     }()
     @State private var loadError: String?
 
+    private var fleetURL: URL? {
+        URL(string: address).flatMap { $0.host == nil ? nil : $0 }
+    }
+
     var body: some View {
         ZStack {
             FleetWebView(webView: webView, url: fleetURL, loadError: $loadError)
                 .ignoresSafeArea()
 
-            if let loadError {
+            if fleetURL == nil || loadError != nil {
                 VStack(spacing: 12) {
-                    Image(systemName: "wifi.exclamationmark")
+                    Image(systemName: fleetURL == nil ? "link" : "wifi.exclamationmark")
                         .font(.system(size: 36))
                         .foregroundStyle(.secondary)
-                    Text("Can't reach Fleet")
+                    Text(fleetURL == nil ? "Where is Fleet?" : "Can't reach Fleet")
                         .font(.headline)
-                    Text(loadError)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center)
-                    Text("Check that this Mac is connected to Tailscale and jean-luc is up.")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                    Button("Retry") {
-                        webView.load(URLRequest(url: fleetURL))
+                    if let loadError {
+                        Text(loadError)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                        Text("Check that this Mac is connected to Tailscale and the head node is up.")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
                     }
-                    .keyboardShortcut("r", modifiers: .command)
+                    TextField("https://<head-node>.<tailnet>.ts.net:<port>", text: $draft)
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit(connect)
+                    // No ⌘R here: that is the menu's "Reload Fleet", which ignores the field.
+                    Button(fleetURL == nil ? "Connect" : "Retry", action: connect)
                 }
                 .padding(24)
-                .frame(maxWidth: 360)
+                .frame(maxWidth: 420)
                 .background(.regularMaterial)
                 .clipShape(RoundedRectangle(cornerRadius: 12))
             }
@@ -62,8 +77,85 @@ struct FleetDashboardView: View {
         }
         .background(FleetWindowChrome())
         .onReceive(NotificationCenter.default.publisher(for: .fleetReload)) { _ in
-            webView.load(URLRequest(url: fleetURL))
+            load()
         }
+        .onReceive(NotificationCenter.default.publisher(for: .fleetVoice)) { _ in
+            // Still loading: the navigation delegate starts voice once the page is there.
+            if !webView.isLoading, webView.url != nil { ComputerVoice.start(in: webView) }
+        }
+    }
+
+    private func connect() {
+        address = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        load()
+    }
+
+    private func load() {
+        guard let fleetURL else { return }
+        loadError = nil
+        webView.load(URLRequest(url: fleetURL))
+    }
+}
+
+/// The "Computer" view's voice input, started from outside the page (the ⌃⌥C hotkey).
+/// Does what fleet.html's own in-page hotkey does (default Ctrl+Shift+Space): open
+/// Computer, focus its input, toggle the microphone -- through the page's globals
+/// `compOn`, `setView` and `compMic`. Rename those in fleet.html and this goes quiet.
+enum ComputerVoice {
+    /// Set by the hotkey, cleared once the page has been told -- survives the window
+    /// (and its web view) being created from scratch in between.
+    static var pending = false
+
+    static func start(in webView: WKWebView) {
+        pending = false
+        webView.evaluateJavaScript("""
+            if (typeof compMic === 'function') {
+              if (!compOn) setView('comp');
+              document.getElementById('comptext').focus();
+              compMic();
+            }
+            """)
+    }
+}
+
+/// ⌃⌥C from anywhere: Fleet window to the front, Computer view, voice input on.
+/// Carbon's RegisterEventHotKey because it needs no Accessibility permission
+/// (an NSEvent global monitor does).
+enum ComputerHotKey {
+    /// The scene's openWindow, handed over by HotKeyBridge -- the Carbon callback
+    /// lives outside any view, and only views get SwiftUI's environment.
+    static var openWindow: OpenWindowAction?
+    private static var ref: EventHotKeyRef?
+
+    static func register() {
+        var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard),
+                                 eventKind: UInt32(kEventHotKeyPressed))
+        InstallEventHandler(GetApplicationEventTarget(), { _, _, _ in
+            DispatchQueue.main.async { ComputerHotKey.fire() }
+            return noErr
+        }, 1, &spec, nil, nil)
+        let status = RegisterEventHotKey(UInt32(kVK_ANSI_C), UInt32(controlKey | optionKey),
+                                         EventHotKeyID(signature: OSType(0x5346_4C54), id: 1), // 'SFLT'
+                                         GetApplicationEventTarget(), 0, &ref)
+        // Typically another app already holds ⌃⌥C. Console.app shows this line.
+        if status != noErr { NSLog("Starfleet Command: ⌃⌥C hotkey not registered (OSStatus \(status))") }
+    }
+
+    static func fire() {
+        ComputerVoice.pending = true
+        if let openWindow { openWindow(id: "fleet") }
+        NSApp.activate(ignoringOtherApps: true)
+        NotificationCenter.default.post(name: .fleetVoice, object: nil)
+    }
+}
+
+/// Hands the scene's openWindow to ComputerHotKey. Sits behind the menu bar label,
+/// the one view that exists from launch on.
+struct HotKeyBridge: View {
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        Color.clear.onAppear { ComputerHotKey.openWindow = openWindow }
     }
 }
 
@@ -122,35 +214,83 @@ private struct FleetWindowChrome: NSViewRepresentable {
 
 private struct FleetWebView: NSViewRepresentable {
     let webView: WKWebView
-    let url: URL
+    let url: URL?
     @Binding var loadError: String?
 
     func makeNSView(context: Context) -> WKWebView {
         webView.navigationDelegate = context.coordinator
-        webView.load(URLRequest(url: url))
+        webView.uiDelegate = context.coordinator
+        if let url { webView.load(URLRequest(url: url)) }
         return webView
     }
 
-    func updateNSView(_ nsView: WKWebView, context: Context) {}
+    func updateNSView(_ nsView: WKWebView, context: Context) {
+        context.coordinator.parent = self
+    }
 
     func makeCoordinator() -> Coordinator {
         Coordinator(self)
     }
 
-    final class Coordinator: NSObject, WKNavigationDelegate {
-        let parent: FleetWebView
+    final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate {
+        var parent: FleetWebView
         init(_ parent: FleetWebView) { self.parent = parent }
 
         func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
             parent.loadError = nil
         }
 
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            if ComputerVoice.pending { ComputerVoice.start(in: webView) }
+        }
+
         func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
-            parent.loadError = error.localizedDescription
+            show(error)
         }
 
         func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+            show(error)
+        }
+
+        private func show(_ error: Error) {
+            // A reload started while the previous load was still running cancels it -- not a failure.
+            if (error as NSError).code == NSURLErrorCancelled { return }
             parent.loadError = error.localizedDescription
+        }
+
+        // The microphone for Computer's voice input -- Fleet's own origin only, never
+        // a page it links to. macOS asks once (NSMicrophoneUsageDescription in Info.plist).
+        func webView(_ webView: WKWebView, requestMediaCapturePermissionFor origin: WKSecurityOrigin,
+                     initiatedByFrame frame: WKFrameInfo, type: WKMediaCaptureType,
+                     decisionHandler: @escaping (WKPermissionDecision) -> Void) {
+            decisionHandler(type == .microphone && origin.host == parent.url?.host ? .grant : .deny)
+        }
+
+        // Without these WKWebView drops alert() and answers every confirm() with false,
+        // so the page's "load over a resident model?" and "cancel loading?" never went through.
+        func webView(_ webView: WKWebView, runJavaScriptAlertPanelWithMessage message: String,
+                     initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping () -> Void) {
+            let alert = NSAlert()
+            alert.messageText = message
+            present(alert, in: webView) { _ in completionHandler() }
+        }
+
+        func webView(_ webView: WKWebView, runJavaScriptConfirmPanelWithMessage message: String,
+                     initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping (Bool) -> Void) {
+            let alert = NSAlert()
+            alert.messageText = message
+            alert.addButton(withTitle: "OK")
+            alert.addButton(withTitle: "Cancel")
+            present(alert, in: webView) { completionHandler($0 == .alertFirstButtonReturn) }
+        }
+
+        private func present(_ alert: NSAlert, in webView: WKWebView,
+                             _ done: @escaping (NSApplication.ModalResponse) -> Void) {
+            if let window = webView.window {
+                alert.beginSheetModal(for: window, completionHandler: done)
+            } else {
+                done(alert.runModal())
+            }
         }
     }
 }

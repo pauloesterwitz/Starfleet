@@ -16,18 +16,14 @@
     <string>app-icon</string>
     <key>LSUIElement</key>
     <true/>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Voice input for the Computer view in Fleet: what you say goes to the speech-to-text on your own cluster.</string>
     <key>NSAppTransportSecurity</key>
     <dict>
-        <key>NSExceptionDomains</key>
-        <dict>
-            <key>100.105.20.79</key>
-            <dict>
-                <key>NSExceptionAllowsInsecureHTTPLoads</key>
-                <true/>
-                <key>NSIncludesSubdomains</key>
-                <false/>
-            </dict>
-        </dict>
+        <!-- The Fleet window may still point at fleet.py's plain-HTTP address. Web content only:
+             the app's own connections stay HTTPS-only. Voice input needs the HTTPS address. -->
+        <key>NSAllowsArbitraryLoadsInWebContent</key>
+        <true/>
     </dict>
 </dict>
 </plist>
