@@ -2133,6 +2133,297 @@ def container_stop(node, name, key):
     return {"ok": True, "node": node, "name": name, "freed_mb": row["ram_mb"]}
 
 
+# ---------------------------------------------------------------- Memory Alpha (off-site backup)
+
+# Kopia on the NAS backs the NAS volume up to the object storage bucket "memory-alpha" (object lock,
+# compliance mode). Fleet holds no Kopia or bucket credentials: it reads the status lines the
+# kopia-check container logs every 6 h (the same lines the kopia-watch alerting reads), the init
+# container's policy output and the container states, all through read-only verbs of the NAS gate.
+# "Back up now" starts the one-shot kopia-snapshot container with the gate's `control start`.
+MA_TTL = 20.0
+MA_SNAP_H, MA_MAINT_H = 30, 48          # same thresholds as kopia-watch
+_MA = {"at": 0.0, "data": None}
+_MA_POLICY = {"at": 0.0, "data": None}
+_MA_LOCK = threading.Lock()
+
+
+def _gate_logs(name, tail):
+    r = _nas_gate("logs", name, "--tail", str(tail))
+    if not isinstance(r, dict) or "logs" not in r:
+        r = r if isinstance(r, dict) else {}
+        raise OSError(r.get("message") or r.get("error") or "no logs")
+    return r["logs"]
+
+
+def _tagged(logs, tag):
+    """[(timestamp, payload)] of the lines '<ts> TAG payload', oldest first."""
+    out = []
+    for line in logs.splitlines():
+        ts, _, rest = line.partition(" ")
+        if rest.startswith(tag + " "):
+            out.append((ts, rest[len(tag) + 1:]))
+    return out
+
+
+def _iso(ts):
+    return datetime.datetime.fromisoformat(re.sub(r"(\.\d{6})\d+", r"\1", ts).replace("Z", "+00:00")).timestamp()
+
+
+def _snap_summary(payload):
+    j = json.loads(payload)
+    sn = j[-1] if isinstance(j, list) else j
+    st = sn.get("stats") or {}
+    return {"start": _iso(sn["startTime"]), "end": _iso(sn["endTime"]), "size": st.get("totalSize"),
+            "files": st.get("fileCount"), "dirs": st.get("dirCount"), "errors": st.get("errorCount", 0),
+            "incomplete": sn.get("incompleteReason") or ("incomplete" if sn.get("incomplete") else None),
+            "description": sn.get("description") or ""}
+
+
+_UNITS = {"": 1, "B": 1, "KB": 1e3, "MB": 1e6, "GB": 1e9, "TB": 1e12, "PB": 1e15,
+          "KIB": 1024, "MIB": 1024 ** 2, "GIB": 1024 ** 3, "TIB": 1024 ** 4}
+
+
+def _blob_summary(payload):
+    """`kopia blob stats` output (one line): blob count and total bytes in the bucket."""
+    c = re.search(r"Count:\s*([\d,]+)", payload)
+    t = re.search(r"Total:\s*([\d.,]+)\s*([KMGTP]?i?B)?", payload, re.I)
+    if not t:
+        return None
+    return {"count": int(c.group(1).replace(",", "")) if c else None,
+            "bytes": int(float(t.group(1).replace(",", "")) * _UNITS.get((t.group(2) or "").upper(), 1))}
+
+
+def _ma_policy():
+    """Snapshot times and retention as kopia-init last applied them; re-read every 10 minutes."""
+    if time.time() - _MA_POLICY["at"] > 600 or _MA_POLICY["data"] is None:
+        logs, pol = _gate_logs("kopia-kopia-init-1", 80), {"times": [], "keep": {}}
+        for line in logs.splitlines():
+            m = re.search(r"setting snapshot times to \[([^\]]*)\]", line)
+            if m:
+                pol["times"] = [t.strip() for t in m.group(1).split(",") if t.strip()]
+            m = re.search(r'setting "number of (\w+) backups to keep" to (\d+)', line)
+            if m:
+                pol["keep"][m.group(1)] = int(m.group(2))
+        _MA_POLICY["data"], _MA_POLICY["at"] = pol, time.time()
+    return _MA_POLICY["data"]
+
+
+def _next_time(times, now):
+    """Next local occurrence of any 'H:MM' in times, as epoch seconds."""
+    best = None
+    for t in times:
+        try:
+            h, m = (int(x) for x in t.split(":"))
+        except ValueError:
+            continue
+        d = datetime.datetime.fromtimestamp(now).replace(hour=h, minute=m, second=0, microsecond=0)
+        if d.timestamp() <= now:
+            d += datetime.timedelta(days=1)
+        best = min(best or d.timestamp(), d.timestamp())
+    return best
+
+
+def memory_alpha_state(force=False):
+    with _MA_LOCK:
+        if not force and _MA["data"] and time.time() - _MA["at"] < MA_TTL:
+            return dict(_MA["data"], at=_MA["at"])
+        now, errors, d = time.time(), [], {}
+        try:
+            ps = _nas_gate("ps", "--all", "--project", "kopia")
+            if isinstance(ps, dict):
+                raise OSError(ps.get("message") or ps.get("error") or str(ps)[:200])
+            d["containers"] = [{"name": c["Names"], "state": c["State"], "status": c["Status"]} for c in ps]
+            logs = _gate_logs("kopia-check", 8)
+            snaps, maint, blob = _tagged(logs, "SNAP"), _tagged(logs, "MAINT"), _tagged(logs, "BLOB")
+            d["checked"] = _iso(snaps[-1][0]) if snaps else None
+            try:
+                d["last"] = _snap_summary(snaps[-1][1]) if snaps else None
+            except (ValueError, KeyError, IndexError):
+                d["last"], _ = None, errors.append("snapshot status unreadable: " + snaps[-1][1][:160])
+            d["stored"] = _blob_summary(blob[-1][1]) if blob else None
+            if maint:
+                m = maint[-1][1]
+                nf = re.search(r'"nextFullMaintenance":"([^"]+)"', m)
+                nq = re.search(r'"nextQuickMaintenance":"([^"]+)"', m)
+                d["maintenance"] = {"locks": '"extendObjectLocks":true' in m,
+                                    "next_full": _iso(nf.group(1)) if nf else None,
+                                    "next_quick": _iso(nq.group(1)) if nq else None}
+            d["policy"] = _ma_policy()
+            d["next_snapshot"] = _next_time(d["policy"]["times"], now)
+            names = {c["name"]: c for c in d["containers"]}
+            d["trigger_ready"] = "kopia-snapshot" in names
+            if d["trigger_ready"]:
+                ml = _gate_logs("kopia-snapshot", 6)
+                man = {"state": names["kopia-snapshot"]["state"]}
+                st, sn, er, ex = (_tagged(ml, t) for t in ("START", "SNAPNOW", "SNAPERR", "EXIT"))
+                man["started"] = _iso(st[-1][1].strip()) if st else None
+                man["exit"] = int(ex[-1][1]) if ex and ex[-1][1].strip().lstrip("-").isdigit() else None
+                man["error"] = er[-1][1][:300] if er else None
+                try:
+                    man["snapshot"] = _snap_summary(sn[-1][1]) if sn else None
+                except (ValueError, KeyError, IndexError):
+                    man["snapshot"] = None
+                d["manual"] = man
+                if man["snapshot"] and (not d.get("last") or man["snapshot"]["end"] > d["last"]["end"]):
+                    d["last"] = man["snapshot"]                  # a manual run newer than kopia-check's line
+        except (OSError, subprocess.SubprocessError) as e:
+            errors.append(str(e)[:200])
+        problems = []
+        last = d.get("last")
+        if last:
+            if (now - last["end"]) / 3600 > MA_SNAP_H:
+                problems.append("last snapshot %d h ago" % ((now - last["end"]) / 3600))
+            if last.get("incomplete"):
+                problems.append("last snapshot incomplete: %s" % last["incomplete"])
+            if last.get("errors"):
+                problems.append("%d errors in the last snapshot" % last["errors"])
+        mt = d.get("maintenance")
+        if mt:
+            if not mt["locks"]:
+                problems.append("object lock renewal is off")
+            if mt["next_full"] and (now - mt["next_full"]) / 3600 + 24 > MA_MAINT_H:
+                problems.append("full maintenance (lock renewal) last ran over %d h ago" % MA_MAINT_H)
+        d["problems"], d["errors"] = problems, errors
+        d["status"] = "error" if errors and not last else "warn" if problems or errors else "ok"
+        _MA["data"], _MA["at"] = d, now
+        return dict(d, at=now)
+
+
+def memory_alpha_backup(key):
+    """Start a snapshot now. Needs the Starfleet key and the kopia-snapshot one-shot container."""
+    key_check(key)
+    st = memory_alpha_state(force=True)
+    if not st.get("trigger_ready"):
+        raise PermissionError("kopia-snapshot is not deployed yet: rebuild the kopia project once in "
+                              "DSM Container Manager.")
+    if (st.get("manual") or {}).get("state") == "running":
+        raise PermissionError("A snapshot is already running.")
+    res = _nas_gate("control", "kopia-snapshot", "start", timeout=90)
+    if isinstance(res, dict) and res.get("error"):
+        raise OSError(res.get("message") or res["error"])
+    _MA["at"] = 0.0
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------- Defiant (web server)
+
+# The web server, reached over ssh (BatchMode, key only). The host comes from the service environment
+# (FLEET_DEFIANT_HOST, e.g. a systemd drop-in) so no address lives in the code; unset = view disabled.
+# One read-only probe: host figures, CPU and network over one second, disk, pending updates, reboot
+# flag, containers and the Caddyfile's site blocks. The sites themselves are checked from here over
+# HTTPS: status, response time and certificate expiry.
+DEFIANT_HOST = os.environ.get("FLEET_DEFIANT_HOST", "").strip()
+DEF_TTL = 20.0
+_DEF = {"at": 0.0, "data": None}
+_DEF_LOCK = threading.Lock()
+DEF_PROBE = r"""echo "H:$(hostname)"; echo "UP:$(cut -d' ' -f1 /proc/uptime)"; echo "LOAD:$(cut -d' ' -f1-3 /proc/loadavg)"
+echo "CPUS:$(nproc)"; . /etc/os-release; echo "OS:$PRETTY_NAME"; echo "KERNEL:$(uname -r)"
+awk '/^MemTotal|^MemAvailable/{print "MEM:" $1 $2}' /proc/meminfo
+dev=$(ip -o route get 1.1.1.1 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p')
+c1=$(head -1 /proc/stat); n1=$(grep " $dev:" /proc/net/dev); sleep 1; c2=$(head -1 /proc/stat); n2=$(grep " $dev:" /proc/net/dev)
+echo "CPU1:$c1"; echo "CPU2:$c2"; echo "NET1:$n1"; echo "NET2:$n2"
+echo "DISK:$(df -B1 --output=size,used,avail / | tail -1)"
+echo "REBOOT:$([ -f /var/run/reboot-required ] && echo yes || echo no)"
+echo "UPD:$(apt list --upgradable 2>/dev/null | grep -c upgradable)"
+docker ps -a --format 'CTR:{{.Names}}|{{.State}}|{{.Status}}' 2>/dev/null
+grep -h -E '^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}([ ,]|$).*\{[[:space:]]*$' /srv/caddy/Caddyfile 2>/dev/null | sed 's/[ ,{].*//' | sed 's/^/SITE:/'
+for s in /srv/sites/*/index.html; do [ -f "$s" ] && echo "DEPLOY:$(basename "$(dirname "$s")")|$(stat -c %Y "$s")"; done"""
+
+
+def _site_check(domain):
+    """HTTPS GET of the site's root: status, milliseconds, certificate days left."""
+    import ssl
+    import socket
+    r = {"domain": domain, "status": None, "ms": None, "cert_days": None, "error": None}
+    try:
+        ctx = ssl.create_default_context()
+        with socket.create_connection((domain, 443), timeout=8) as sock:
+            with ctx.wrap_socket(sock, server_hostname=domain) as tls:
+                exp = ssl.cert_time_to_seconds(tls.getpeercert()["notAfter"])
+                r["cert_days"] = int((exp - time.time()) // 86400)
+        t0 = time.time()
+        req = urllib.request.Request(f"https://{domain}/", method="GET",
+                                     headers={"User-Agent": "starfleet-fleet-status"})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                r["status"] = resp.status
+        except urllib.error.HTTPError as e:
+            r["status"] = e.code
+        r["ms"] = round((time.time() - t0) * 1000)
+    except (OSError, ssl.SSLError, ValueError) as e:
+        r["error"] = str(e)[:120]
+    return r
+
+
+def _cpu_pct(a, b):
+    x, y = [int(v) for v in a.split()[1:9]], [int(v) for v in b.split()[1:9]]
+    idle, total = (y[3] + y[4]) - (x[3] + x[4]), sum(y) - sum(x)
+    return round(100 * (1 - idle / total), 1) if total > 0 else None
+
+
+def defiant_state(force=False):
+    with _DEF_LOCK:
+        if not force and _DEF["data"] and time.time() - _DEF["at"] < DEF_TTL:
+            return dict(_DEF["data"], at=_DEF["at"])
+        if not DEFIANT_HOST:
+            return {"configured": False, "status": "off", "at": time.time()}
+        d, errors, now = {"configured": True, "containers": [], "sites": []}, [], time.time()
+        try:
+            r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", DEFIANT_HOST, DEF_PROBE],
+                               capture_output=True, text=True, timeout=45, stdin=subprocess.DEVNULL)
+            if "H:" not in r.stdout:
+                raise OSError((r.stderr or f"ssh exit {r.returncode}").strip()[-200:])
+            kv, sites, deploys = {}, [], {}
+            for line in r.stdout.splitlines():
+                k, _, v = line.partition(":")
+                if k == "CTR":
+                    n, stt, sts = (v.split("|") + ["", ""])[:3]
+                    d["containers"].append({"name": n, "state": stt, "status": sts})
+                elif k == "SITE":
+                    if not v.startswith("www.") and v not in sites:
+                        sites.append(v)
+                elif k == "DEPLOY":
+                    n, _, ts = v.partition("|")
+                    deploys[n] = int(ts) if ts.isdigit() else None
+                elif k == "MEM":
+                    kv[v.split(":")[0]] = int(re.sub(r"\D", "", v.split(":", 1)[1]))
+                else:
+                    kv[k] = v.strip()
+            mem_t, mem_a = kv.get("MemTotal"), kv.get("MemAvailable")
+            disk = [int(x) for x in kv.get("DISK", "0 0 0").split()]
+            n1, n2 = kv.get("NET1", "").split(":", 1)[-1].split(), kv.get("NET2", "").split(":", 1)[-1].split()
+            d.update({"host": kv.get("H"), "os": kv.get("OS"), "kernel": kv.get("KERNEL"),
+                      "uptime_s": float(kv.get("UP") or 0), "load": kv.get("LOAD"), "cpus": int(kv.get("CPUS") or 0),
+                      "cpu_pct": _cpu_pct(kv["CPU1"], kv["CPU2"]) if "CPU1" in kv else None,
+                      "mem_total_kb": mem_t, "mem_avail_kb": mem_a,
+                      "disk_total": disk[0], "disk_used": disk[1], "disk_avail": disk[2],
+                      "rx_bps": int(n2[0]) - int(n1[0]) if len(n1) > 8 and len(n2) > 8 else None,
+                      "tx_bps": int(n2[8]) - int(n1[8]) if len(n1) > 8 and len(n2) > 8 else None,
+                      "reboot_required": kv.get("REBOOT") == "yes", "updates": int(kv.get("UPD") or 0)})
+            checks = {}
+            ts = [threading.Thread(target=lambda dm=dm: checks.__setitem__(dm, _site_check(dm))) for dm in sites]
+            [t.start() for t in ts]
+            [t.join() for t in ts]
+            d["sites"] = [dict(checks.get(dm) or {"domain": dm}, deployed=deploys.get(dm)) for dm in sites]
+        except (OSError, subprocess.SubprocessError, ValueError, KeyError) as e:
+            errors.append(str(e)[:200])
+        problems = []
+        for st in d["sites"]:
+            if st.get("error") or not st.get("status") or (st["status"] >= 400 and st["status"] != 401):   # 401 = password-protected on purpose
+                problems.append(f"{st['domain']}: {st.get('error') or st.get('status')}")
+            elif st.get("cert_days") is not None and st["cert_days"] < 14:
+                problems.append(f"{st['domain']}: certificate expires in {st['cert_days']} days")
+        if d.get("disk_total") and d["disk_used"] / d["disk_total"] > 0.85:
+            problems.append("disk over 85 % full")
+        for c in d["containers"]:
+            if c["state"] != "running":
+                problems.append(f"container {c['name']} is {c['state']}")
+        d["problems"], d["errors"] = problems, errors
+        d["status"] = "error" if errors else "warn" if problems else "ok"
+        _DEF["data"], _DEF["at"] = d, now
+        return dict(d, at=now)
+
+
 # ---------------------------------------------------------------- http
 
 class Handler(BaseHTTPRequestHandler):
@@ -2157,6 +2448,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, f.read(), "audio/mpeg")
         if self.path == "/api/nas":
             return self._send(200, json.dumps(nas_state()), "application/json")
+        if self.path == "/api/memoryalpha":
+            return self._send(200, json.dumps(memory_alpha_state()), "application/json")
+        if self.path == "/api/defiant":
+            return self._send(200, json.dumps(defiant_state()), "application/json")
         if self.path == "/api/containers":
             return self._send(200, json.dumps(containers_state()), "application/json")
         if self.path == "/api/nas/stats":
@@ -2295,6 +2590,17 @@ class Handler(BaseHTTPRequestHandler):
             except (OSError, subprocess.SubprocessError) as e:
                 return self._send(502, json.dumps({"error": str(e)[:200]}), "application/json")
             print(f"NAS {body.get('action')} {body.get('target')}: ok", flush=True)
+            return self._send(200, json.dumps(res), "application/json")
+        if self.path == "/api/memoryalpha/backup":
+            try:
+                res = memory_alpha_backup(key)
+            except urllib.error.HTTPError as e:
+                return self._send(403, json.dumps({"error": _err_text(e)}), "application/json")
+            except PermissionError as e:
+                return self._send(409, json.dumps({"error": str(e)}), "application/json")
+            except (urllib.error.URLError, OSError, subprocess.SubprocessError) as e:
+                return self._send(502, json.dumps({"error": str(e)[:200]}), "application/json")
+            print("MEMORY ALPHA backup started", flush=True)
             return self._send(200, json.dumps(res), "application/json")
         if self.path == "/api/containers/stop":
             try:

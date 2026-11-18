@@ -53,6 +53,10 @@ front of 39 models and **Fleet**, a window in the app, as the control surface.
   → [Main Engineering](#main-engineering-every-container-on-both-nodes)
 - **Looks after the NAS.** *Deep Space NAS* shows the Synology's containers and
   hardware, with start, stop and restart. → [Deep Space NAS](#deep-space-nas-the-nas-containers)
+- **Watches the off-site backup and the web server.** *Memory Alpha* shows the last
+  backup snapshot, its size, the schedule and the object-lock renewal, with a **Back up
+  now** button; *Defiant* shows the web server's health, its sites and certificates.
+  → [Memory Alpha](#memory-alpha-the-off-site-backup) · [Defiant](#defiant-the-web-server)
 - **Watches the cluster.** GPU load, temperature, power and memory per node, which
   models are resident, and which coding-agent sessions are running — in the menu bar
   and on a desktop widget, with a notification when a session stalls.
@@ -207,9 +211,10 @@ at `/api/jobs`.
 Every table sorts by any column: click a heading, click again to reverse, a third time
 for the default order (numbers start with the biggest; the choice is kept in the browser).
 
-Three views share the window. The left rail switches between them: **Starfleet
-Command** (the models), **Deep Space NAS** and **Engineering**. The address keeps the
-view (`#nas`, `#ctr`), so a reload or a bookmark opens the same one.
+Five views share the window. The left rail switches between them: **Starfleet
+Command** (the models), **Deep Space NAS**, **Engineering**, **Memory Alpha** and
+**Defiant**. The address keeps the view (`#nas`, `#ctr`, `#ma`, `#def`), so a reload or
+a bookmark opens the same one.
 
 ### Main Engineering: every container on both nodes
 
@@ -271,6 +276,62 @@ instead (a real photo is copyrighted, so `.gitignore` keeps it out).
 | `GET /api/nas` | | all NAS containers, running and stopped |
 | `GET /api/nas/stats` | | the NAS's hardware figures |
 | `POST /api/nas/control` | `{"target": "...", "action": "start\|stop\|restart\|rm"}` | asks the gate to do it |
+
+### Memory Alpha: the off-site backup
+
+<p align="center">
+  <img src="docs/images/memory-alpha.png" width="820" alt="Memory Alpha: panels for the last snapshot (age, time, duration, protected size, files, folders, errors), the bytes stored in the bucket with object-lock renewal and maintenance, the schedule with retention, and a Back up now button">
+  <br><sub><b>Memory Alpha</b>: the off-site backup at a glance.</sub>
+</p>
+
+[Kopia](https://kopia.io) runs on the NAS and snapshots its volume into an object storage
+bucket with object lock in compliance mode, so no snapshot can be deleted or altered
+before its lock expires; full maintenance renews the locks daily. The view shows:
+
+- **Last snapshot**: when it finished, how long it took, the protected size, file and
+  folder counts and errors
+- **Stored in the bucket**: bytes and blob count after deduplication and compression,
+  plus whether lock renewal is on and when full maintenance runs next
+- **Schedule and retention**: the daily snapshot time and the next run, and how many
+  latest, daily, monthly and annual snapshots are kept
+- **Status**: *Attention* when the last snapshot is older than 30 hours, incomplete or
+  has errors, or when lock renewal stopped (the same rules as the daily watchdog)
+
+Fleet holds no backup credentials. It reads the status lines a `kopia-check` container
+logs every six hours (`SNAP`, `MAINT`, `BLOB`), the policy printed by the init container
+and the container states, all through the NAS gate's read-only verbs. **Back up now**
+needs the Starfleet key and a second click; it starts a one-shot `kopia-snapshot`
+container with the gate's `control start`, which takes a snapshot of the volume and logs
+the result (`SNAPNOW`, `SNAPERR`, `EXIT`). The button stays disabled until that container
+exists in the NAS's compose project.
+
+| Call | Body | Does |
+| --- | --- | --- |
+| `GET /api/memoryalpha` | | last snapshot, stored bytes, maintenance, policy, next snapshot, manual run, problems |
+| `POST /api/memoryalpha/backup` | `{}` | starts a snapshot; 403 without the key, 409 when the one-shot container is missing or already running |
+
+### Defiant: the web server
+
+<p align="center">
+  <img src="docs/images/defiant.png" width="820" alt="Defiant: server uptime, OS, load, pending updates and reboot flag; CPU and memory gauges; disk and network; a sortable table of sites with HTTP status, response time, certificate days left and last deploy; and the server's containers">
+  <br><sub><b>Defiant</b>: the web server's health, sites and certificates. Two site names are replaced.</sub>
+</p>
+
+The web server that hosts the public sites (Caddy with Let's Encrypt). One read-only ssh
+probe returns uptime, OS and kernel, load, CPU use and network rates over one second,
+memory, disk, pending package updates, whether a reboot is required, the containers and
+the site blocks of the Caddyfile. Fleet then checks every site over HTTPS itself: status
+code, response time and days until the certificate expires (a 401 counts as a protected
+site, not a fault). *Attention* means a site is down, a certificate expires within 14
+days, the disk is over 85 % full or a container is not running.
+
+The ssh target comes from the service environment, `FLEET_DEFIANT_HOST` (for example
+`user@host` in a systemd drop-in), so no address lives in the code; without it the view
+says it is not configured.
+
+| Call | Body | Does |
+| --- | --- | --- |
+| `GET /api/defiant` | | host figures, sites with status, response time, certificate and last deploy, containers, problems |
 
 ### Full screen
 

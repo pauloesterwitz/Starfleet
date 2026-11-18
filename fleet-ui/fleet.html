@@ -249,6 +249,20 @@ td .sub{margin-top:3px;font-size:11px;color:var(--dim);line-height:1.35}
 /* ---- Deep Space NAS view: a second page in the same frame; the rail button swaps which one shows ---- */
 body.nas .main:not(#nasview), body:not(.nas) #nasview{display:none}
 body.ctr .main:not(#ctrview), body:not(.ctr) #ctrview{display:none}
+body.ma .main:not(#maview), body:not(.ma) #maview{display:none}
+body.def .main:not(#defview), body:not(.def) #defview{display:none}
+/* ---- Memory Alpha (off-site backup) and Defiant (web server) ---- */
+.vmsg{display:none;border-left:8px solid var(--amber);background:#1a1204;color:var(--amber);padding:6px 14px;
+  font-size:13px;text-transform:uppercase;margin-top:6px;letter-spacing:.06em}
+.vmsg.err{border-left-color:var(--red);background:#2a0d0d;color:var(--red)}
+.vstate{display:inline-block;border-radius:11px;padding:2px 12px;font-size:13px;font-weight:700;color:#000;margin-left:10px}
+.vstate.ok{background:var(--blue)} .vstate.warn{background:var(--amber)} .vstate.error{background:var(--red)} .vstate.off{background:var(--grid);color:var(--dim)}
+.node .sub2{font-size:13px;color:var(--dim);text-transform:uppercase;letter-spacing:.06em;margin-top:2px}
+.bigbtn{font-family:var(--lcars);font-size:18px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;border:0;
+  border-radius:20px;padding:9px 26px;margin-top:10px;background:var(--orange);color:#000;cursor:pointer}
+.bigbtn:hover{background:var(--peach)} .bigbtn:disabled{opacity:.35;cursor:default}
+.bigbtn.armed{background:var(--red)}
+.vnote{margin-top:8px;font-size:12px;color:var(--dim);text-transform:uppercase;letter-spacing:.06em;line-height:1.4}
 /* sortable tables: click a heading */
 th[data-sort]{cursor:pointer;user-select:none;-webkit-user-select:none}
 th[data-sort]:hover{color:var(--text)}
@@ -357,6 +371,10 @@ html.fs{scrollbar-width:none} html.fs::-webkit-scrollbar{display:none}
       style="border:0;cursor:pointer;font:inherit;text-transform:uppercase;letter-spacing:.08em;font-weight:700;font-size:14px;padding:10px">Deep Space NAS</button>
     <button id="ctrbtn" type="button" class="blk c4" title="Running containers on Jean-Luc and Kathryn: memory, start time, owner, idle time. Stop one to free memory."
       style="border:0;cursor:pointer;font:inherit;text-transform:uppercase;letter-spacing:.08em;font-weight:700;font-size:14px;padding:10px">Engineering</button>
+    <button id="mabtn" type="button" class="blk c2" title="Off-site backup of the NAS (Kopia to the object storage bucket): last snapshot, size, schedule, Back up now"
+      style="border:0;cursor:pointer;font:inherit;text-transform:uppercase;letter-spacing:.08em;font-weight:700;font-size:14px;padding:10px">Memory Alpha</button>
+    <button id="defbtn" type="button" class="blk" title="The web server: health, resources, sites, certificates and containers"
+      style="background:var(--peach);border:0;cursor:pointer;font:inherit;text-transform:uppercase;letter-spacing:.08em;font-weight:700;font-size:14px;padding:10px">Defiant</button>
     <div class="blk fill"></div>
     <div class="blk elbow-b"><div class="n" id="r-free">--</div><div class="l">GB Free</div></div>
   </div>
@@ -416,6 +434,24 @@ html.fs{scrollbar-width:none} html.fs::-webkit-scrollbar{display:none}
     <div id="ctrmsg"></div>
     <div id="ctrnodes"></div>
   </div>
+
+  <div class="main" id="maview">
+    <div class="top">
+      <div class="title">Memory <span>Alpha</span></div>
+      <div class="bar"><span id="mameta">--</span></div>
+    </div>
+    <div class="vmsg" id="mamsg"></div>
+    <div id="mabody"></div>
+  </div>
+
+  <div class="main" id="defview">
+    <div class="top">
+      <div class="title">U.S.S. <span>Defiant</span></div>
+      <div class="bar"><span id="defmeta">--</span></div>
+    </div>
+    <div class="vmsg" id="defmsg"></div>
+    <div id="defbody"></div>
+  </div>
 </div>
 
 <script>
@@ -460,7 +496,7 @@ document.addEventListener("click",e=>{
   const t=th.closest("table").dataset.table, k=th.dataset.sort, first=+(th.dataset.first||1), s=SORT[t];
   if(!s||s.k!==k) SORT[t]={k,d:first}; else if(s.d===first) SORT[t]={k,d:-first}; else delete SORT[t];
   try{ localStorage.setItem("fleetSort",JSON.stringify(SORT)); }catch(e){}
-  if(t==="models"){ if(last) render(last); } else ctrPaint();
+  if(t==="models"){ if(last) render(last); } else if(t==="ctr") ctrPaint(); else defPaint();
 });
 var queuedPos={};   /* model id -> 1-based place in the load queue; declared early because render() runs before later top-level lines */
 const TAG={"jean-luc":["jl","JEAN-LUC"],"kathryn":["ka","KATHRYN"],"dynamic":["dy","AUTO"]};
@@ -468,7 +504,7 @@ const gb=kb=>(kb/1048576).toFixed(1);
 const busy=new Set();
 const FILTERS=["all","jean-luc","kathryn","starfleet","dynamic","live","pinned","vision","embed","rerank","image"];
 /* the hash makes a view bookmarkable — open #kathryn to land straight on her models */
-const wantNas=location.hash==="#nas", wantCtr=location.hash==="#ctr";   /* read before setFilter() below rewrites the hash; opens the Deep Space NAS view */
+const wantView=["nas","ctr","ma","def"].find(v=>location.hash==="#"+v);   /* read before setFilter() below rewrites the hash: reopens that view */
 let filter=FILTERS.includes(location.hash.slice(1))?location.hash.slice(1):"all";
 let query="", last={nodes:{},models:[],running:[],pins:[],errors:{},loading:[]};
 /* Date.now() of the poll that produced last.loading, so the bar can tick every
@@ -1377,15 +1413,7 @@ async function nasAct(name,action){
   delete nasBusy[name]; nasPoll();
 }
 
-function nasToggle(on){
-  if(on&&ctrOn) ctrToggle(false);
-  nasOn=on; document.body.classList.toggle("nas",on);
-  document.getElementById("nasbtn").textContent=on?"Starfleet Command":"Deep Space NAS";
-  try{ history.replaceState(null,"",on?"#nas":"#"+(filter==="all"?"":filter)); }catch(e){}
-  if(on){ nasFit(); nasPoll(); } else clearTimeout(nasTimer);
-}
-document.getElementById("nasbtn").addEventListener("click",()=>nasToggle(!nasOn));
-if(wantNas) nasToggle(true);
+function nasToggle(on){ setView(on?"nas":""); }
 
 /* ================= Main Engineering =================
    Running containers on both Sparks from /api/containers (a read-only probe per node, refreshed every 30 s by
@@ -1454,15 +1482,149 @@ async function ctrStop(node,name){
   }catch(e){ if(ctrLast) ctrLast.actionError=`Stop ${name} on ${node} failed: ${e.message}`; }
   delete ctrBusy[k]; ctrPoll();
 }
-function ctrToggle(on){
-  if(on&&nasOn) nasToggle(false);
-  ctrOn=on; document.body.classList.toggle("ctr",on);
-  document.getElementById("ctrbtn").textContent=on?"Starfleet Command":"Engineering";
-  try{ history.replaceState(null,"",on?"#ctr":"#"+(filter==="all"?"":filter)); }catch(e){}
-  if(on) ctrPoll(); else clearTimeout(ctrTimer);
+function ctrToggle(on){ setView(on?"ctr":""); }
+
+/* shared formatting for the server views */
+const fmtB=b=>b==null?"–":b>=1e12?(b/1e12).toFixed(2)+" TB":b>=1e9?(b/1e9).toFixed(1)+" GB":b>=1e6?(b/1e6).toFixed(0)+" MB":Math.round(b/1e3)+" kB";
+const fmtN=n=>n==null?"–":n.toLocaleString("en-US");
+const fmtT=t=>t?new Date(t*1000).toLocaleString([], {weekday:"short",day:"2-digit",month:"short",hour:"2-digit",minute:"2-digit"}):"–";
+const ago=t=>t?ctrDur(Date.now()/1000-t)+" ago":"–";
+const until=t=>!t?"–":t<Date.now()/1000?"due":"in "+ctrDur(t-Date.now()/1000);
+const chip=(l,v)=>`<span class="stat">${l}<b>${v}</b></span>`;
+const vstate=st=>`<span class="vstate ${st}">${{ok:"Nominal",warn:"Attention",error:"Fault",off:"Not configured"}[st]||st}</span>`;
+function vmsg(id,problems,errors){
+  const el=document.getElementById(id), t=[...(errors||[]),...(problems||[])].join(" · ");
+  el.style.display=t?"block":"none"; el.textContent=t; el.classList.toggle("err",!!(errors||[]).length);
 }
-document.getElementById("ctrbtn").addEventListener("click",()=>ctrToggle(!ctrOn));
-if(wantCtr) ctrToggle(true);
+
+/* ================= Memory Alpha =================
+   The off-site backup: Kopia on the NAS snapshots the whole volume into an object storage bucket with object lock.
+   /api/memoryalpha reads what the kopia-check container logs (every 6 h), the policy and the container states
+   through the NAS gate; Fleet holds no backup credentials. "Back up now" (Starfleet key, second click) starts the
+   one-shot kopia-snapshot container. */
+var maOn=false;
+let maTimer=null, maLast=null, maArmed=false, maArmT=null, maBusy=false, maMsg="";
+function maPaint(){
+  const d=maLast; if(!d) return;
+  document.getElementById("mameta").innerHTML=`checked ${d.checked?fmtT(d.checked):"–"}${vstate(d.status)}`;
+  vmsg("mamsg",d.problems,[...(d.errors||[]),...(maMsg?[maMsg]:[])]);
+  const L=d.last||{}, mt=d.maintenance||{}, pol=d.policy||{}, k=pol.keep||{}, man=d.manual||{};
+  const cls=d.status==="ok"?"":d.status==="warn"?"warn":"crit";
+  const running=man.state==="running";
+  const btn=!d.trigger_ready
+    ?`<button class="bigbtn" disabled>Back up now</button><div class="vnote">Needs the kopia-snapshot container: rebuild the kopia project once in DSM Container Manager.</div>`
+    :`<button class="bigbtn${maArmed?" armed":""}" ${running||maBusy?"disabled":""} onclick="maBackup()">${running?"Snapshot running...":maBusy?"Starting...":maArmed?"Sure? Start snapshot":"Back up now"}</button>`+
+     `<div class="vnote">${running?`Started ${ago(man.started)}. Snapshots take 2 to 6 minutes.`
+        :man.started?`Last manual run ${ago(man.started)}: ${man.exit===0?"completed":man.exit!=null?"failed (exit "+man.exit+")":"no result"}${man.error?" · "+esc(man.error):""}`:"No manual run yet."}</div>`;
+  document.getElementById("mabody").innerHTML=`
+  <div class="sec"><div class="cap"></div><h2>Off-site Backup</h2><div class="rule"></div></div>
+  <div class="nodes">
+    <div class="node ${cls}"><h3>Last Snapshot</h3>
+      <div class="mem">${L.end?ago(L.end):"–"}</div>
+      <div class="sub2">${L.end?fmtT(L.end)+" · took "+ctrDur((L.end-L.start)):"no snapshot reported"}${L.description?" · "+esc(L.description):""}</div>
+      <div class="stats">${chip("Protected",fmtB(L.size))}${chip("Files",fmtN(L.files))}${chip("Folders",fmtN(L.dirs))}${chip("Errors",L.errors??"–")}</div></div>
+    <div class="node"><h3>Stored in Memory Alpha</h3>
+      <div class="mem">${d.stored?fmtB(d.stored.bytes):"–"}</div>
+      <div class="sub2">${d.stored?fmtN(d.stored.count)+" blobs, deduplicated and compressed":"reported by kopia-check after the DSM rebuild"}</div>
+      <div class="stats">${chip("Object lock",mt.locks?"Renewed":"Off")}${chip("Full maintenance",until(mt.next_full))}${chip("Quick maintenance","hourly")}</div></div>
+    <div class="node"><h3>Schedule</h3>
+      <div class="mem">${d.next_snapshot?until(d.next_snapshot):"–"}</div>
+      <div class="sub2">${(pol.times||[]).length?"daily at "+pol.times.join(", "):"no snapshot time set"} · next ${fmtT(d.next_snapshot)}</div>
+      <div class="stats">${chip("Keep latest",k.latest??"–")}${chip("Daily",k.daily??"–")}${chip("Monthly",k.monthly??"–")}${chip("Annual",k.annual??"–")}</div></div>
+    <div class="node"><h3>Back Up Now</h3>${btn}</div>
+  </div>
+  <div class="sec"><div class="cap"></div><h2>Backup Containers on the NAS</h2><div class="rule"></div></div>
+  <div class="ctrs" style="margin-top:0">${(d.containers||[]).map(c=>`<u class="${c.state==="running"?"gpu":""}">${esc(c.name)} · ${esc(c.status)}</u>`).join("")}</div>`;
+}
+async function maPoll(){
+  clearTimeout(maTimer);
+  if(!maOn) return;
+  try{ maLast=await (await fetch("/api/memoryalpha")).json(); maPaint(); }
+  catch(e){ if(maLast){ maLast.errors=["Fleet not answering: "+e]; maPaint(); } }
+  maTimer=setTimeout(maPoll,15000);
+}
+async function maBackup(){
+  if(!maArmed){ maArmed=true; clearTimeout(maArmT); maArmT=setTimeout(()=>{ maArmed=false; maPaint(); },4000); maPaint(); return; }
+  maArmed=false; maBusy=true; maMsg=""; maPaint();
+  try{
+    const r=await fetch("/api/memoryalpha/backup",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"});
+    const j=await r.json();
+    if(r.status===403) throw new Error("Starfleet key missing or wrong (enter it on the Starfleet Command page, Save key)");
+    if(!r.ok) throw new Error(j.error||("HTTP "+r.status));
+  }catch(e){ maMsg="Back up now failed: "+e.message; }
+  maBusy=false; maPoll();
+}
+
+/* ================= Defiant =================
+   The web server. /api/defiant runs one read-only ssh probe (host, CPU, memory, disk, network, updates,
+   containers, the Caddyfile's sites) and checks each site over HTTPS from here: status, time, certificate. */
+var defOn=false;
+let defTimer=null, defLast=null;
+function defPaint(){
+  const d=defLast; if(!d) return;
+  document.getElementById("defmeta").innerHTML=`${d.host?esc(d.host)+" · ":""}synced ${new Date(d.at*1000).toLocaleTimeString()}${vstate(d.status)}`;
+  if(!d.configured){ vmsg("defmsg",[],["Set FLEET_DEFIANT_HOST (ssh target) in the Fleet service environment to enable this view."]);
+    document.getElementById("defbody").innerHTML=""; return; }
+  vmsg("defmsg",d.problems,d.errors);
+  const memU=d.mem_total_kb?(1-d.mem_avail_kb/d.mem_total_kb)*100:null, diskU=d.disk_total?d.disk_used/d.disk_total*100:null;
+  const sc=p=>p==null?"":p>90?"crit":p>80?"warn":"";
+  const sites=sorted("sites",d.sites||[],{domain:s=>s.domain,status:s=>s.status,ms:s=>s.ms,cert:s=>s.cert_days,deployed:s=>s.deployed});
+  const ctrs=sorted("defctr",d.containers||[],{name:c=>c.name,state:c=>c.state,status:c=>c.status});
+  document.getElementById("defbody").innerHTML=`
+  <div class="sec"><div class="cap"></div><h2>Server</h2><div class="rule"></div></div>
+  <div class="nodes">
+    <div class="node ${d.status==="ok"?"":d.status==="warn"?"warn":"crit"}"><h3>${esc(d.host||"Defiant")}</h3>
+      <div class="mem">${d.uptime_s?ctrDur(d.uptime_s):"–"} <s>up</s></div>
+      <div class="sub2">${esc(d.os||"")} · kernel ${esc(d.kernel||"")}</div>
+      <div class="stats">${chip("Cores",d.cpus||"–")}${chip("Load",esc(d.load||"–"))}${chip("Updates",d.updates??"–")}${chip("Reboot",d.reboot_required?"Required":"No")}</div></div>
+    <div class="node ${sc(Math.max(d.cpu_pct||0,memU||0))}"><h3>CPU and Memory</h3>
+      <div class="mem">${d.cpu_pct??"–"} <s>% CPU</s></div>${hwGauge(d.cpu_pct||0)}
+      <div class="free">Memory ${memU==null?"–":memU.toFixed(0)+" % used"} · ${d.mem_avail_kb?(d.mem_avail_kb/1048576).toFixed(1):"–"} of ${d.mem_total_kb?(d.mem_total_kb/1048576).toFixed(1):"–"} GiB free</div>${hwGauge(memU||0)}</div>
+    <div class="node ${sc(diskU)}"><h3>Disk and Network</h3>
+      <div class="mem">${fmtB(d.disk_used)} <s>/ ${fmtB(d.disk_total)}</s></div>${hwGauge(diskU||0)}
+      <div class="stats">${chip("Free",fmtB(d.disk_avail))}${chip("In",d.rx_bps==null?"–":hwRate(d.rx_bps))}${chip("Out",d.tx_bps==null?"–":hwRate(d.tx_bps))}</div></div>
+  </div>
+  <div class="sec"><div class="cap"></div><h2>Sites · ${sites.length}</h2><div class="rule"></div></div>
+  <table data-table="sites"><thead><tr><th data-sort="domain">Site</th><th data-sort="status">HTTP</th><th class="num" data-sort="ms">Response</th>
+    <th class="num" data-sort="cert">Certificate</th><th data-sort="deployed" data-first="-1">Last deploy</th></tr></thead><tbody>${sites.map(s=>{
+      const bad=s.error||!s.status||(s.status>=400&&s.status!==401);
+      return `<tr class="${bad?"":"live"}"><td><div class="mid">${esc(s.domain)}</div>${s.error?`<div class="err">${esc(s.error)}</div>`:""}</td>
+      <td><span class="st ${bad?"stopped":"ready"}">${s.status?s.status+(s.status===401?" protected":""):"down"}</span></td>
+      <td class="num mid">${s.ms==null?"–":s.ms+" ms"}</td>
+      <td class="num mid ${s.cert_days!=null&&s.cert_days<14?"idle-long":""}">${s.cert_days==null?"–":s.cert_days+" days"}</td>
+      <td class="mid">${s.deployed?ago(s.deployed):"–"}</td></tr>`;}).join("")}</tbody></table>
+  <div class="sec"><div class="cap"></div><h2>Containers · ${ctrs.length}</h2><div class="rule"></div></div>
+  <table data-table="defctr"><thead><tr><th data-sort="name">Container</th><th data-sort="state">State</th><th data-sort="status">Status</th></tr></thead>
+  <tbody>${ctrs.map(c=>`<tr class="${c.state==="running"?"live":""}"><td class="mid">${esc(c.name)}</td>
+    <td><span class="st ${c.state==="running"?"ready":"stopped"}">${esc(c.state)}</span></td><td class="mid">${esc(c.status)}</td></tr>`).join("")}</tbody></table>`;
+  sortMarks();
+}
+async function defPoll(){
+  clearTimeout(defTimer);
+  if(!defOn) return;
+  try{ defLast=await (await fetch("/api/defiant")).json(); defPaint(); }
+  catch(e){ if(defLast){ defLast.errors=["Fleet not answering: "+e]; defPaint(); } }
+  defTimer=setTimeout(defPoll,15000);
+}
+
+/* ================= views =================
+   The rail buttons switch between Starfleet Command and one other page at a time; the address keeps the page. */
+const VIEWS={nas:["nasbtn","Deep Space NAS"],ctr:["ctrbtn","Engineering"],ma:["mabtn","Memory Alpha"],def:["defbtn","Defiant"]};
+var view="";
+function setView(v){
+  if(v===view) v="";
+  view=v;
+  for(const [k,[b,l]] of Object.entries(VIEWS)){
+    document.body.classList.toggle(k,k===v); document.getElementById(b).textContent=k===v?"Starfleet Command":l; }
+  nasOn=v==="nas"; ctrOn=v==="ctr"; maOn=v==="ma"; defOn=v==="def";
+  try{ history.replaceState(null,"",v?"#"+v:"#"+(filter==="all"?"":filter)); }catch(e){}
+  if(nasOn){ nasFit(); nasPoll(); } else clearTimeout(nasTimer);
+  if(ctrOn) ctrPoll(); else clearTimeout(ctrTimer);
+  if(maOn) maPoll(); else clearTimeout(maTimer);
+  if(defOn) defPoll(); else clearTimeout(defTimer);
+}
+Object.entries(VIEWS).forEach(([k,[b]])=>document.getElementById(b).addEventListener("click",()=>setView(k)));
+if(wantView) setView(wantView);
 
 /* Full screen: the whole display, not just a bigger panel. Safari before 16.4 only has the webkit-prefixed API.
    Where the request is refused or silently ignored (the Starfleet Command Mac app's WKWebView without
