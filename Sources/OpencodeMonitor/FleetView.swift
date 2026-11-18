@@ -15,7 +15,11 @@ extension Notification.Name {
 /// demand from ContentView's "Open Fleet" button, not shown at launch.
 struct FleetDashboardView: View {
     @State private var webView: WKWebView = {
-        let view = WKWebView(frame: .zero)
+        // Off by default in WKWebView: without it the page's Full screen button
+        // (requestFullscreen) is silently ignored. Needs macOS 12.3+.
+        let config = WKWebViewConfiguration()
+        config.preferences.isElementFullscreenEnabled = true
+        let view = WKWebView(frame: .zero, configuration: config)
         view.customUserAgent = "Starfleet Command/1.0 (macOS)"
         return view
     }()
