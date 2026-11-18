@@ -393,6 +393,33 @@ body.fs #nasview{grid-column:1}
 body.fs .main{padding-top:24px}
 body.fs th{position:sticky;top:0;background:var(--ink);z-index:1}
 html.fs{scrollbar-width:none} html.fs::-webkit-scrollbar{display:none}
+
+/* ---- phone (the iPhone app, narrow browsers): the 150px rail would leave the page ~230px,
+   so it becomes a block grid above the page: the five figures in one row, the buttons four
+   to a row. Headers wrap, wide tables scroll sideways inside their view, not the page. ---- */
+@media (max-width:700px){
+  .frame{grid-template-columns:minmax(0,1fr);align-content:start;padding:4px;gap:6px}
+  #nasview{grid-column:1}
+  /* below 16px iOS zooms the page into a field on every tap */
+  input,textarea,select{font-size:16px!important}
+  .rail{position:static;height:auto;display:grid;grid-template-columns:repeat(20,minmax(0,1fr));gap:4px}
+  .rail>div.blk{grid-column:span 4;order:-1;min-height:40px;padding:3px 7px 4px}
+  .rail>button.blk{grid-column:span 5;min-height:44px;justify-content:center;align-items:center;text-align:center;
+    line-height:1.05;font-size:11px!important;padding:4px 5px!important}
+  .rail .blk .n{font-size:19px} .rail .blk .l{font-size:9px;margin-top:2px}
+  .rail .blk.elbow-t{height:auto;border-radius:20px 0 0 20px}
+  .rail .blk.elbow-b{height:auto;border-radius:0 20px 20px 0}
+  .rail .blk.fill{display:none}
+  #fsbtn{display:none}
+  .main{min-width:0}
+  .top{height:auto;flex-wrap:wrap;gap:6px}
+  .title{font-size:30px;white-space:normal}
+  .top .bar{flex:1 1 100%;min-height:34px;height:auto;flex-wrap:wrap}
+  .main table{display:block;overflow-x:auto}
+  .nodes{grid-template-columns:minmax(0,1fr)}
+  #comp{grid-template-columns:minmax(0,1fr)}
+  .cbtns{width:auto}
+}
 </style><link rel="stylesheet" href="/vendor/atom-one-dark.min.css"><link rel="stylesheet" href="/vendor/memcore.css">
 <script src="/vendor/marked.min.js"></script><script src="/vendor/purify.min.js"></script><script src="/vendor/highlight.min.js"></script>
 </head><body>
