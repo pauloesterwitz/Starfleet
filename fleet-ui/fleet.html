@@ -419,6 +419,50 @@ html.fs{scrollbar-width:none} html.fs::-webkit-scrollbar{display:none}
   .nodes{grid-template-columns:minmax(0,1fr)}
   #comp{grid-template-columns:minmax(0,1fr)}
   .cbtns{width:auto}
+
+  /* Model registry as cards, one per model, nothing off screen:
+       name ............ state
+       node  speed  ttl      pin  unload
+       ctx [..]   effort [..]
+     Column headers (and with them sorting) are hidden; the filter pills stay. */
+  table[data-table="models"]{display:block;overflow:visible}
+  table[data-table="models"] thead{display:none}
+  #rows{display:block}
+  #rows tr{display:flex;flex-wrap:wrap;align-items:center;gap:7px 8px;margin-bottom:6px;
+    padding:9px 10px 10px;background:#0b0803;border-left:7px solid var(--grid)}
+  #rows tr.live{border-left-color:var(--blue)}
+  #rows tr.pinned{background:#170f18;border-left-color:var(--magenta)}
+  #rows td{display:flex;align-items:center;gap:5px;padding:0;background:none;border:0;min-width:0}
+  /* a 70% basis keeps the name and the state alone on the first line; the ::after break below keeps
+     context and effort off the second one, however short that line is */
+  #rows td:nth-child(1){display:block;order:1;flex:1 1 70%}
+  #rows td:nth-child(6){order:2;flex:0 0 auto;align-self:flex-start;padding-top:2px}
+  #rows td:nth-child(2){order:3}
+  #rows td:nth-child(3){order:4;color:var(--dim)}
+  #rows td:nth-child(7){order:5}
+  #rows td.act{order:6;margin-left:auto;gap:6px}
+  #rows tr::after{content:"";order:7;flex-basis:100%;height:0}
+  #rows td:nth-child(4),#rows td:nth-child(5){order:8;flex:1 1 40%}
+  #rows td.act button:disabled:not(:first-child){display:none}
+  #rows td:nth-child(7)::before{content:"TTL";font-size:10px;color:var(--dim)}
+  #rows td.ctx:nth-child(4)::before{content:"CTX";font-size:10px;color:var(--dim)}
+  #rows td.eff::before{content:"EFFORT";font-size:10px;color:var(--dim)}
+  /* nothing to show or set: an idle model has no TTL; a dash where context or effort cannot be set,
+     and the image rows' empty columns (those cells are .mid there) */
+  #rows tr:not(.live) td:nth-child(7),
+  #rows td.ctx:nth-child(4):not(:has(select)),#rows td.eff:not(:has(select)),
+  #rows td.mid:nth-child(4),#rows td.mid:nth-child(5),
+  #rows tr:has(>td.mid:nth-child(4)) td:nth-child(3),#rows tr:has(>td.mid:nth-child(4)) td:nth-child(7){display:none}
+  #rows td .mid{font-size:17px;word-break:break-word}
+  #rows td .sub{overflow-wrap:anywhere}
+  #rows td.act button{min-height:38px;min-width:76px;margin:0;font-size:14px;border-radius:14px}
+  /* iOS draws a select as a white system pill and ignores the LCARS colours until its native look is off */
+  #rows select{-webkit-appearance:none;appearance:none;min-height:34px;padding:4px 24px 4px 10px;border-radius:14px;
+    background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%23a4855f'/%3E%3C/svg%3E");
+    background-repeat:no-repeat;background-position:right 9px center}
+  #rows td:nth-child(4) select,#rows td.eff select{width:100%}
+  #rows select:disabled{opacity:1;background-image:none;padding-right:10px;color:var(--dim)}
+  #rows td.empty{flex:1 1 100%}
 }
 </style><link rel="stylesheet" href="/vendor/atom-one-dark.min.css"><link rel="stylesheet" href="/vendor/memcore.css">
 <script src="/vendor/marked.min.js"></script><script src="/vendor/purify.min.js"></script><script src="/vendor/highlight.min.js"></script>
