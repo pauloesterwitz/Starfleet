@@ -45,17 +45,17 @@ function build(){
   addEventListener("resize",()=>{ if(view==="wiki") draw(); });
   built=true;
 }
-function msg(t){ const m=$("mcmsg"); m.textContent=t||""; m.style.display=t?"block":"none"; m.classList.toggle("err",!!t); }
+function msg(t,err){ const m=$("mcmsg"); m.textContent=t||""; m.style.display=t?"block":"none"; m.classList.toggle("err",!!(t&&err)); }
 
 /* ---- data ---- */
 async function loadGraph(){
   try{
     const j=await compJSON("/api/computer/wiki/graph");
-    if(j.error) msg(j.error); else msg("");
+    if(j.error) msg(j.error,true); else msg(j.note||"");   /* note: wiki-mcp stopped, map read by a one-shot run */
     if(!j.graph){ setTimeout(()=>{ if(view==="wiki") loadGraph(); },3000); return; }
     if(G&&j.at===gAt) return;
     gAt=j.at; setGraph(j.graph); mark(); paintLists(); draw();
-  }catch(e){ msg(e.message); }
+  }catch(e){ msg(e.message,true); }
 }
 async function loadTrails(){
   try{
@@ -65,7 +65,7 @@ async function loadTrails(){
     if(before===JSON.stringify(trails.map(t=>[t.id,t.steps.length]))) return;
     if(!trails.find(t=>t.id===chatSel)) chatSel=trails[0]?trails[0].id:null;   /* newest session by default: a live answer grows */
     mark(); paintLists(); draw();
-  }catch(e){ msg(e.message); }
+  }catch(e){ msg(e.message,true); }
 }
 function setGraph(g){
   byPath={}; byName={};

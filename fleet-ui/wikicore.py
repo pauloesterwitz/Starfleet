@@ -1,7 +1,9 @@
 """Memory Core: the LLM wiki as one graph, and the path Computer took through it. Read-only.
 
-The graph comes from wiki-mcp's own link scanner (wiki_mcp.graph, run inside its container with docker exec), so the map
-shows exactly the relations Computer's wiki_search and wiki_related follow. The trails come from Computer's chat files
+The graph comes from wiki-mcp's own link scanner (wiki_mcp.graph), so the map shows exactly the relations Computer's
+wiki_search and wiki_related follow. While the wiki-mcp container runs, it is read with docker exec; when it was stopped
+(e.g. to free memory), a one-shot container of the same image reads the wiki read-only, offline, for a few seconds and is
+removed. The last good map is also kept on disk, so a Fleet restart or a removed container still shows the core. The trails come from Computer's chat files
 (fleet.py COMPUTER_DIR): every wiki_* call with its arguments, what it returned, and what the answer cited.
 Nothing here writes to the wiki, the chats or the container."""
 import glob
@@ -17,6 +19,7 @@ CONTAINER = os.environ.get("FLEET_WIKI_CONTAINER", "wikidemo-mcp")
 TTL = 600          # seconds a graph export is reused; a stale one is served while the next builds in the background
 MAX_CHATS = 40     # newest chats scanned for trails
 MAX_HITS = 40      # hits kept per step
+CACHE_FILE = os.path.expanduser("~/.cache/fleet-ui/wiki-graph.json")
 
 # Runs inside the wiki-mcp container (python -). graph.get only stats and parses the vault.
 _EXPORT = r'''
@@ -35,28 +38,65 @@ print(json.dumps({"nodes": nodes, "edges": edges, "stubs": len(g.pages) - len(g.
 '''
 
 _lock = threading.Lock()
-_cache = {"at": 0.0, "json": None, "error": None, "busy": False}
+_cache = {"at": 0.0, "json": None, "error": None, "note": None, "busy": False}
+
+
+def _export_cmd():
+    """(argv, note): docker exec into the running wiki-mcp container, else a one-shot read-only run of its image."""
+    r = subprocess.run(["docker", "inspect", CONTAINER], capture_output=True, text=True, timeout=30)
+    if r.returncode != 0:
+        raise OSError(f"container {CONTAINER} not found")
+    c = json.loads(r.stdout)[0]
+    if c["State"].get("Running"):
+        return ["docker", "exec", "-i", CONTAINER, "python", "-"], None
+    vol = [m for m in c.get("Mounts", []) if m.get("Destination") == "/vault/wiki"]
+    if not vol:
+        raise OSError(f"container {CONTAINER} has no /vault/wiki mount")
+    cfg = c["Config"]
+    argv = ["docker", "run", "--rm", "-i", "--network", "none", "--read-only", "--tmpfs", "/tmp", "--memory", "1g",
+            "-v", f'{vol[0]["Source"]}:/vault/wiki:ro', "-e", "WIKI_VAULT=/vault", "-e", "PYTHONPATH=/app",
+            "-w", cfg.get("WorkingDir") or "/app", "--entrypoint", "python"]
+    if cfg.get("User"):
+        argv += ["--user", cfg["User"]]
+    return argv + [cfg["Image"], "-"], (f"{CONTAINER} is stopped: the map was read by a one-shot read-only run of its image. "
+                                        "Computer cannot use the wiki until it runs again.")
 
 
 def _refresh():
-    data, err = None, None
+    data, err, note = None, None, None
     try:
-        r = subprocess.run(["docker", "exec", "-i", CONTAINER, "python", "-"], input=_EXPORT,
-                           capture_output=True, text=True, timeout=180)
+        argv, note = _export_cmd()
+        r = subprocess.run(argv, input=_EXPORT, capture_output=True, text=True, timeout=180)
         if r.returncode != 0:
             raise OSError((r.stderr or "export failed").strip().splitlines()[-1][:300])
         json.loads(r.stdout)                 # refuse to cache garbage
         data = r.stdout.strip()
-    except (OSError, ValueError, IndexError, subprocess.SubprocessError) as e:
+        try:
+            os.makedirs(os.path.dirname(CACHE_FILE), mode=0o700, exist_ok=True)
+            with open(CACHE_FILE + ".tmp", "w", encoding="utf-8") as f:
+                f.write(data)
+            os.chmod(CACHE_FILE + ".tmp", 0o600)
+            os.replace(CACHE_FILE + ".tmp", CACHE_FILE)
+        except OSError:
+            pass                             # the disk copy is a convenience only
+    except (OSError, ValueError, IndexError, KeyError, subprocess.SubprocessError) as e:
         err = f"wiki graph from container {CONTAINER}: {str(e)[:300]}"
     with _lock:
         if data:
             _cache["json"], _cache["at"] = data, time.time()
-        _cache["error"], _cache["busy"] = err, False
+        elif _cache["json"] is None and os.path.isfile(CACHE_FILE):
+            try:
+                with open(CACHE_FILE, encoding="utf-8") as f:
+                    _cache["json"] = f.read()
+                _cache["at"] = os.path.getmtime(CACHE_FILE)
+                err = (err or "") + " Showing the last saved map."
+            except OSError:
+                pass
+        _cache["error"], _cache["note"], _cache["busy"] = err, note, False
 
 
 def graph_json():
-    """JSON text {graph, at, error, refreshing}. The first call waits for the export (about 4 s); later calls never wait."""
+    """JSON text {graph, at, error, note, refreshing}. The first call waits for the export (about 4 s); later calls never wait."""
     with _lock:
         start = time.time() - _cache["at"] > TTL and not _cache["busy"]
         if start:
@@ -69,7 +109,8 @@ def graph_json():
             threading.Thread(target=_refresh, daemon=True).start()
     with _lock:
         return ('{"graph":' + (_cache["json"] or "null") + ',"at":' + json.dumps(_cache["at"]) + ',"error":'
-                + json.dumps(_cache["error"]) + ',"refreshing":' + json.dumps(_cache["busy"]) + "}")
+                + json.dumps(_cache["error"]) + ',"note":' + json.dumps(_cache["note"]) + ',"refreshing":'
+                + json.dumps(_cache["busy"]) + "}")
 
 
 # ---------------------------------------------------------------- trails
