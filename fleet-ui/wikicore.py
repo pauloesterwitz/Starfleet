@@ -1,0 +1,183 @@
+"""Memory Core: the LLM wiki as one graph, and the path Computer took through it. Read-only.
+
+The graph comes from wiki-mcp's own link scanner (wiki_mcp.graph, run inside its container with docker exec), so the map
+shows exactly the relations Computer's wiki_search and wiki_related follow. The trails come from Computer's chat files
+(fleet.py COMPUTER_DIR): every wiki_* call with its arguments, what it returned, and what the answer cited.
+Nothing here writes to the wiki, the chats or the container."""
+import glob
+import json
+import os
+import re
+import subprocess
+import threading
+import time
+import urllib.parse
+
+CONTAINER = os.environ.get("FLEET_WIKI_CONTAINER", "wikidemo-mcp")
+TTL = 600          # seconds a graph export is reused; a stale one is served while the next builds in the background
+MAX_CHATS = 40     # newest chats scanned for trails
+MAX_HITS = 40      # hits kept per step
+
+# Runs inside the wiki-mcp container (python -). graph.get only stats and parses the vault.
+_EXPORT = r'''
+import json, os
+from pathlib import Path
+from wiki_mcp import graph
+v = Path(os.environ.get("WIKI_VAULT", "/vault"))
+g = graph.get(v)
+idx = {p: i for i, p in enumerate(g.nodes)}
+nodes = [[p, g.parsed[p]["title"], g.parsed[p]["type"], g.parsed[p]["tags"][:5], round(g.in_weight.get(p, 0), 2),
+          g.summary.get(p, "")] for p in g.nodes]
+edges = [[idx[u], idx[w], "r" if "related" in ts else "s" if "source" in ts else "l"] for (u, w), ts in g.dedge.items()]
+log = v / "wiki/log.md"
+print(json.dumps({"nodes": nodes, "edges": edges, "stubs": len(g.pages) - len(g.nodes),
+                  "log_mtime": log.stat().st_mtime if log.is_file() else None}, ensure_ascii=False, separators=(",", ":")))
+'''
+
+_lock = threading.Lock()
+_cache = {"at": 0.0, "json": None, "error": None, "busy": False}
+
+
+def _refresh():
+    data, err = None, None
+    try:
+        r = subprocess.run(["docker", "exec", "-i", CONTAINER, "python", "-"], input=_EXPORT,
+                           capture_output=True, text=True, timeout=180)
+        if r.returncode != 0:
+            raise OSError((r.stderr or "export failed").strip().splitlines()[-1][:300])
+        json.loads(r.stdout)                 # refuse to cache garbage
+        data = r.stdout.strip()
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError) as e:
+        err = f"wiki graph from container {CONTAINER}: {str(e)[:300]}"
+    with _lock:
+        if data:
+            _cache["json"], _cache["at"] = data, time.time()
+        _cache["error"], _cache["busy"] = err, False
+
+
+def graph_json():
+    """JSON text {graph, at, error, refreshing}. The first call waits for the export (about 4 s); later calls never wait."""
+    with _lock:
+        start = time.time() - _cache["at"] > TTL and not _cache["busy"]
+        if start:
+            _cache["busy"] = True
+        first = _cache["json"] is None
+    if start:
+        if first:
+            _refresh()
+        else:
+            threading.Thread(target=_refresh, daemon=True).start()
+    with _lock:
+        return ('{"graph":' + (_cache["json"] or "null") + ',"at":' + json.dumps(_cache["at"]) + ',"error":'
+                + json.dumps(_cache["error"]) + ',"refreshing":' + json.dumps(_cache["busy"]) + "}")
+
+
+# ---------------------------------------------------------------- trails
+
+_HIT = re.compile(r"^\s*\d+\.\s+`(wiki/[^`]+?\.md)`\s*\|\s*(.*?)\s*\|\s*([^|]*?)\s*\|\s*(.*)$")
+_VIA = re.compile(r"via \[\[([^\]|#]+)[^\]]*\]\]\s*\((\w+)\)")
+_PATH = re.compile(r"wiki/[^\n`<>|\"\]]*?\.md")
+_WLINK = re.compile(r"\[\[([^\]|#^\n]+)")
+
+
+def _paths(text):
+    seen, out = set(), []
+    for p in _PATH.findall(urllib.parse.unquote(text or "")):
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
+
+def _text(content):
+    if isinstance(content, list):
+        return " ".join(c.get("text", "") for c in content if isinstance(c, dict))
+    return content or ""
+
+
+def _step(name, args, result, at):
+    """One tool call as a trail step."""
+    result = result or ""
+    st = {"at": at, "error": result.startswith(("TOOL ERROR", "Tool ")),
+          "blocked": result.startswith("Refused: web search is off")}
+    if not name.startswith("wiki_"):
+        q = args.get("q") or args.get("query") or args.get("url") or ""
+        return dict(st, tool="web", name=name, arg=str(q)[:200], hits=[])
+    tool = name[5:]
+    st.update(tool=tool, name=name, hits=[])
+    if tool == "search":
+        st["arg"] = str(args.get("query", ""))[:200]
+        for ln in result.splitlines():
+            m = _HIT.match(ln)
+            if m:
+                via = _VIA.search(m.group(4))
+                st["hits"].append({"p": m.group(1), "how": m.group(4)[:120],
+                                   "via": via.group(1).strip() if via else None, "rel": via.group(2) if via else None,
+                                   "text": "text fallback" in m.group(4)})
+        if not st["hits"]:
+            st["hits"] = [{"p": p} for p in _paths(result)]
+    elif tool in ("read", "related"):
+        st["arg"] = str(args.get("path", ""))[:200]
+        first = result.split("\n", 1)[0]
+        st["target"] = first[2:].strip() if first.startswith("# wiki/") else st["arg"]
+        if tool == "related":
+            st["depth"] = args.get("depth", 1)
+            st["hits"] = [{"p": p} for p in _paths(result) if p != st["target"]]
+    else:                                   # overview and anything newer
+        st["arg"] = ""
+        m = re.search(r"Pages: (\d+)", result)
+        st["pages"] = int(m.group(1)) if m else None
+    st["hits"] = st["hits"][:MAX_HITS]
+    return st
+
+
+def trails(chat_dir):
+    """[{id, title, updated, model, steps}] for the newest chats that used the wiki, newest first."""
+    files = sorted(glob.glob(os.path.join(chat_dir, "*.json")), key=lambda p: -os.path.getmtime(p))[:MAX_CHATS]
+    out = []
+    for path in files:
+        try:
+            with open(path, encoding="utf-8") as f:
+                chat = json.load(f)
+            msgs = chat["messages"]
+        except (OSError, ValueError, KeyError):
+            continue
+        results = {m.get("tool_call_id"): m for m in msgs if m.get("role") == "tool"}
+        steps, used = [], False
+        for m in msgs:
+            if m.get("role") == "user":
+                steps.append({"tool": "ask", "arg": _text(m.get("content"))[:240], "at": m.get("at"), "hits": []})
+            elif m.get("role") == "assistant":
+                for tc in m.get("tool_calls") or []:
+                    fn = tc.get("function") or {}
+                    try:
+                        args = json.loads(fn.get("arguments") or "{}")
+                    except ValueError:
+                        args = {}
+                    res = results.get(tc.get("id")) or {}
+                    s = _step(fn.get("name") or "", args if isinstance(args, dict) else {}, res.get("content"),
+                              res.get("at") or m.get("at"))
+                    used = used or s["tool"] not in ("web", "ask")
+                    steps.append(s)
+                if not m.get("tool_calls") and (m.get("content") or "").strip():
+                    c = m["content"]
+                    steps.append({"tool": "answer", "at": m.get("at"), "hits": [],
+                                  "cites": (_paths(c) + [w.strip() for w in _WLINK.findall(c)])[:MAX_HITS]})
+        if used:
+            out.append({"id": chat.get("id"), "title": chat.get("title") or "Untitled", "model": chat.get("model"),
+                        "updated": chat.get("updated") or os.path.getmtime(path), "steps": steps})
+    return out
+
+
+if __name__ == "__main__":       # self-check: python3 wikicore.py
+    s = _step("wiki_search", {"query": "llama swap"},
+              "Search \"x\"\n1. `wiki/entities/llama-swap.md` | llama-swap | entity | entry (catalogue match: title)\n"
+              "2. `wiki/entities/ds4 (DwarfStar).md` | ds4 (DwarfStar) | entity | via [[llama-swap]] (related): x\n", 1.0)
+    assert [h["p"] for h in s["hits"]] == ["wiki/entities/llama-swap.md", "wiki/entities/ds4 (DwarfStar).md"]
+    assert s["hits"][1]["via"] == "llama-swap" and s["hits"][1]["rel"] == "related" and s["hits"][0]["via"] is None
+    r = _step("wiki_read", {"path": "llama-swap"}, "# wiki/entities/llama-swap.md\nOpen in browser: x", 2.0)
+    assert r["target"] == "wiki/entities/llama-swap.md"
+    w = _step("google_search", {"q": "x"}, "Refused: web search is off for the rest of this answer", 3.0)
+    assert w["tool"] == "web" and w["blocked"]
+    assert _paths("open: http://h/p/wiki/concepts/A%20B%20%28c%29.md)") == ["wiki/concepts/A B (c).md"]
+    print("wikicore self-check ok")

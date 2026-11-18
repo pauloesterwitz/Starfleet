@@ -1,0 +1,68 @@
+/* ---- Memory Core: the LLM wiki as a memory core, and the path Computer took through it (vendor/memcore.js) ---- */
+body.wiki .main:not(#wikiview), body:not(.wiki) #wikiview{display:none}
+#wikiview{min-width:0}
+#mc{display:grid;grid-template-columns:240px minmax(0,1fr) 320px;gap:8px;height:calc(100vh - 128px);margin-top:8px}
+body.fs #mc{height:calc(100vh - 40px)}
+#mc>div{min-height:0;display:flex;flex-direction:column;gap:4px}
+.mch{display:flex;align-items:center;gap:8px;font-size:14px;font-weight:600;letter-spacing:.1em;text-transform:uppercase;
+  color:var(--amber);margin:4px 0 2px}
+.mch::before{content:"";width:30px;height:16px;background:var(--mauve);border-radius:0 8px 8px 0;flex:none}
+.mch::after{content:"";flex:1;height:5px;background:var(--grid);border-radius:3px}
+#mcchats{overflow:auto;display:flex;flex-direction:column;gap:4px;max-height:55%}
+#mctop{overflow:auto;display:flex;flex-direction:column;gap:3px}
+.mci{background:#0b0803;border-left:6px solid var(--grid);padding:6px 10px;cursor:pointer;color:var(--text);font-size:13px;
+  letter-spacing:.04em;line-height:1.25}
+.mci:hover{border-left-color:var(--peach)}
+.mci.on{border-left-color:var(--orange);background:#1a1204}
+.mci small{display:block;color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.08em;margin-top:2px}
+.mci.pg{display:flex;gap:8px;align-items:baseline;padding:4px 10px}
+.mci.pg b{font-size:15px;color:var(--peach);min-width:22px;text-align:right;font-variant-numeric:tabular-nums}
+.mcempty{color:var(--dim);font-size:13px;line-height:1.4;padding:8px 10px;text-transform:uppercase;letter-spacing:.06em}
+
+#mctools{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+#mctools input{font-family:var(--lcars);font-size:14px;letter-spacing:.08em;text-transform:uppercase;background:#0b0803;
+  border:2px solid var(--grid);border-radius:14px;color:var(--peach);padding:3px 14px;outline:none;width:210px}
+#mctools input:focus{border-color:var(--orange)}
+#mclegend{margin-left:auto;display:flex;gap:10px;font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--dim)}
+#mclegend i{display:inline-block;width:14px;height:8px;border-radius:4px;margin-right:4px;vertical-align:0}
+#mcbox{position:relative;flex:1;min-height:0}
+#mccv{position:absolute;inset:0;width:100%;height:100%;cursor:crosshair}
+#mctip{position:absolute;pointer-events:none;display:none;background:#000;border:1px solid var(--orange);border-radius:10px;
+  padding:3px 10px;font-size:13px;color:var(--text);white-space:nowrap;letter-spacing:.04em;z-index:2}
+#mctip small{color:var(--dim);text-transform:uppercase;margin-left:6px;font-size:10px}
+
+#mcr{overflow:hidden}
+#mclog{overflow:auto;display:flex;flex-direction:column;gap:3px;flex:1}
+.mcs{display:grid;grid-template-columns:30px 78px 1fr auto;align-items:stretch;background:#0b0803;cursor:pointer;font-size:13px;
+  min-height:30px}
+.mcs>b{background:var(--grid);color:var(--dim);display:flex;align-items:center;justify-content:center;font-size:12px;
+  font-variant-numeric:tabular-nums;border-radius:12px 0 0 12px}
+.mcs>i{font-style:normal;font-weight:700;letter-spacing:.1em;color:#000;display:flex;align-items:center;padding:0 8px;font-size:11px}
+.mcs>span{padding:4px 8px;color:var(--text);overflow:hidden;line-height:1.25;word-break:break-word}
+.mcs>span small{display:block;color:var(--dim);font-size:10.5px;text-transform:uppercase;letter-spacing:.07em}
+.mcs>em{font-style:normal;color:var(--dim);font-size:11px;padding:5px 8px 0 0;font-variant-numeric:tabular-nums}
+.mcs:hover,.mcs.hot{background:#1a1204} .mcs:hover>b,.mcs.hot>b{background:var(--orange);color:#000}
+.mcs.fut{opacity:.3}
+.mcs.k-ask>i{background:var(--peach)} .mcs.k-overview>i{background:var(--amber)} .mcs.k-search>i{background:var(--orange)}
+.mcs.k-related>i{background:var(--mauve)} .mcs.k-read>i{background:var(--blue)} .mcs.k-answer>i{background:var(--magenta)}
+.mcs.k-web>i{background:#665} .mcs.lock>i{background:var(--red)}
+.mcs.err>span{color:var(--red)}
+
+#mcpage{display:none;background:#0b0803;border-left:8px solid var(--blue);padding:8px 12px 10px;max-height:52%;overflow:auto;
+  flex:none}
+#mcpage h3{margin:0;font-size:20px;font-weight:700;text-transform:uppercase;line-height:1.05;display:flex;gap:8px;
+  justify-content:space-between;align-items:flex-start}
+#mcpage h3 button{font:inherit;font-size:11px;font-weight:700;background:var(--grid);color:var(--text);border:0;border-radius:9px;
+  padding:2px 9px;cursor:pointer;letter-spacing:.08em}
+#mcpage .pth{font-size:11px;color:var(--dim);letter-spacing:.04em;margin:3px 0 6px;word-break:break-all}
+#mcpage p{margin:0 0 6px;color:var(--text);font-size:13px;line-height:1.35;letter-spacing:.03em}
+#mcpage .tg{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:6px}
+#mcpage .tg u{text-decoration:none;font-size:11px;background:#1a1409;color:var(--dim);border-radius:9px;padding:1px 8px}
+#mcpage .kv{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:6px}
+#mcpage .kv span{background:var(--grid);padding:1px 9px 2px;border-radius:10px;font-size:11px;color:var(--dim);text-transform:uppercase}
+#mcpage .kv b{color:var(--text);margin-left:4px;font-size:13px}
+#mcpage .nb{display:flex;flex-direction:column;gap:2px}
+#mcpage .nb a{color:var(--text);font-size:12.5px;cursor:pointer;text-decoration:none;padding:1px 0 1px 8px;border-left:4px solid var(--grid)}
+#mcpage .nb a:hover{color:var(--orange)}
+#mcpage .nb a small{color:var(--dim);font-size:10px;text-transform:uppercase;margin-left:6px}
+@media (max-width:1100px){ #mc{grid-template-columns:1fr;height:auto} #mcbox{height:70vh;flex:none} #mcchats{max-height:none} }

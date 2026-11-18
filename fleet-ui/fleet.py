@@ -36,6 +36,8 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import wikicore      # Memory Core view: wiki graph + Computer's wiki trails (read-only)
+
 # All llama-swap traffic goes through ctxproxy (:28081). Loads/unloads need the Starfleet key, which this
 # process only passes through from the browser (X-Starfleet-Key) and never stores.
 SWAP = os.environ.get("FLEET_SWAP", "http://127.0.0.1:28081")
@@ -2424,9 +2426,673 @@ def defiant_state(force=False):
         return dict(d, at=now)
 
 
+# ---------------------------------------------------------------- Computer (knowledge chat)
+
+# A chat for knowledge work against the model that is ALREADY resident: Computer never loads a model.
+# Requests go to llama-swap through ctxproxy WITHOUT the Starfleet key, so even a race with an unload
+# ends in the gate's 403, never in a load. Tools come from MCP servers (wiki read tools, vane, google
+# search). Wiki content must not reach the internet: web tools stay available after a wiki read, but every
+# web call passes web_guard() first, which refuses secrets, customer-specific terms, personal data and pasted
+# text (see below). Every /api/computer call needs the Starfleet key; chats stay on this host.
+COMPUTER_DIR = os.path.expanduser(os.environ.get("FLEET_COMPUTER_DIR", "~/.local/share/fleet-ui/computer"))
+ASR_GATE = os.path.expanduser(os.environ.get("FLEET_ASR_GATE", "~/.whatsapp-bridge/asr_gate.sh"))
+ENV_FILE = os.path.expanduser("~/.config/opencode/.env")
+COMPUTER_MCP = {      # name -> how to reach it; tools = the allowed subset (None = all); web = talks to the internet
+    "wiki": {"http": "http://127.0.0.1:18081/mcp", "token_env": "WIKI_MCP_TOKEN", "web": False,
+             "link_rewrite": ("http://127.0.0.1:18081", os.environ.get("FLEET_WIKI_PUBLIC_URL", "")),
+             "tools": {"wiki_overview", "wiki_related", "wiki_search", "wiki_read"}},
+    "vane": {"cmd": ["node", os.path.expanduser("~/.local/share/opencode/vane-mcp-server/dist/server.js")],
+             "web": True, "tools": {"vane_search", "vane_deep_research"}},
+    "google": {"cmd": ["node", os.path.expanduser("~/google-search-mcp/dist/server.js")], "web": True, "tools": None},
+}
+try:                  # optional override file, same shape as COMPUTER_MCP
+    with open(os.path.expanduser("~/.config/fleet-ui/computer-mcp.json")) as _f:
+        COMPUTER_MCP = {k: dict(v, tools=set(v["tools"]) if v.get("tools") else None) for k, v in json.load(_f).items()}
+except (OSError, ValueError):
+    pass
+COMPUTER_ROUNDS = 8           # model <-> tool round trips per message
+TOOL_TEXT_CAP = 12000         # characters of one tool result passed to the model
+HISTORY_CHARS = 240000        # characters of history sent with a request (oldest turns drop first)
+_NOT_CHAT = re.compile(r"embed|rerank|imagegen", re.I)
+_KEY_OK = {}                  # sha256(key) -> expiry: one gate round trip per 10 minutes, not per request
+_KEY_LOCK = threading.Lock()
+
+
+def _deny(msg=POLICY):
+    raise urllib.error.HTTPError(SWAP, 403, msg, {}, io.BytesIO(json.dumps({"error": {"message": msg}}).encode()))
+
+
+def computer_auth(key):
+    """Fail closed. The key counts only when the gate itself confirms it: llama-swap answers /running quickly
+    (so the gate's guard is working and cannot fail open), then a no-op unload of a model that is not resident
+    answers 2xx. A 403, an error, a slow llama-swap or no idle model all reject. Cached 2 minutes."""
+    import hashlib
+    if not key:
+        _deny()
+    h = hashlib.sha256(key.encode()).hexdigest()
+    with _KEY_LOCK:
+        for k in [k for k, t in _KEY_OK.items() if t < time.time()]:
+            del _KEY_OK[k]
+        if _KEY_OK.get(h, 0) > time.time():
+            return
+    try:
+        with urllib.request.urlopen(SWAP + "/running", timeout=3) as r:     # quick answer = guard can read it too
+            running = {e.get("model") for e in (json.load(r) or {}).get("running") or []}
+    except (OSError, ValueError):
+        _deny("Cannot verify the Starfleet key right now (llama-swap not answering); try again in a moment.")
+    with LOCK:
+        idle = next((m for m in STATE["models"] if m not in running), None)
+    if not idle:
+        _deny("Cannot verify the Starfleet key right now (no idle model to test against).")
+    try:
+        swap_unload(idle, key=key)              # 2xx only when the gate accepted the key
+    except urllib.error.HTTPError as e:
+        _deny(POLICY if e.code == 403 else "Cannot verify the Starfleet key right now (gate answered %d)." % e.code)
+    except OSError:
+        _deny("Cannot verify the Starfleet key right now (gate not answering).")
+    with _KEY_LOCK:
+        _KEY_OK[h] = time.time() + 120
+
+
+def _env_value(name):
+    """One variable from the opencode env file (shell syntax, quoted or not), never the whole file."""
+    if os.environ.get(name):
+        return os.environ[name]
+    try:
+        with open(ENV_FILE) as f:
+            for line in f:
+                m = re.match(r"\s*(?:export\s+)?" + re.escape(name) + r"\s*=\s*(.*)$", line)
+                if m:
+                    v = m.group(1).strip()
+                    if len(v) >= 2 and v[0] == v[-1] and v[0] in "'\"":
+                        v = v[1:-1]
+                    return v
+    except OSError:
+        pass
+    return ""
+
+
+# ---- web guard: every argument of a web tool call (vane, google) is checked before it leaves this host.
+# Refused, with the reason given back to the model so it can rephrase: a secret (a value of a KEY/TOKEN/
+# SECRET/PASSWORD variable in the env file or Fleet's own env, or a known key format), a customer-specific
+# term (built-in names, wiki entity pages tagged customer/* that are people, organisations, projects or
+# internal systems, plus web-guard.json "block"), personal data (email, phone, IBAN), or long pasted text.
+# Public products tagged customer/* (Qdrant, Azure OpenAI, ...) are deliberately NOT blocked: their subtype
+# is product/tool, and searching for public tech is the point. web-guard.json "allow" un-blocks a term.
+WEB_GUARD_FILE = os.path.expanduser("~/.config/fleet-ui/web-guard.json")   # {"block": [...], "allow": [...]}
+WIKI_DIR = os.path.expanduser(os.environ.get("FLEET_WIKI_DIR", "~/llm-wiki/wiki"))
+WEB_ARG_MAX = 300             # characters per argument: a query, not a pasted page
+_CUSTOMER_TERMS = ()          # built-in terms: none in code; this host's list lives in web-guard.json "block"
+_CUSTOMER_SUBTYPES = {"organization", "person", "project", "program", "initiative", "system", "data-system",
+                      "business-domain"}
+_SECRET_NAME = re.compile(r"KEY|TOKEN|SECRET|PASS|PAT\b|_PAT|AUTH|CREDENTIAL|PRIVATE|CODE", re.I)
+_SECRET_RE = re.compile(
+    r"\bsk-[a-z0-9_-]{16,}|\b(?:ghp|gho|ghs|ghu|github_pat)_[a-z0-9_]{20,}|\bglpat-[a-z0-9_-]{16,}"
+    r"|\bxox[abprs]-[a-z0-9-]{10,}|\bakia[0-9a-z]{16}\b|\baiza[0-9a-z_-]{30,}|\beyj[a-z0-9_-]{8,}\.eyj"
+    r"|-----begin [a-z ]*private key|\bbearer\s+[a-z0-9._~+/-]{16,}"
+    r"|\b(?:password|passwort|passwd|pwd|secret|token|api[-_ ]?key)\s*[:=]\s*\S+", re.I)
+# A random-looking token: 24+ characters mixing upper case, lower case and digits (a hex hash is not one).
+_TOKEN_RE = re.compile(r"(?<![\w+/=-])(?=[\w+/=-]*[a-z])(?=[\w+/=-]*[A-Z])(?=[\w+/=-]*\d)[\w+/=-]{24,}")
+_PII_RE = re.compile(r"[\w.%+-]+@[\w-]+(?:\.[\w-]+)+|\b[A-Z]{2}\d{2}(?: ?[A-Z0-9]{4}){3,7}\b"
+                     r"|(?<![\w.])(?:\+|00)\d[\d ()/-]{7,}\d|(?<![\w.])0\d{2,5}[ /-]\d{3,}(?:[ -]\d+)*")
+_WG = {"at": 0.0}
+_WG_LOCK = threading.Lock()
+
+
+def _wg_norm(s):
+    return re.sub(r"[\s_-]+", " ", s.lower()).strip()
+
+
+def _wg_lists():
+    """Customer terms (one regex) and secret values, rebuilt at most every 5 minutes. Values stay in memory."""
+    with _WG_LOCK:
+        if time.time() - _WG["at"] < 300:
+            return _WG
+        terms, allow = set(_CUSTOMER_TERMS), set()
+        try:
+            with open(WEB_GUARD_FILE) as f:
+                cfg = json.load(f)
+            terms |= {_wg_norm(t) for t in cfg.get("block", [])}
+            allow = {_wg_norm(t) for t in cfg.get("allow", [])}
+        except (OSError, ValueError, AttributeError):
+            pass
+        for p in glob.glob(os.path.join(WIKI_DIR, "entities", "*.md")):
+            try:
+                with open(p, encoding="utf-8", errors="ignore") as f:
+                    m = re.match(r"---\n(.*?)\n---", f.read(6000), re.S)
+            except OSError:
+                continue
+            fm = m.group(1) if m else ""
+            st = re.search(r"^subtype:\s*(\S+)", fm, re.M)
+            if "customer/" not in fm or not st or st.group(1) not in _CUSTOMER_SUBTYPES:
+                continue
+            names = [os.path.basename(p)[:-3]] + re.findall(r'^title:\s*"?([^"\n]+?)"?\s*$', fm, re.M)
+            al = re.search(r"^aliases:\s*\n((?:[ \t]+-.*\n?)+)", fm, re.M)
+            names += re.findall(r'-\s*"?([^"\n]+?)"?\s*$', al.group(1), re.M) if al else []
+            for n in map(_wg_norm, names):
+                n = re.sub(r"^\d+ ", "", n)                 # "01_Acme" -> "acme"
+                person = st.group(1) == "person"
+                if len(n) >= 3 and (" " in n or not person):     # people by full name only, never a first name
+                    terms.add(n)
+                    if person and n.count(" ") == 1:
+                        terms.add(" ".join(reversed(n.split())))     # "miller thomas" -> "thomas miller"
+        terms -= allow
+        alt = "|".join(re.escape(t) for t in sorted(terms, key=len, reverse=True)) or r"(?!)"   # empty: match nothing
+        secrets = set()
+        try:
+            with open(ENV_FILE) as f:
+                for line in f:
+                    m = re.match(r"\s*(?:export\s+)?(\w+)\s*=\s*(.*)$", line)
+                    if m and _SECRET_NAME.search(m.group(1)):
+                        secrets.add(m.group(2).strip().strip("'\""))
+        except OSError:
+            pass
+        secrets |= {v for k, v in os.environ.items() if _SECRET_NAME.search(k)}
+        _WG.update(at=time.time(), terms=re.compile(r"(?<!\w)(?:" + alt + r")(?!\w)"),
+                   secrets=[s for s in secrets if len(s) >= 8])
+        return _WG
+
+
+def web_guard(args):
+    """None when a web tool call may leave this host, else why not. Never echoes a matched secret."""
+    texts = []
+
+    def walk(v):
+        if isinstance(v, str):
+            texts.append(v)
+        elif isinstance(v, dict):
+            for x in v.values():
+                walk(x)
+        elif isinstance(v, list):
+            for x in v:
+                walk(x)
+    walk(args)
+    lists = _wg_lists()
+    for t in texts:
+        if len(t) > WEB_ARG_MAX:
+            return f"an argument is longer than {WEB_ARG_MAX} characters; send a short query, never pasted text"
+        if any(s in t for s in lists["secrets"]) or _SECRET_RE.search(t) or _TOKEN_RE.search(t):
+            return "it contains a secret (API key, token or password)"
+        if _PII_RE.search(t):
+            return "it contains personal data (email address, phone number or IBAN)"
+        m = lists["terms"].search(_wg_norm(t))
+        if m:
+            return f"it contains the customer-specific term \"{m.group(0)}\""
+    return None
+
+
+def _child_env():
+    """Environment for MCP children: an allowlist. The servers load their own keys from their own files."""
+    return {k: os.environ[k] for k in ("PATH", "HOME", "LANG", "LC_ALL", "USER", "TMPDIR", "XDG_RUNTIME_DIR",
+                                       "DOCKER_HOST") if k in os.environ}
+
+
+class _StdioMCP:
+    """Minimal MCP client over stdio (newline-delimited JSON-RPC). One long-lived child per server,
+    requests serialised by a lock; a dead child is restarted on the next call."""
+
+    def __init__(self, name, cmd):
+        self.name, self.cmd, self.p, self.q, self.n = name, cmd, None, None, 0
+        self.lock = threading.Lock()
+
+    def _start(self):
+        import queue
+        self.p = subprocess.Popen(self.cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  stderr=subprocess.DEVNULL, text=True, bufsize=1, env=_child_env())
+        self.q = queue.Queue()
+
+        def reader(p, q):
+            for line in p.stdout:
+                try:
+                    q.put(json.loads(line))
+                except ValueError:
+                    pass
+            q.put(None)
+        threading.Thread(target=reader, args=(self.p, self.q), daemon=True).start()
+        self._rpc("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                                 "clientInfo": {"name": "starfleet-computer", "version": "1"}}, 60)
+        self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+
+    def _send(self, obj):
+        self.p.stdin.write(json.dumps(obj) + "\n")
+        self.p.stdin.flush()
+
+    def _rpc(self, method, params, timeout):
+        import queue
+        self.n += 1
+        i = self.n
+        self._send({"jsonrpc": "2.0", "id": i, "method": method, "params": params})
+        end = time.time() + timeout
+        while True:
+            try:
+                msg = self.q.get(timeout=max(0.1, end - time.time()))
+            except queue.Empty:
+                self._kill()
+                raise OSError(f"{self.name}: no answer to {method} within {timeout} s")
+            if msg is None:
+                self.p = None
+                raise OSError(f"{self.name}: server exited")
+            if msg.get("id") == i:
+                if "error" in msg:
+                    raise OSError(f"{self.name}: {str(msg['error'].get('message'))[:200]}")
+                return msg.get("result") or {}
+
+    def _kill(self):
+        if self.p is not None:
+            try:
+                self.p.kill()
+                self.p.wait(5)
+            except (OSError, subprocess.SubprocessError):
+                pass
+        self.p = None
+
+    def call(self, method, params, timeout=120):
+        with self.lock:
+            if self.p is None or self.p.poll() is not None:
+                try:
+                    self._start()
+                except (OSError, subprocess.SubprocessError, ValueError):
+                    self._kill()
+                    raise
+            return self._rpc(method, params, timeout)
+
+
+class _HttpMCP:
+    """Minimal MCP client over Streamable HTTP (JSON or SSE answers, session id header)."""
+
+    def __init__(self, name, url, token_env):
+        self.name, self.url, self.token_env, self.sid, self.n = name, url, token_env, None, 0
+        self.lock = threading.Lock()
+
+    def _post(self, obj, timeout):
+        hdr = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream",
+               "MCP-Protocol-Version": "2025-06-18"}
+        tok = _env_value(self.token_env) if self.token_env else ""
+        if tok:
+            hdr["Authorization"] = "Bearer " + tok
+        if self.sid:
+            hdr["Mcp-Session-Id"] = self.sid
+        req = urllib.request.Request(self.url, data=json.dumps(obj).encode(), headers=hdr, method="POST")
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            self.sid = r.headers.get("Mcp-Session-Id") or self.sid
+            ctype, body = r.headers.get("Content-Type", ""), r.read().decode("utf-8", "replace")
+        if "id" not in obj:
+            return None
+        if "text/event-stream" in ctype:
+            for line in body.splitlines():
+                if line.startswith("data:"):
+                    try:
+                        msg = json.loads(line[5:].strip())
+                    except ValueError:
+                        continue
+                    if msg.get("id") == obj["id"]:
+                        return msg
+            raise OSError(f"{self.name}: no answer in the event stream")
+        return json.loads(body) if body.strip() else None
+
+    def _rpc(self, method, params, timeout):
+        self.n += 1
+        msg = self._post({"jsonrpc": "2.0", "id": self.n, "method": method, "params": params}, timeout)
+        if msg and "error" in msg:
+            raise OSError(f"{self.name}: {str(msg['error'].get('message'))[:200]}")
+        return (msg or {}).get("result") or {}
+
+    def _init(self):
+        self.sid = None
+        self._rpc("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                                 "clientInfo": {"name": "starfleet-computer", "version": "1"}}, 30)
+        self._post({"jsonrpc": "2.0", "method": "notifications/initialized"}, 30)
+
+    def call(self, method, params, timeout=120):
+        with self.lock:
+            for attempt in (0, 1):
+                try:
+                    if not self.sid:
+                        self._init()
+                    return self._rpc(method, params, timeout)
+                except urllib.error.HTTPError as e:
+                    if e.code in (400, 404) and attempt == 0:      # session expired: initialise once more
+                        self.sid = None
+                        continue
+                    raise OSError(f"{self.name}: HTTP {e.code}")
+                except urllib.error.URLError as e:
+                    raise OSError(f"{self.name}: {e.reason}")
+
+
+_MCP = {}
+_MCP_TOOLS = {"at": 0.0, "tools": {}, "errors": {}}    # tool name -> (server, OpenAI tool spec)
+_MCP_LOCK = threading.Lock()
+
+
+def _mcp(name):
+    with _MCP_LOCK:
+        if name not in _MCP:
+            c = COMPUTER_MCP[name]
+            _MCP[name] = _HttpMCP(name, c["http"], c.get("token_env")) if c.get("http") else _StdioMCP(name, c["cmd"])
+        return _MCP[name]
+
+
+def computer_tools(force=False):
+    """The allowed tools of every configured MCP server as OpenAI function specs; re-listed every 10 min."""
+    if not force and _MCP_TOOLS["tools"] and time.time() - _MCP_TOOLS["at"] < 600:
+        return _MCP_TOOLS
+    tools, errors = {}, {}
+    for name, c in COMPUTER_MCP.items():
+        try:
+            for t in _mcp(name).call("tools/list", {}, 60).get("tools", []):
+                if c.get("tools") is None or t["name"] in c["tools"]:
+                    tools[t["name"]] = (name, {"type": "function", "function": {
+                        "name": t["name"], "description": (t.get("description") or "")[:1500],
+                        "parameters": t.get("inputSchema") or {"type": "object", "properties": {}}}})
+        except (OSError, ValueError, KeyError, subprocess.SubprocessError) as e:
+            errors[name] = str(e)[:200]
+    _MCP_TOOLS.update(at=time.time(), tools=tools, errors=errors)
+    return _MCP_TOOLS
+
+
+def _tool_call(name, args):
+    """Run one tool: (text for the model, [image data URLs for the screen])."""
+    server = _MCP_TOOLS["tools"][name][0]
+    timeout = 900 if "deep" in name else 180
+    res = _mcp(server).call("tools/call", {"name": name, "arguments": args}, timeout)
+    texts, images = [], []
+    for part in res.get("content") or []:
+        if part.get("type") == "text":
+            texts.append(part.get("text") or "")
+        elif part.get("type") == "image" and part.get("data"):
+            images.append(f"data:{part.get('mimeType') or 'image/png'};base64,{part['data']}")
+    text = "\n".join(texts) or ("(no text)" if not images else "(image)")
+    link = COMPUTER_MCP[server].get("link_rewrite")     # local-only URLs in results -> addresses the browser can open
+    if link and link[1]:
+        text = text.replace(link[0], link[1])
+    if res.get("isError"):
+        text = "TOOL ERROR: " + text
+    return text[:TOOL_TEXT_CAP] + (" [truncated]" if len(text) > TOOL_TEXT_CAP else ""), images
+
+
+def computer_models():
+    """Resident models that can chat (no embedder, reranker or image stack), with their vision flag."""
+    with LOCK:
+        running = [r.get("model") for r in STATE.get("running", []) if r.get("state") in ("ready", None)]
+    with _ctx_max_lock:
+        visions = dict(_ctx_vision)
+    return [{"id": m, "vision": visions.get(m) == "on"} for m in running if m and not _NOT_CHAT.search(m)]
+
+
+COMPUTER_SYSTEM = (
+    "You are Computer, the knowledge assistant of Starfleet Command, running on the user's own hardware. "
+    "Answer in the language of the user's message. Be precise and concise; use markdown: headings, lists, "
+    "tables and fenced code blocks with a language. "
+    "Tools: wiki_* search and read the user's private knowledge wiki (start with wiki_search or wiki_overview, "
+    "read the relevant pages, cite them as markdown links with the URL the tool gives). vane_* and google_* "
+    "search the public internet: use them for current or public facts, also after reading the wiki. Never put "
+    "private or customer information from the conversation or the wiki into a web query: no customer, company "
+    "or people names, no internal project names, no secrets, no copied text. Search for the generic, public "
+    "topic instead. A guard refuses such queries and says why; then rephrase generically. "
+    "Say which sources you used. "
+    "If you do not know, say so instead of guessing.")
+
+
+def _chat_path(cid):
+    if not re.fullmatch(r"[a-f0-9]{16}", cid or ""):
+        raise ValueError("bad chat id")
+    return os.path.join(COMPUTER_DIR, cid + ".json")
+
+
+def computer_chat_load(cid):
+    with open(_chat_path(cid), encoding="utf-8") as f:
+        return json.load(f)
+
+
+def computer_chat_save(chat):
+    import tempfile
+    os.makedirs(COMPUTER_DIR, mode=0o700, exist_ok=True)
+    p = _chat_path(chat["id"])
+    fd, tmp = tempfile.mkstemp(dir=COMPUTER_DIR, suffix=".part")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(chat, f, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, p)
+
+
+_CHAT_BUSY = set()           # chat ids with a message in flight: a second send on the same chat is refused
+_CHAT_BUSY_LOCK = threading.Lock()
+
+
+def computer_chats():
+    out = []
+    for p in glob.glob(os.path.join(COMPUTER_DIR, "*.json")):
+        try:
+            with open(p, encoding="utf-8") as f:
+                c = json.load(f)
+            out.append({"id": c["id"], "title": c.get("title") or "Untitled", "updated": c.get("updated", 0),
+                        "model": c.get("model")})
+        except (OSError, ValueError, KeyError):
+            continue
+    return sorted(out, key=lambda c: -c["updated"])
+
+
+def _history(chat, vision=True):
+    """OpenAI messages for the model: system prompt + newest turns that fit HISTORY_CHARS."""
+    msgs, total = [], 0
+    last_user = max((i for i, m in enumerate(chat["messages"]) if m["role"] == "user"), default=-1)
+    for idx, m in reversed(list(enumerate(chat["messages"]))):
+        if isinstance(m.get("content"), list) and (idx != last_user or not vision):   # images only in the newest turn
+            m = dict(m, content=" ".join(p.get("text", "[image]") if p.get("type") == "text" else "[image]"
+                                         for p in m["content"]))
+        size = len(json.dumps(m.get("content") or "")) + len(json.dumps(m.get("tool_calls") or ""))
+        if total + size > HISTORY_CHARS and msgs:
+            break
+        msgs.append({k: m[k] for k in ("role", "content", "tool_calls", "tool_call_id", "name") if k in m})
+        total += size
+    msgs.reverse()
+    while msgs and msgs[0]["role"] == "tool":        # never start with an orphaned tool result
+        msgs.pop(0)
+    return [{"role": "system", "content": COMPUTER_SYSTEM}] + msgs
+
+
+def _stream_completion(model, messages, tools, emit):
+    """One streamed completion from llama-swap (no Starfleet key: a non-resident model is refused, never
+    loaded). Returns (content, reasoning, tool_calls)."""
+    body = {"model": model, "messages": messages, "stream": True, "max_tokens": 8192}
+    if tools:
+        body["tools"] = tools
+    req = urllib.request.Request(SWAP + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json"}, method="POST")
+    content, reasoning, calls, finished, reason = [], [], {}, False, None
+    with urllib.request.urlopen(req, timeout=900) as r:
+        for raw in r:
+            line = raw.decode("utf-8", "replace").strip()
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data == "[DONE]":
+                finished = True
+                break
+            try:
+                chunk = json.loads(data)
+            except ValueError:
+                continue
+            if chunk.get("error"):
+                raise OSError("model error: " + str(chunk["error"])[:200])
+            choice = (chunk.get("choices") or [{}])[0]
+            reason = choice.get("finish_reason") or reason
+            delta = choice.get("delta") or {}
+            if delta.get("reasoning_content"):
+                reasoning.append(delta["reasoning_content"])
+                emit({"type": "reasoning", "text": delta["reasoning_content"]})
+            if delta.get("content"):
+                content.append(delta["content"])
+                emit({"type": "token", "text": delta["content"]})
+            for tc in delta.get("tool_calls") or []:
+                c = calls.setdefault(tc.get("index", 0), {"id": "", "name": "", "arguments": ""})
+                c["id"] = tc.get("id") or c["id"]
+                fn = tc.get("function") or {}
+                c["name"] += fn.get("name") or ""
+                c["arguments"] += fn.get("arguments") or ""
+    if not finished:
+        raise OSError("the model stream ended early (model unloaded?); this answer is incomplete")
+    if reason == "length" and calls:
+        raise OSError("the answer hit the token limit in the middle of a tool call; no tool was run")
+    return "".join(content), "".join(reasoning), [calls[i] for i in sorted(calls)]
+
+
+COMPUTER_TOOLS_PER_ROUND = 4      # tool calls run per model response; the rest are answered "skipped"
+COMPUTER_DEADLINE = 1200           # seconds per message, all rounds and tools included
+
+
+def computer_send(body, emit):
+    """Handle one user message end to end, streaming events through emit(dict). The chat is saved even
+    when the turn fails, with an error note."""
+    if not isinstance(body, dict):
+        raise ValueError("bad request")
+    model, text, cid = body.get("model"), body.get("text") or "", body.get("id")
+    tools_in, images_in = body.get("tools") or [], body.get("images") or []
+    if not isinstance(model, str) or not isinstance(text, str) or not isinstance(tools_in, list) \
+            or not isinstance(images_in, list) or (cid is not None and not isinstance(cid, str)):
+        raise ValueError("bad request")
+    text = text.strip()
+    images = [u for u in images_in if isinstance(u, str) and u.startswith("data:image/")][:4]
+    if not text and not images:
+        raise ValueError("empty message")
+    models = {m["id"]: m for m in computer_models()}
+    if model not in models:
+        raise PermissionError("That model is not loaded. Computer only uses resident models; "
+                              "load one in the Model Registry first.")
+    enabled = {t for t in tools_in if isinstance(t, str) and t in COMPUTER_MCP}
+    if cid:
+        chat = computer_chat_load(cid)
+    else:
+        import secrets
+        chat = {"id": secrets.token_hex(8), "title": (text or "Image")[:60], "created": time.time(), "messages": []}
+    with _CHAT_BUSY_LOCK:
+        if chat["id"] in _CHAT_BUSY:
+            raise PermissionError("This chat is still answering; wait for it to finish.")
+        _CHAT_BUSY.add(chat["id"])
+    try:
+        _computer_turn(chat, model, models[model]["vision"], text, images, enabled, emit)
+    except Exception as e:                       # keep what the turn produced, note the failure, re-raise
+        chat["messages"].append({"role": "assistant", "content": f"(interrupted: {str(e)[:200]})",
+                                 "error": True, "at": time.time()})
+        raise
+    finally:
+        chat["updated"] = time.time()
+        try:
+            computer_chat_save(chat)
+        finally:
+            with _CHAT_BUSY_LOCK:
+                _CHAT_BUSY.discard(chat["id"])
+    emit({"type": "done", "id": chat["id"]})
+
+
+def _computer_turn(chat, model, vision, text, images, enabled, emit):
+    chat["model"] = model
+    content = text if not images or not vision else (
+        [{"type": "text", "text": text or "Describe the image."}] +
+        [{"type": "image_url", "image_url": {"url": u}} for u in images])
+    chat["messages"].append({"role": "user", "content": content, "at": time.time()})
+    emit({"type": "chat", "id": chat["id"], "title": chat["title"], "wiki_used": bool(chat.get("wiki_used"))})
+    reg = computer_tools()
+    deadline = time.time() + COMPUTER_DEADLINE
+    for _ in range(COMPUTER_ROUNDS):
+        if time.time() > deadline:
+            raise OSError("stopped: this message took longer than %d minutes" % (COMPUTER_DEADLINE // 60))
+        if model not in {m["id"] for m in computer_models()}:
+            raise PermissionError("The model was unloaded during the answer; Computer never reloads it.")
+        specs = [spec for name, (srv, spec) in reg["tools"].items()
+                 if srv in enabled]
+        reply, reasoning, calls = _stream_completion(model, _history(chat, vision), specs, emit)
+        msg = {"role": "assistant", "content": reply, "at": time.time()}
+        if reasoning:
+            msg["reasoning"] = reasoning
+        if calls:
+            msg["tool_calls"] = [{"id": c["id"] or f"call_{i}", "type": "function",
+                                  "function": {"name": c["name"], "arguments": c["arguments"] or "{}"}}
+                                 for i, c in enumerate(calls)]
+        chat["messages"].append(msg)
+        if not calls:
+            return
+        for n, tc in enumerate(msg["tool_calls"]):
+            name = tc["function"]["name"]
+            try:
+                args = json.loads(tc["function"]["arguments"] or "{}")
+            except ValueError:
+                args = {}
+            if not isinstance(args, dict):
+                args = {}
+            emit({"type": "tool_call", "name": name, "args": args})
+            srv = (reg["tools"].get(name) or (None,))[0]
+            images_out, guarded = [], False
+            if n >= COMPUTER_TOOLS_PER_ROUND:
+                result = "Skipped: at most %d tool calls per step." % COMPUTER_TOOLS_PER_ROUND
+            elif time.time() > deadline:
+                result = "Skipped: the time limit for this message was reached."
+            elif srv is None or srv not in enabled:
+                result = f"Tool {name} is not available."
+            elif COMPUTER_MCP[srv]["web"] and (why := web_guard(args)):
+                guarded = True
+                result = (f"Refused by the web guard: {why}. Nothing was sent. Search again with a short, generic "
+                          "query about the public topic, without customer, company or people names, internal "
+                          "project names, secrets or copied text.")
+            else:
+                try:
+                    result, images_out = _tool_call(name, args)
+                except (OSError, ValueError, KeyError, subprocess.SubprocessError) as e:
+                    result = f"TOOL ERROR: {str(e)[:300]}"
+                if not COMPUTER_MCP[srv]["web"]:
+                    chat["wiki_used"] = True
+            emit({"type": "tool_result", "name": name, "text": result[:600], "images": images_out[:4],
+                  "guarded": guarded})
+            chat["messages"].append({"role": "tool", "tool_call_id": tc["id"], "name": name, "content": result,
+                                     "images": images_out[:4], "at": time.time()})
+    emit({"type": "error", "text": f"Stopped after {COMPUTER_ROUNDS} tool rounds."})
+
+
+def computer_transcribe(wav):
+    """Speech to text with whisper.cpp on the Sparks, through the same ASR gate the voice-memo bridge uses:
+    it is memory-guarded and steps aside when a Spark is busy, so this tries every node in turn."""
+    if not wav.startswith(b"RIFF"):
+        raise ValueError("expected a WAV file")
+    errors = []
+    for node, host in NODES.items():
+        cmd = [ASR_GATE] if host is None else [
+            "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host, os.environ.get("FLEET_ASR_GATE_REMOTE",
+                                                                                        "~/.whatsapp-bridge/asr_gate.sh")]
+        try:
+            p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 start_new_session=True)
+            try:
+                out, _ = p.communicate(wav, timeout=300)
+            except subprocess.TimeoutExpired:
+                import signal
+                os.killpg(p.pid, signal.SIGKILL)
+                p.wait()
+                raise OSError("timed out")
+            j = json.loads(out.decode("utf-8", "replace").strip().splitlines()[-1])
+        except (ValueError, IndexError, OSError, subprocess.SubprocessError) as e:
+            errors.append(f"{node}: {str(e)[:80]}")
+            continue
+        if j.get("busy"):
+            errors.append(f"{node}: busy")
+            continue
+        return {"text": " ".join(s.get("text", "").strip() for s in j.get("segments") or []).strip(),
+                "language": j.get("language"), "node": node}
+    if all(e.endswith("busy") for e in errors):
+        raise PermissionError("Both Sparks are too busy for transcription right now; try again shortly.")
+    raise OSError("transcription failed: " + "; ".join(errors))
+
+
 # ---------------------------------------------------------------- http
 
+CSP = ("default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' "
+       "https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data: blob:; "
+       "media-src 'self' blob:; connect-src 'self'; form-action 'none'; base-uri 'none'; frame-ancestors 'self'")
+
+
 class Handler(BaseHTTPRequestHandler):
+    timeout = 60          # socket operations: a client that stalls a read or write is dropped
+
     def log_message(self, *a):
         pass
 
@@ -2436,10 +3102,104 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
+        if ctype.startswith("text/html"):
+            self.send_header("Content-Security-Policy", CSP)
         self.end_headers()
         self.wfile.write(data)
 
+    def _sse_start(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+
+    def _sse(self, obj):
+        self.wfile.write(("data: " + json.dumps(obj) + "\n\n").encode())
+        self.wfile.flush()
+
+    def _computer_post(self, n):
+        try:
+            computer_auth(self.headers.get(KEY_HDR))
+        except urllib.error.HTTPError as e:
+            self.close_connection = True          # the body is never read without a valid key
+            return self._send(403, json.dumps({"error": _err_text(e)}), "application/json")
+        if n > (64 << 20):
+            return self._send(413, '{"error":"too large"}', "application/json")
+        data = self.rfile.read(n)
+        if self.path == "/api/computer/transcribe":
+            try:
+                return self._send(200, json.dumps(computer_transcribe(data)), "application/json")
+            except PermissionError as e:
+                return self._send(409, json.dumps({"error": str(e)}), "application/json")
+            except (OSError, ValueError, subprocess.SubprocessError) as e:
+                return self._send(502, json.dumps({"error": str(e)[:200]}), "application/json")
+        try:
+            body = json.loads(data or b"{}")
+        except ValueError:
+            return self._send(400, '{"error":"bad json"}', "application/json")
+        if self.path == "/api/computer/delete":
+            try:
+                os.remove(_chat_path(body.get("id")))
+            except (OSError, ValueError) as e:
+                return self._send(404, json.dumps({"error": str(e)[:200]}), "application/json")
+            return self._send(200, '{"ok":true}', "application/json")
+        if self.path == "/api/computer/send":
+            self._sse_start()
+            gone = []
+
+            def emit(obj):                       # a closed browser tab must not abort the turn or lose it
+                if gone:
+                    return
+                try:
+                    self._sse(obj)
+                except (BrokenPipeError, ConnectionError, OSError):
+                    gone.append(1)
+            try:
+                computer_send(body, emit)
+            except PermissionError as e:
+                emit({"type": "error", "text": str(e)})
+            except urllib.error.HTTPError as e:
+                emit({"type": "error", "text": "Model: " + _err_text(e)[:300]})
+            except Exception as e:               # anything else: report it, never leave the stream hanging
+                emit({"type": "error", "text": str(e)[:300] or e.__class__.__name__})
+            return
+        return self._send(404, '{"error":"unknown"}', "application/json")
+
     def do_GET(self):
+        if self.path.startswith("/vendor/"):
+            name = self.path[len("/vendor/"):]
+            if not re.fullmatch(r"[a-z0-9.-]+\.(js|css)", name):
+                return self._send(404, "", "text/plain")
+            p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor", name)
+            if not os.path.isfile(p):
+                return self._send(404, "", "text/plain")
+            with open(p, "rb") as f:
+                return self._send(200, f.read(), "text/css" if name.endswith(".css") else "application/javascript")
+        if self.path.startswith("/api/computer/"):
+            try:
+                computer_auth(self.headers.get(KEY_HDR))
+            except urllib.error.HTTPError as e:
+                return self._send(403, json.dumps({"error": _err_text(e)}), "application/json")
+            u = urllib.parse.urlsplit(self.path)
+            q = urllib.parse.parse_qs(u.query)
+            try:
+                if u.path == "/api/computer/models":
+                    t = computer_tools()
+                    return self._send(200, json.dumps({"models": computer_models(),
+                        "servers": {n: {"web": c["web"], "tools": sorted(k for k, v in t["tools"].items() if v[0] == n),
+                                        "error": t["errors"].get(n)} for n, c in COMPUTER_MCP.items()}}), "application/json")
+                if u.path == "/api/computer/chats":
+                    return self._send(200, json.dumps({"chats": computer_chats()}), "application/json")
+                if u.path == "/api/computer/chat":
+                    return self._send(200, json.dumps(computer_chat_load((q.get("id") or [""])[0])), "application/json")
+                if u.path == "/api/computer/wiki/graph":      # Memory Core (wikicore.py)
+                    return self._send(200, wikicore.graph_json(), "application/json")
+                if u.path == "/api/computer/wiki/trails":
+                    return self._send(200, json.dumps({"trails": wikicore.trails(COMPUTER_DIR)}), "application/json")
+            except (OSError, ValueError) as e:
+                return self._send(404, json.dumps({"error": str(e)[:200]}), "application/json")
+            return self._send(404, '{"error":"unknown"}', "application/json")
         if self.path == "/":
             return self._send(200, page(), "text/html; charset=utf-8")
         if self.path == "/sounds/tng_red_alert1.mp3":
@@ -2561,7 +3321,14 @@ class Handler(BaseHTTPRequestHandler):
         self._send(404, "not found", "text/plain")
 
     def do_POST(self):
-        n = int(self.headers.get("Content-Length") or 0)
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            n = -1
+        if n < 0:
+            return self._send(400, '{"error":"bad Content-Length"}', "application/json")
+        if self.path.startswith("/api/computer/"):
+            return self._computer_post(n)
         try:
             body = json.loads(self.rfile.read(n) or "{}")
         except ValueError:
@@ -2807,6 +3574,22 @@ def _ct_selfcheck():
 def selfcheck():
     global _q_current, AUTODESTRUCT_CODE
     _ct_selfcheck()
+    # web guard: public tech passes; customer names, people, secrets, personal data and pasted text do not.
+    # Runs on a fixed test list (customer term "acme corp"/"acme"), not this host's real one.
+    _wg_saved = dict(_WG)
+    try:
+        _WG.update(at=time.time(), terms=re.compile(r"(?<!\w)(?:acme corp|acme)(?!\w)"), secrets=[])
+        assert web_guard({"query": "qdrant hybrid search tutorial"}) is None
+        assert web_guard({"query": "Azure OpenAI rate limits", "focusMode": "webSearch"}) is None
+        assert web_guard({"query": "what is new in vllm?"}) is None
+        for bad in ("Acme Corp RAG evaluation", "ACME-rollout", "password: hunter22", "sk-proj-abcdefghijklmnop1234",
+                    "aB3dE5fG7hJ9kL1mN3pQ5rS7tU9", "x@example.com", "+49 621 1234567", "y" * (WEB_ARG_MAX + 1)):
+            assert web_guard({"query": bad}), bad
+        assert web_guard({"history": [["human", "Acme"]]}), "nested arguments are checked too"
+    finally:
+        _WG.clear()
+        _WG.update(_wg_saved)
+    assert re.compile(r"(?<!\w)(?:" + (r"(?!)") + r")(?!\w)").search("? ! ") is None, "an empty list matches nothing"
     # A pin missing from `running` (evicted by ttl, or by llama-swap swapping in a
     # different member of its swap:true group) must be touched immediately, same
     # tick, regardless of the refresh clock -- that's the whole fix.

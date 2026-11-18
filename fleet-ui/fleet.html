@@ -251,6 +251,66 @@ body.nas .main:not(#nasview), body:not(.nas) #nasview{display:none}
 body.ctr .main:not(#ctrview), body:not(.ctr) #ctrview{display:none}
 body.ma .main:not(#maview), body:not(.ma) #maview{display:none}
 body.def .main:not(#defview), body:not(.def) #defview{display:none}
+body.comp .main:not(#compview), body:not(.comp) #compview{display:none}
+/* ---- Computer: knowledge chat ---- */
+#compview{display:flex;flex-direction:column;height:calc(100vh - 12px);min-width:0}
+body.fs #compview{height:calc(100vh - 36px)}
+#comp{display:grid;grid-template-columns:230px 1fr;gap:8px;flex:1;min-height:0;margin-top:8px}
+#compchats{overflow:auto;display:flex;flex-direction:column;gap:4px;padding-right:2px}
+#compchats .new{background:var(--orange);color:#000;border:0;border-radius:0 16px 16px 0;padding:8px 12px;font:inherit;
+  font-weight:700;letter-spacing:.1em;text-transform:uppercase;text-align:left;cursor:pointer}
+#compchats .it{background:#0b0803;border-left:6px solid var(--grid);padding:6px 10px;cursor:pointer;color:var(--text);
+  font-size:13px;letter-spacing:.04em;display:flex;gap:6px;align-items:flex-start}
+#compchats .it:hover{border-left-color:var(--blue)} #compchats .it.on{border-left-color:var(--orange);background:#160f06}
+#compchats .it span{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#compchats .it small{display:block;color:var(--dim);font-size:10px;text-transform:uppercase}
+#compchats .it button{background:none;border:0;color:var(--dim);cursor:pointer;font:inherit;font-size:11px}
+#compchats .it button:hover{color:var(--red)}
+#compmain{display:flex;flex-direction:column;min-height:0;min-width:0}
+#compbar{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-bottom:6px}
+#compbar select{font-family:var(--lcars);font-size:13px;font-weight:600;letter-spacing:.06em;border:0;border-radius:11px;
+  padding:4px 10px;background:var(--blue);color:#000;max-width:320px}
+#compbar select:disabled{background:var(--grid);color:var(--dim)}
+.tpill{font-family:var(--lcars);font-size:12px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;background:var(--grid);
+  color:var(--dim);border:0;border-radius:11px;padding:4px 13px;cursor:pointer}
+.tpill:hover{color:var(--text)} .tpill.on{background:var(--orange);color:#000} .tpill.web.on{background:var(--amber)}
+#complog{flex:1;overflow:auto;background:#050402;border:1px solid var(--grid);border-radius:4px 18px 4px 4px;padding:12px 16px;
+  scroll-behavior:smooth}
+.cm{margin:0 0 14px;max-width:980px}
+.cm .who{font-size:11px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;margin-bottom:3px}
+.cm.user .who{color:var(--peach)} .cm.bot .who{color:var(--blue)}
+.cm .body{border-left:6px solid var(--grid);padding:6px 12px;background:#0b0803;color:#f3e6d8;font-family:-apple-system,"Segoe UI",
+  Roboto,"Helvetica Neue",sans-serif;font-size:15px;line-height:1.55;letter-spacing:normal;overflow-wrap:anywhere}
+.cm.user .body{border-left-color:var(--peach)} .cm.bot .body{border-left-color:var(--blue)}
+.cm .body img{max-width:100%;max-height:420px;border-radius:6px;display:block;margin:6px 0}
+.cm .body pre{background:#0f1117;border-radius:8px;padding:10px 12px;overflow:auto;font-size:13px}
+.cm .body pre code.hljs{background:transparent;padding:0}
+.cm .body code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.92em}
+.cm .body :not(pre)>code{background:#1d160d;border-radius:4px;padding:1px 5px;color:var(--amber)}
+.cm .body table{border-collapse:collapse;width:auto;margin:6px 0}
+.cm .body th,.cm .body td{border:1px solid #3a2c18;padding:4px 9px;background:transparent;font-size:14px;text-transform:none;
+  letter-spacing:normal;color:inherit}
+.cm .body th{color:var(--amber)} .cm .body a{color:var(--blue)} .cm .body h1,.cm .body h2,.cm .body h3{color:var(--orange);
+  font-family:var(--lcars);letter-spacing:.06em;margin:10px 0 4px} .cm .body p{margin:4px 0 8px}
+.cm details{margin:2px 0 6px;color:var(--dim);font-size:13px}
+.cm details summary{cursor:pointer;text-transform:uppercase;letter-spacing:.1em;font-size:11px}
+.cm details pre{white-space:pre-wrap;font-family:-apple-system,"Segoe UI",sans-serif;font-size:13px;color:var(--dim);margin:4px 0}
+.tc{display:inline-block;margin:2px 6px 4px 0;background:var(--grid);border-radius:10px;padding:2px 10px;font-size:11px;
+  color:var(--text);letter-spacing:.06em}
+.tc.web{color:var(--amber)} .tc b{color:var(--blue);font-weight:700;margin-right:4px}
+.cm .thumbs img{max-height:120px;display:inline-block;margin:4px 6px 0 0}
+#compin{margin-top:8px;display:grid;grid-template-columns:1fr auto;gap:6px}
+#comptext{resize:none;height:74px;background:#0b0803;border:2px solid var(--grid);border-radius:4px 18px 18px 4px;color:#f3e6d8;
+  padding:8px 14px;font:15px -apple-system,"Segoe UI",sans-serif;outline:none}
+#comptext:focus{border-color:var(--orange)}
+.cbtns{display:grid;grid-template-columns:1fr 1fr;gap:4px;width:200px}
+.cbtns button{border:0;font:inherit;font-size:13px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;cursor:pointer;
+  padding:6px 8px;color:#000;background:var(--mauve)}
+.cbtns #compsend{grid-column:1/3;background:var(--orange);border-radius:0 16px 16px 0}
+.cbtns #compmic.rec{background:var(--red);animation:adblink 1s steps(2) infinite}
+.cbtns button:disabled{opacity:.35;cursor:default}
+#compatt{grid-column:1/3;display:flex;gap:6px} #compatt img{height:54px;border-radius:4px;border:1px solid var(--grid);cursor:pointer}
+#comphint{font-size:11px;color:var(--dim);letter-spacing:.08em;text-transform:uppercase;margin-left:auto}
 /* ---- Memory Alpha (off-site backup) and Defiant (web server) ---- */
 .vmsg{display:none;border-left:8px solid var(--amber);background:#1a1204;color:var(--amber);padding:6px 14px;
   font-size:13px;text-transform:uppercase;margin-top:6px;letter-spacing:.06em}
@@ -333,7 +393,9 @@ body.fs #nasview{grid-column:1}
 body.fs .main{padding-top:24px}
 body.fs th{position:sticky;top:0;background:var(--ink);z-index:1}
 html.fs{scrollbar-width:none} html.fs::-webkit-scrollbar{display:none}
-</style></head><body>
+</style><link rel="stylesheet" href="/vendor/atom-one-dark.min.css"><link rel="stylesheet" href="/vendor/memcore.css">
+<script src="/vendor/marked.min.js"></script><script src="/vendor/purify.min.js"></script><script src="/vendor/highlight.min.js"></script>
+</head><body>
 <div id="adov"><div class="box">
   <div class="e1"></div><div class="hd" id="adhd">Auto Destruct Sequence</div>
   <div class="side"><b id="adside">CODE<br>REQUIRED</b></div>
@@ -375,6 +437,10 @@ html.fs{scrollbar-width:none} html.fs::-webkit-scrollbar{display:none}
       style="border:0;cursor:pointer;font:inherit;text-transform:uppercase;letter-spacing:.08em;font-weight:700;font-size:14px;padding:10px">Memory Alpha</button>
     <button id="defbtn" type="button" class="blk" title="The web server: health, resources, sites, certificates and containers"
       style="background:var(--peach);border:0;cursor:pointer;font:inherit;text-transform:uppercase;letter-spacing:.08em;font-weight:700;font-size:14px;padding:10px">Defiant</button>
+    <button id="compbtn" type="button" class="blk c5" title="Computer: chat with the loaded model, with your wiki and web search (knowledge work)"
+      style="border:0;cursor:pointer;font:inherit;text-transform:uppercase;letter-spacing:.08em;font-weight:700;font-size:14px;padding:10px">Computer</button>
+    <button id="wikibtn" type="button" class="blk c3" title="Memory Core: the LLM wiki as one map, and the course Computer took through it"
+      style="border:0;cursor:pointer;font:inherit;text-transform:uppercase;letter-spacing:.08em;font-weight:700;font-size:14px;padding:10px">Memory Core</button>
     <div class="blk fill"></div>
     <div class="blk elbow-b"><div class="n" id="r-free">--</div><div class="l">GB Free</div></div>
   </div>
@@ -452,6 +518,40 @@ html.fs{scrollbar-width:none} html.fs::-webkit-scrollbar{display:none}
     <div class="vmsg" id="defmsg"></div>
     <div id="defbody"></div>
   </div>
+
+  <div class="main" id="wikiview"></div>
+
+  <div class="main" id="compview">
+    <div class="top">
+      <div class="title">Com<span>puter</span></div>
+      <div class="bar"><span id="compmeta">--</span></div>
+    </div>
+    <div class="vmsg" id="compmsg"></div>
+    <div id="comp">
+      <div id="compchats"></div>
+      <div id="compmain">
+        <div id="compbar">
+          <select id="compmodel" title="Only models that are loaded right now. Computer never loads a model."></select>
+          <button class="tpill on" data-tool="wiki" title="Search and read your wiki (local)">Wiki</button>
+          <button class="tpill web on" data-tool="vane" title="vane research (internet). Every query is checked first: no customer names, secrets, personal data or pasted text leave this host.">Vane</button>
+          <button class="tpill web on" data-tool="google" title="Google search (internet). Every query is checked first: no customer names, secrets, personal data or pasted text leave this host.">Google</button>
+          <button class="tpill" id="comphot" title="Set the key combination that opens Computer and starts the microphone">Hotkey</button>
+          <span id="comphint"></span>
+        </div>
+        <div id="complog"></div>
+        <div id="compin">
+          <div id="compatt"></div>
+          <textarea id="comptext" placeholder="Ask the computer. Enter sends, Shift+Enter for a new line." autocomplete="off"></textarea>
+          <div class="cbtns">
+            <button id="compmic" type="button" title="Voice input, transcribed on the Spark">Voice</button>
+            <button id="compimg" type="button" title="Attach an image (vision models only; you can also paste one)">Image</button>
+            <button id="compsend" type="button">Engage</button>
+          </div>
+          <input type="file" id="compfile" accept="image/*" hidden>
+        </div>
+      </div>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -469,7 +569,7 @@ ksave.addEventListener("click",()=>{
     sessionStorage.removeItem("starfleetKey"); }catch(e){ alert("Browser refused to store the key: "+e.message); }
   kshow(); });
 window.fetch=(url,opt={})=>{
-  if(String(url).startsWith("/api/")&&opt.method==="POST"&&skey.value.trim())
+  if(String(url).startsWith("/api/")&&(opt.method==="POST"||String(url).startsWith("/api/computer/"))&&skey.value.trim())
     opt.headers={...opt.headers,"X-Starfleet-Key":skey.value.trim()};
   return _fetch(url,opt);
 };
@@ -504,7 +604,7 @@ const gb=kb=>(kb/1048576).toFixed(1);
 const busy=new Set();
 const FILTERS=["all","jean-luc","kathryn","starfleet","dynamic","live","pinned","vision","embed","rerank","image"];
 /* the hash makes a view bookmarkable — open #kathryn to land straight on her models */
-const wantView=["nas","ctr","ma","def"].find(v=>location.hash==="#"+v);   /* read before setFilter() below rewrites the hash: reopens that view */
+const wantView=["nas","ctr","ma","def","comp","wiki"].find(v=>location.hash==="#"+v);   /* read before setFilter() below rewrites the hash: reopens that view */
 let filter=FILTERS.includes(location.hash.slice(1))?location.hash.slice(1):"all";
 let query="", last={nodes:{},models:[],running:[],pins:[],errors:{},loading:[]};
 /* Date.now() of the poll that produced last.loading, so the bar can tick every
@@ -1163,8 +1263,8 @@ function render(s){
       `Queue, one at a time: ${(s.queued||[]).map((id,i)=>`${i+1}. ${modelName(id)}`).join("  |  ")}`;
   }else qb.style.display="none";
   const stOf=m=>loadingIds.has(m.id)?"loading":busy.has(m.id)?"working":queuedPos[m.id]?"queued":(run[m.id]?run[m.id].state:"stopped");
-  const shown=sorted("models",grouped.filter(m=>keep(m,run)).sort((a,c)=>
-    (c.pinned-a.pinned)||((run[c.id]?1:0)-(run[a.id]?1:0))||a.id.localeCompare(c.id)),
+  const shown=sorted("models",grouped.filter(m=>keep(m,run)).sort((a,c)=>   /* default: alphabetical by model name */
+    modelName(a.id).localeCompare(modelName(c.id),undefined,{numeric:true,sensitivity:"base"})||a.id.localeCompare(c.id)),
     {name:m=>modelName(m.id), node:m=>(m.nodes||[]).join(" "), speed:m=>m.tps, ctx:m=>m.ctx||m.ctx_deployed||m.ctx_max,
      effort:m=>m.effort, state:stOf, ttl:m=>run[m.id]&&run[m.id].ttl, pin:m=>m.pinned?1:0});
   document.getElementById("count").textContent=
@@ -1607,21 +1707,204 @@ async function defPoll(){
   defTimer=setTimeout(defPoll,15000);
 }
 
+
+/* ================= Computer =================
+   Chat for knowledge work with the model that is already loaded (never loads one), with the wiki (local) and
+   vane / Google (internet) as tools. Every call carries the Starfleet key. Answers stream in as markdown
+   (sanitised with DOMPurify), code is highlighted, images are shown. Voice: recorded here, converted to a
+   16 kHz WAV, transcribed by whisper.cpp on the Spark. A key combination of your choice opens Computer and
+   starts the microphone; press it again to stop and transcribe. */
+var compOn=false;
+let compChat=null, compBusy=false, compImgs=[], compRec=null, compModels=[], compHot=null;
+const LS=(k,v)=>{ try{ if(v===undefined) return localStorage.getItem(k); localStorage.setItem(k,v); }catch(e){} return null; };
+compHot=LS("computerHotkey")||"Ctrl+Shift+Space";
+/* Model and tool text is untrusted: no styles, forms or embeds, and no image may load from another host (an image
+   URL can carry chat or wiki text to the internet). Remote images become a link you would have to click. The page's
+   Content-Security-Policy (img-src 'self' data: blob:) blocks them a second time. */
+const MDCFG={ADD_ATTR:["target"],FORBID_TAGS:["style","form","input","button","textarea","select","option","iframe","object","embed","link","meta"],
+  FORBID_ATTR:["style","action","formaction","srcset","poster","background"]};
+const md=t=>{
+  if(!window.marked||!window.DOMPurify) return esc(t).replace(/\n/g,"<br>");
+  return DOMPurify.sanitize(marked.parse(t||"",{breaks:true,gfm:true}),MDCFG);
+};
+if(window.DOMPurify) DOMPurify.addHook("afterSanitizeAttributes",n=>{
+  if(n.tagName==="A"){ n.setAttribute("target","_blank"); n.setAttribute("rel","noopener noreferrer"); }
+  if(n.tagName==="IMG"){ const src=n.getAttribute("src")||"";
+    if(!/^(data:image\/|\/(?!\/))/i.test(src)){ n.removeAttribute("src"); n.setAttribute("data-remote",src); } }
+});
+function compRemote(el){   /* blocked remote images -> plain links with the host shown */
+  el.querySelectorAll("img[data-remote]").forEach(i=>{ const u=i.getAttribute("data-remote"); let h="";
+    try{ h=new URL(u).host; }catch(e){}
+    const a=document.createElement("a"); a.href=/^https?:/i.test(u)?u:"#"; a.target="_blank"; a.rel="noopener noreferrer";
+    a.textContent=`[remote image${h?": "+h:""}]`; i.replaceWith(a); }); }
+function compMsg(t,err){ const el=document.getElementById("compmsg"); el.style.display=t?"block":"none"; el.textContent=t||""; el.classList.toggle("err",!!err); }
+function compHint(){ document.getElementById("comphint").textContent=`Hotkey ${compHot} · voice ${window.isSecureContext&&navigator.mediaDevices?"ready":"needs HTTPS"}`; }
+function compTools(){ return [...document.querySelectorAll("#compbar [data-tool].on")].map(b=>b.dataset.tool); }
+document.querySelectorAll("#compbar [data-tool]").forEach(b=>{
+  const saved=LS("computerTools"); if(saved) b.classList.toggle("on",saved.split(",").includes(b.dataset.tool));
+  b.onclick=()=>{ b.classList.toggle("on"); LS("computerTools",compTools().join(",")); };
+});
+async function compJSON(url,opt){
+  const r=await fetch(url,opt), j=await r.json().catch(()=>({}));
+  if(r.status===403) throw new Error("Starfleet key missing or wrong: enter it on the Starfleet Command page and Save key.");
+  if(!r.ok) throw new Error(j.error||("HTTP "+r.status));
+  return j;
+}
+async function compOpen(){
+  compHint();
+  try{
+    const j=await compJSON("/api/computer/models");
+    compModels=j.models||[];
+    const sel=document.getElementById("compmodel"), want=LS("computerModel");
+    sel.innerHTML=compModels.length?compModels.map(m=>`<option value="${esc(m.id)}">${esc(modelName(m.id))}${m.vision?" · vision":""}</option>`).join("")
+      :`<option>No chat model loaded</option>`;
+    sel.disabled=!compModels.length;
+    if(compModels.some(m=>m.id===want)) sel.value=want;
+    const down=Object.entries(j.servers||{}).filter(([n,s])=>s.error).map(([n,s])=>`${n}: ${s.error}`);
+    compMsg(!compModels.length?"No chat model is loaded. Load one in the Model Registry; Computer never loads models itself."
+      :down.length?"Tool server not answering: "+down.join(" · "):"",!compModels.length);
+    document.getElementById("compmeta").textContent=`${compModels.length} model${compModels.length===1?"":"s"} ready · tools ${Object.values(j.servers||{}).reduce((a,s)=>a+s.tools.length,0)}`;
+    compImgBtn(); await compList();
+  }catch(e){ compMsg(e.message,true); }
+}
+document.getElementById("compmodel").onchange=e=>{ LS("computerModel",e.target.value); compImgBtn(); };
+function compImgBtn(){ const m=compModels.find(x=>x.id===document.getElementById("compmodel").value);
+  document.getElementById("compimg").disabled=!(m&&m.vision); }
+async function compList(){
+  const j=await compJSON("/api/computer/chats");
+  document.getElementById("compchats").innerHTML=`<button class="new" onclick="compNew()">+ New chat</button>`+
+    (j.chats||[]).map(c=>`<div class="it ${compChat&&compChat.id===c.id?"on":""}" onclick="compLoad('${c.id}')"><span>${esc(c.title)}
+      <small>${ago(c.updated)}</small></span><button title="Delete this chat" onclick="event.stopPropagation();compDel('${c.id}',this)">✕</button></div>`).join("");
+}
+function compNew(){ compChat=null; document.getElementById("complog").innerHTML=""; compList(); document.getElementById("comptext").focus(); }
+async function compDel(id,btn){
+  if(btn.dataset.arm!=="1"){ btn.dataset.arm="1"; btn.textContent="Sure?"; setTimeout(()=>{ btn.dataset.arm=""; btn.textContent="✕"; },3000); return; }
+  try{ await compJSON("/api/computer/delete",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id})}); }catch(e){ compMsg(e.message,true); }
+  if(compChat&&compChat.id===id) compNew(); else compList();
+}
+function compUserHTML(content){
+  if(typeof content==="string") return md(content);
+  return content.map(p=>p.type==="text"?md(p.text):`<img src="${esc(p.image_url.url)}" alt="attached image">`).join("");
+}
+function compBot(){ const el=document.createElement("div"); el.className="cm bot";
+  el.innerHTML=`<div class="who">Computer</div><div class="tools"></div><details class="think" hidden><summary>Thinking</summary><pre></pre></details><div class="body"></div><div class="thumbs"></div>`;
+  return el; }
+function compAddUser(content){ const el=document.createElement("div"); el.className="cm user";
+  el.innerHTML=`<div class="who">You</div><div class="body">${compUserHTML(content)}</div>`; document.getElementById("complog").appendChild(el); }
+function compChip(el,name,args,web){ const q=args&&(args.query||args.path||args.q||"");
+  el.querySelector(".tools").insertAdjacentHTML("beforeend",`<span class="tc ${web?"web":""}" title="${esc(JSON.stringify(args||{}))}"><b>${esc(name)}</b>${esc(String(q).slice(0,80))}</span>`); }
+function compHL(el){ compRemote(el); if(window.hljs) el.querySelectorAll("pre code").forEach(c=>{ try{ hljs.highlightElement(c); }catch(e){} }); }
+const WEB=n=>/^(vane|google)_/.test(n);
+async function compLoad(id){
+  try{ compChat=await compJSON("/api/computer/chat?id="+encodeURIComponent(id)); }catch(e){ return compMsg(e.message,true); }
+  const log=document.getElementById("complog"); log.innerHTML=""; let bot=null;
+  for(const m of compChat.messages){
+    if(m.role==="user"){ compAddUser(m.content); bot=null; }
+    else if(m.role==="assistant"){ if(!bot){ bot=compBot(); log.appendChild(bot); }
+      if(m.reasoning){ const d=bot.querySelector(".think"); d.hidden=false; d.querySelector("pre").textContent+=m.reasoning; }
+      (m.tool_calls||[]).forEach(tc=>{ let a={}; try{ a=JSON.parse(tc.function.arguments||"{}"); }catch(e){} compChip(bot,tc.function.name,a,WEB(tc.function.name)); });
+      if(m.content){ bot.querySelector(".body").innerHTML=md(m.content); compHL(bot); } }
+    else if(m.role==="tool"&&bot){ (m.images||[]).forEach(u=>bot.querySelector(".thumbs").insertAdjacentHTML("beforeend",`<img src="${esc(u)}" alt="tool image">`)); }
+  }
+  log.scrollTop=log.scrollHeight; compList();
+  compMsg("");
+}
+async function compSend(){
+  const ta=document.getElementById("comptext"), text=ta.value.trim(), model=document.getElementById("compmodel").value;
+  if(compBusy||(!text&&!compImgs.length)) return;
+  if(!compModels.some(m=>m.id===model)) return compMsg("No chat model is loaded.",true);
+  compBusy=true; document.getElementById("compsend").disabled=true; compMsg("");
+  const imgs=compImgs.slice(); compImgs=[]; compAtt(); ta.value="";
+  compAddUser(imgs.length?[{type:"text",text},...imgs.map(u=>({type:"image_url",image_url:{url:u}}))]:text);
+  const log=document.getElementById("complog"), bot=compBot(); log.appendChild(bot); log.scrollTop=log.scrollHeight;
+  let txt="", think="", raf=0, gotDone=false;
+  const paint=()=>{ raf=0; bot.querySelector(".body").innerHTML=md(txt)||'<span class="st loading">working...</span>'; compHL(bot); log.scrollTop=log.scrollHeight; };
+  paint();
+  try{
+    const r=await fetch("/api/computer/send",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({id:compChat&&compChat.id,text,model,tools:compTools(),images:imgs})});
+    if(r.status===403) throw new Error("Starfleet key missing or wrong: enter it on the Starfleet Command page and Save key.");
+    const rd=r.body.getReader(), dec=new TextDecoder(); let buf="";
+    for(;;){ const {value,done}=await rd.read(); if(done) break; buf+=dec.decode(value,{stream:true});
+      let i; while((i=buf.indexOf("\n\n"))>=0){ const line=buf.slice(0,i); buf=buf.slice(i+2);
+        if(!line.startsWith("data:")) continue; let e; try{ e=JSON.parse(line.slice(5)); }catch(x){ continue; }
+        if(e.type==="token"){ txt+=e.text; if(!raf) raf=requestAnimationFrame(paint); }
+        else if(e.type==="reasoning"){ think+=e.text; const d=bot.querySelector(".think"); d.hidden=false; d.querySelector("pre").textContent=think; }
+        else if(e.type==="tool_call"){ if(txt){ txt+="\n\n"; } compChip(bot,e.name,e.args,WEB(e.name)); }
+        else if(e.type==="tool_result"){ if(e.guarded) compMsg("Web guard: a query with customer names, personal data, a secret or copied text was not sent; the model rephrases it.");
+          (e.images||[]).forEach(u=>bot.querySelector(".thumbs").insertAdjacentHTML("beforeend",`<img src="${esc(u)}" alt="tool image">`)); }
+        else if(e.type==="chat"){ compChat={id:e.id,title:e.title}; }
+        else if(e.type==="error"){ compMsg(e.text,true); }
+        else if(e.type==="done"){ compChat={id:e.id}; gotDone=true; } } }
+    if(!gotDone) compMsg("The connection ended before the answer finished. Reopen this chat to see what was saved.",true);
+  }catch(e){ compMsg(e.message,true); }
+  paint(); compBusy=false; document.getElementById("compsend").disabled=false; compList();
+}
+document.getElementById("compsend").onclick=compSend;
+document.getElementById("comptext").addEventListener("keydown",e=>{ if(e.key==="Enter"&&!e.shiftKey&&!e.isComposing){ e.preventDefault(); compSend(); } });
+/* images: attach or paste (vision models only) */
+function compAtt(){ document.getElementById("compatt").innerHTML=compImgs.map((u,i)=>`<img src="${esc(u)}" title="Click to remove" onclick="compImgs.splice(${i},1);compAtt()">`).join(""); }
+function compAddFile(f){ if(!f||!f.type.startsWith("image/")||document.getElementById("compimg").disabled) return;
+  if(f.size>8e6) return compMsg("Image over 8 MB.",true);
+  const r=new FileReader(); r.onload=()=>{ if(compImgs.length<4){ compImgs.push(r.result); compAtt(); } }; r.readAsDataURL(f); }
+document.getElementById("compimg").onclick=()=>document.getElementById("compfile").click();
+document.getElementById("compfile").onchange=e=>{ [...e.target.files].forEach(compAddFile); e.target.value=""; };
+document.getElementById("comptext").addEventListener("paste",e=>{ [...(e.clipboardData||{}).files||[]].forEach(compAddFile); });
+/* voice: record, convert to 16 kHz mono WAV, transcribe on the Spark */
+function wav16(f32){ const b=new ArrayBuffer(44+f32.length*2), v=new DataView(b), w=(o,s)=>[...s].forEach((c,i)=>v.setUint8(o+i,c.charCodeAt(0)));
+  w(0,"RIFF"); v.setUint32(4,36+f32.length*2,true); w(8,"WAVE"); w(12,"fmt "); v.setUint32(16,16,true); v.setUint16(20,1,true); v.setUint16(22,1,true);
+  v.setUint32(24,16000,true); v.setUint32(28,32000,true); v.setUint16(32,2,true); v.setUint16(34,16,true); w(36,"data"); v.setUint32(40,f32.length*2,true);
+  for(let i=0;i<f32.length;i++){ const x=Math.max(-1,Math.min(1,f32[i])); v.setInt16(44+i*2,x<0?x*0x8000:x*0x7fff,true); } return b; }
+async function compMic(){
+  const btn=document.getElementById("compmic");
+  if(compRec){ compRec.stop(); return; }
+  if(!window.isSecureContext||!navigator.mediaDevices){ return compMsg(`Voice needs HTTPS. Open Starfleet Command over https (Tailscale serve) to use the microphone.`,true); }
+  let stream; try{ stream=await navigator.mediaDevices.getUserMedia({audio:true}); }catch(e){ return compMsg("Microphone not allowed: "+e.message,true); }
+  const chunks=[]; compRec=new MediaRecorder(stream); btn.classList.add("rec"); btn.textContent="Stop";
+  compRec.ondataavailable=e=>chunks.push(e.data);
+  compRec.onstop=async()=>{ stream.getTracks().forEach(t=>t.stop()); compRec=null; btn.classList.remove("rec"); btn.textContent="Wait...";
+    try{ const ab=await new Blob(chunks).arrayBuffer(), ctx=new (window.AudioContext||window.webkitAudioContext)();
+      const buf=await ctx.decodeAudioData(ab); ctx.close&&ctx.close();
+      const off=new OfflineAudioContext(1,Math.ceil(buf.duration*16000),16000), src=off.createBufferSource(); src.buffer=buf; src.connect(off.destination); src.start();
+      const out=await off.startRendering();
+      const r=await compJSON("/api/computer/transcribe",{method:"POST",headers:{"Content-Type":"audio/wav"},body:wav16(out.getChannelData(0))});
+      const ta=document.getElementById("comptext"); ta.value=(ta.value?ta.value+" ":"")+(r.text||""); ta.focus();
+    }catch(e){ compMsg("Voice: "+e.message,true); }
+    btn.textContent="Voice"; };
+  compRec.start(); compMsg("");
+}
+document.getElementById("compmic").onclick=compMic;
+/* hotkey: any combination with a modifier; opens Computer, focuses the input, starts or stops the microphone */
+const comboOf=e=>[e.ctrlKey&&"Ctrl",e.altKey&&"Alt",e.shiftKey&&"Shift",e.metaKey&&"Cmd"].filter(Boolean).concat(e.code==="Space"?"Space":e.key.length===1?e.key.toUpperCase():e.key).join("+");
+let compCapture=false;
+document.getElementById("comphot").onclick=()=>{ compCapture=true; document.getElementById("comphint").textContent="Press the new key combination (with Ctrl, Alt or Cmd)..."; };
+document.addEventListener("keydown",e=>{
+  if(["Control","Alt","Shift","Meta"].includes(e.key)) return;
+  const c=comboOf(e);
+  if(compCapture){ e.preventDefault(); if(!(e.ctrlKey||e.altKey||e.metaKey)){ return; } compHot=c; LS("computerHotkey",c); compCapture=false; compHint(); return; }
+  if(c!==compHot) return;
+  e.preventDefault(); e.stopPropagation();
+  if(!compOn) setView("comp");
+  document.getElementById("comptext").focus(); compMic();
+},true);
+
 /* ================= views =================
    The rail buttons switch between Starfleet Command and one other page at a time; the address keeps the page. */
-const VIEWS={nas:["nasbtn","Deep Space NAS"],ctr:["ctrbtn","Engineering"],ma:["mabtn","Memory Alpha"],def:["defbtn","Defiant"]};
+const VIEWS={nas:["nasbtn","Deep Space NAS"],ctr:["ctrbtn","Engineering"],ma:["mabtn","Memory Alpha"],def:["defbtn","Defiant"],comp:["compbtn","Computer"],wiki:["wikibtn","Memory Core"]};
 var view="";
 function setView(v){
   if(v===view) v="";
   view=v;
   for(const [k,[b,l]] of Object.entries(VIEWS)){
     document.body.classList.toggle(k,k===v); document.getElementById(b).textContent=k===v?"Starfleet Command":l; }
-  nasOn=v==="nas"; ctrOn=v==="ctr"; maOn=v==="ma"; defOn=v==="def";
+  nasOn=v==="nas"; ctrOn=v==="ctr"; maOn=v==="ma"; defOn=v==="def"; compOn=v==="comp";
   try{ history.replaceState(null,"",v?"#"+v:"#"+(filter==="all"?"":filter)); }catch(e){}
   if(nasOn){ nasFit(); nasPoll(); } else clearTimeout(nasTimer);
   if(ctrOn) ctrPoll(); else clearTimeout(ctrTimer);
   if(maOn) maPoll(); else clearTimeout(maTimer);
   if(defOn) defPoll(); else clearTimeout(defTimer);
+  if(compOn) compOpen();
+  if(v==="wiki"){ if(window.wikiOpen) wikiOpen(); } else if(window.wikiClose) wikiClose();   /* vendor/memcore.js */
 }
 Object.entries(VIEWS).forEach(([k,[b]])=>document.getElementById(b).addEventListener("click",()=>setView(k)));
 if(wantView) setView(wantView);
@@ -1661,4 +1944,5 @@ if(wantView) setView(wantView);
     e.preventDefault(); toggle();
   });
 })();
-</script></body></html>
+</script>
+<script src="/vendor/memcore.js"></script></body></html>
