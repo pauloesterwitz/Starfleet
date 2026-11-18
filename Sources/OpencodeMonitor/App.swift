@@ -15,6 +15,7 @@ struct StarfleetCommandApp: App {
         // (not per-StatusPoller) now that there are two of them.
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
         ComputerHotKey.register()
+        SelfUpdate.atLaunch()
         let jeanLuc = StatusPoller(host: "jean-luc", label: "Jean-Luc")
         let kathryn = StatusPoller(host: "kathryn", label: "Kathryn")
         _jeanLuc = StateObject(wrappedValue: jeanLuc)
@@ -69,5 +70,24 @@ struct StarfleetCommandApp: App {
                 .frame(minWidth: 960, minHeight: 640)
         }
         .windowStyle(.hiddenTitleBar)
+    }
+}
+
+/// Updates itself at every start. package.sh stamps the clone this build came from into the
+/// bundle (Resources/repo-path); that clone's update.sh fast-forwards main from origin,
+/// rebuilds and relaunches this app when its sources changed, and reinstalls the iPhone app
+/// when ios/ changed. Runs on its own, in the background; it logs to
+/// ~/Library/Logs/Starfleet Command update.log. A `swift run` build has no stamp: no update.
+enum SelfUpdate {
+    static func atLaunch() {
+        guard Bundle.main.bundlePath.hasSuffix(".app"),
+              let stamp = Bundle.main.url(forResource: "repo-path", withExtension: nil),
+              let repo = try? String(contentsOf: stamp, encoding: .utf8)
+                  .trimmingCharacters(in: .whitespacesAndNewlines)
+        else { return }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: repo).appendingPathComponent("update.sh")
+        process.arguments = [Bundle.main.bundlePath, String(ProcessInfo.processInfo.processIdentifier)]
+        try? process.run()
     }
 }

@@ -1450,6 +1450,27 @@ it into the gitignored `ios/Local.xcconfig`, which `ios/Starfleet.xcconfig` incl
 cd ios && grep -m1 -o 'DEVELOPMENT_TEAM = [A-Z0-9]*' Starfleet.xcodeproj/project.pbxproj > Local.xcconfig && git checkout Starfleet.xcodeproj/project.pbxproj
 ```
 
+### Updates, at every start of the Mac app
+
+Build and install by hand once; after that the Mac app updates both apps itself. At
+every start it runs [`update.sh`](update.sh) from the clone it was built from
+(`package.sh` stamps that path and the commit into the bundle), in the background:
+
+1. `main` is fast-forwarded from `origin`. Never a merge; a clone on another branch, or
+   with local commits, is left alone.
+2. **iPhone**: when `ios/` changed since the last install, the app is built with
+   `xcodebuild` and installed on the paired iPhone with `devicectl`, over the cable or
+   Wi-Fi. An iOS app cannot replace itself, so the Mac does it. Needs
+   `ios/Local.xcconfig` (see above) and the iPhone paired with Xcode once; when no
+   iPhone is reachable, the next start tries again.
+3. **Mac**: when the app's sources changed since the running build, `package.sh`
+   rebuilds it, and the app quits, is swapped for the new bundle and opens again.
+
+The page itself needs none of this: Fleet serves it fresh. The log is
+`~/Library/Logs/Starfleet Command update.log`. The first signed `xcodebuild` may ask once
+for keychain access to your signing key: Always Allow. Whatever is on `main` gets built
+and run at the next start, so only push there what you would run.
+
 ### 7. Fleet and the cluster tooling
 
 Fleet runs on the head node: see [Setup](#setup). The llama-swap config, launchers,
@@ -1474,6 +1495,7 @@ Sources/OpencodeMonitor/   the app (the directory keeps the project's original n
   DesktopWidget*.swift      floating panel
   Panel*.swift, GPUStream.swift   the optional USB panel: driver, controller, streamed GPU figures
 ios/                       the iPhone app: Starfleet.xcodeproj, Starfleet/StarfleetApp.swift, the icon
+package.sh, update.sh      build the Mac app; the self-update both apps get at every start of the Mac app
 cluster/                   the cluster's configuration and tooling: the llama-swap config and
                             launchers, the memory guard (memcheck.sh and friends), the context proxy
                             that also gates every load, the status scripts the app runs over ssh,

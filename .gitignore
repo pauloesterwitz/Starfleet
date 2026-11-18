@@ -38,3 +38,4 @@ fleet-ui/ds9.jpg
 !ios/Starfleet.xcodeproj/
 xcuserdata/
 ios/Local.xcconfig
+ios/build/

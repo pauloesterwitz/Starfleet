@@ -35,6 +35,10 @@ cp assets/app-icon.icns "$APP/Contents/Resources/app-icon.icns"
 # Stamp the contract this build speaks into the bundle, so upload_theme.py can refuse
 # to flash a theme this app would drive wrong. Before codesign: it is a sealed resource.
 python3 panel-theme/panel_contract.py stamp "$APP/Contents/Resources/panel-contract.json"
+# Where this build came from, for the self-update at every start (update.sh): the clone's
+# path and the commit. Also before codesign.
+pwd > "$APP/Contents/Resources/repo-path"
+git rev-parse HEAD > "$APP/Contents/Resources/build-commit"
 codesign --force --sign - "$APP" >/dev/null
 
 echo "Built $APP. Move it to /Applications (or ~/Applications) and open it,"
