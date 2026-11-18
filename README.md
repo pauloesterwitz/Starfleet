@@ -684,20 +684,36 @@ saved even when an answer fails or the browser goes away.
 ### Memory Core: the wiki as a map
 
 <p align="center">
-  <img src="docs/images/memory-core.png" width="820" alt="Memory Core: the wiki drawn as rings of ticks by page type around a core, with Computer's course through it highlighted, the sessions and most consulted pages on the left and a page detail and access log on the right">
-  <br><sub><b>Memory Core</b>: the wiki as rings by page type; Computer's course (search hits, relation hops, numbered reads, cited pages) and its access log. Example data.</sub>
+  <img src="docs/images/memory-core.png" width="820" alt="Memory Core: the wiki as a network of coloured dots joined by links, with a Computer session drawn on top (search-term pills wired to the pages they matched, numbered reads, cited pages); sessions, search terms and most consulted pages on the left, the access log on the right and the replay bar under the map">
+  <br><sub><b>Memory Core</b>: the wiki as a zoomable network; a Computer session as search terms, hits, relation hops, numbered reads and cited pages, with the access log and the replay bar. Example data.</sub>
 </p>
 
-Memory Core draws the LLM wiki as the ship's memory core: one ring per page type
-(other, concepts, entities, sources, from the centre out), each page a tick whose length
-is its inbound link weight, with linked pages placed close together. A Computer chat
-that used the wiki is drawn on top as its course: the searches, the related-page hops,
-the pages read (numbered) and the pages the answer cited.
+Memory Core draws the LLM wiki as a map you can zoom and move: every page is a dot
+(colour = page type, size = inbound link weight), every wiki link a line (colour =
+relation). In the **Network** layout a force simulation pulls linked pages together, so
+clusters are topics; it settles once and the browser keeps it, so pages stay where they
+were. The **Core** layout is the ship's memory core: one ring per page type (other,
+concepts, entities, sources, from the centre out). Wheel, pinch or the buttons zoom,
+dragging moves the map, and page names appear as you zoom in.
+
+- **Connections.** Hover a page for its links, click it for its neighbourhood,
+  double-click to zoom to it, Shift-click a second page (or **Path to…**) for the
+  shortest chain of links between the two.
+- **Term probe.** Type terms: each becomes a pill wired to the pages whose title, tags
+  or summary contain it. Pages that several terms share are the bridges between them.
+- **Computer.** A chat that used the wiki is drawn as its search: term pills to the
+  pages they matched, dashed lines to pages reached over a relation, dotted lines to
+  full-text hits, the pages read (numbered) and the pages the answer cited. The bar
+  under the map replays it step by step with the camera following, and counts
+  searches, hits, reads and cited pages. A web search refused after a wiki read shows
+  as **Locked**.
 
 It is read-only. [`wikicore.py`](fleet-ui) exports the graph with the wiki MCP server's
 own link scanner, run inside its container with `docker exec` (`FLEET_WIKI_CONTAINER`),
 so the map shows exactly the relations Computer's `wiki_search` and `wiki_related`
-follow; an export is reused for 10 minutes. The courses come from Computer's chat files.
+follow; an export is reused for 10 minutes. While that container is stopped, a one-shot
+read-only, offline run of its image reads the wiki instead, and the last good map is
+kept on disk. The courses come from Computer's chat files.
 Both calls need the Starfleet key, like the rest of Computer.
 
 | Call | Body | Does |
