@@ -245,6 +245,75 @@ td .sub{margin-top:3px;font-size:11px;color:var(--dim);line-height:1.35}
 #adov.shake .bd{animation:adshake .3s}
 @keyframes adshake{25%{transform:translateX(-8px)}75%{transform:translateX(8px)}}
 .empty{color:var(--dim);font-size:14px;padding:14px 10px;text-transform:uppercase}
+
+/* ---- Deep Space NAS view: a second page in the same frame; the rail button swaps which one shows ---- */
+body.nas .main:not(#nasview), body:not(.nas) #nasview{display:none}
+body.ctr .main:not(#ctrview), body:not(.ctr) #ctrview{display:none}
+/* ---- Main Engineering: running containers on both Sparks, stop one to free memory ---- */
+#ctrmsg{display:none;background:#2a0d0d;color:var(--red);border-left:8px solid var(--red);padding:6px 14px;
+  font-size:13px;text-transform:uppercase;margin-top:6px}
+#ctrview td .sub{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:340px}
+#ctrview .num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+#ctrview th.num{text-align:right}
+.tag.k-gpu{background:var(--magenta)} .tag.k-session{background:var(--blue)} .tag.k-service{background:var(--amber)}
+.idle-long{color:var(--amber)} .idle-act{color:var(--blue)}
+#nasview{grid-column:2;min-width:0}
+#nasmsg{display:none;background:#2a0d0d;color:var(--red);border-left:8px solid var(--red);padding:6px 14px;
+  font-size:13px;text-transform:uppercase;margin-top:6px}
+/* The station is a fixed 1200x864 stage that nasFit() scales (text included) to the free window, so the whole
+   view always fits one page; the -/Fit/+ buttons in the header multiply that scale. */
+/* hardware KPIs: one panel in the free top-left corner of the stage, same segmented gauge as the node panels */
+.hw{position:absolute;left:10px;top:8px;width:380px;background:#0b0803;border-left:8px solid var(--orange);padding:6px 12px 8px}
+.hw h3{margin:0 0 3px;font-size:19px;font-weight:700;text-transform:uppercase;color:var(--orange);
+  display:flex;justify-content:space-between;align-items:baseline;gap:8px}
+.hw h3 small{font-size:12px;font-weight:600;color:var(--dim)}
+.kp{display:grid;grid-template-columns:50px 1fr 132px;align-items:center;gap:8px;padding:4px 0 3px;border-top:1px solid var(--grid)}
+.kp b{font-size:13px;font-weight:600;color:var(--dim);text-transform:uppercase;letter-spacing:.08em}
+.kp .v{font-size:16px;font-weight:700;color:var(--peach);text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}
+.kp .gauge{margin:0;height:12px}
+.kp.warn .gauge i.on{background:var(--amber)} .kp.crit .gauge i.on{background:var(--red)}
+.kp.warn .v{color:var(--amber)} .kp.crit .v{color:var(--red)}
+.hw .ft{border-top:1px solid var(--grid);padding-top:3px;font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.06em}
+#fitbox{position:relative;margin:8px auto 0}
+.ds9{position:absolute;left:0;top:0;width:1200px;height:864px;transform-origin:0 0}
+.zb{margin:0 6px 0 0;height:24px;min-width:30px;background:#000;color:#fff;border:1px solid #fff4;border-radius:12px;
+  padding:0 10px;font:inherit;font-size:14px;font-weight:700;cursor:pointer}
+.zb:hover{border-color:var(--blue);color:var(--blue)}
+#core{position:absolute;left:0;top:0;width:1200px;height:864px}
+#core>svg{position:absolute;inset:0;width:100%;height:100%}
+#pylons{position:absolute;inset:0}
+.pyl{position:absolute;width:29%;transform:translate(-50%,-50%);background:#0b0803;
+  border-left:8px solid var(--blue);padding:6px 12px 8px;box-shadow:0 0 0 2px #000}
+.pyl.warn{border-left-color:var(--amber)} .pyl.crit{border-left-color:var(--red)}
+.pyl h3{margin:0 0 3px;font-size:19px;font-weight:700;text-transform:uppercase;color:var(--blue);
+  display:flex;justify-content:space-between;align-items:baseline;gap:8px}
+.pyl.warn h3{color:var(--amber)} .pyl.crit h3{color:var(--red)}
+.pyl h3 small{font-size:12px;font-weight:600;color:var(--dim)}
+.cn{display:flex;align-items:center;gap:8px;padding:5px 0 4px;border-top:1px solid var(--grid)}
+.cn i{width:11px;height:11px;border-radius:50%;flex:none;background:#665}
+.cn.ok i{background:#6c6} .cn.warn i{background:var(--amber)} .cn.bad i{background:var(--red)}
+.cn .tx{flex:1;min-width:0;line-height:1.15}
+.cn .nm{display:block;font-size:15px;font-weight:600;color:var(--peach);text-transform:uppercase;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cn .sub{display:block;font-size:11px;color:var(--dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.nb{font-family:var(--lcars);font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;
+  border:0;border-radius:9px;padding:3px 10px;cursor:pointer;background:var(--grid);color:var(--text)}
+.nb.go{background:var(--blue);color:#000} .nb.stop{background:var(--red);color:#000}
+.nb:disabled{opacity:.4;cursor:default}
+.pyl .free{padding:10px 0;color:var(--dim)}
+.pyl.ovf{transform:none;width:348px}   /* overflow project: column beside the station, no pylon */
+
+/* ---- full screen (browser Fullscreen API, F key or the corner button; Esc leaves). body.fs is set from
+   fullscreenchange, so the layout below only applies while the browser really is full screen. ---- */
+#fsbtn{position:fixed;top:14px;right:14px;z-index:50;height:24px;background:#000;color:#fff;border:1px solid #fff4;
+  border-radius:12px;padding:0 12px;font:inherit;font-size:13px;font-weight:600;text-transform:uppercase;cursor:pointer}
+#fsbtn:hover{border-color:var(--blue);color:var(--blue)}
+body.fs .rail, body.fs .top{display:none}
+body.fs .frame{grid-template-columns:1fr}
+body.fs #nasview{grid-column:1}
+body.fs .main{padding-top:24px}
+body.fs th{position:sticky;top:0;background:var(--ink);z-index:1}
+html.fs{scrollbar-width:none} html.fs::-webkit-scrollbar{display:none}
 </style></head><body>
 <div id="adov"><div class="box">
   <div class="e1"></div><div class="hd" id="adhd">Auto Destruct Sequence</div>
@@ -268,6 +337,7 @@ td .sub{margin-top:3px;font-size:11px;color:var(--dim);line-height:1.35}
   </div>
   <div class="e2"></div><div class="ft"></div>
 </div></div>
+<button id="fsbtn" type="button" title="Full screen (F). Esc leaves." hidden>Full screen</button>
 <div class="frame">
   <div class="rail">
     <div class="blk elbow-t"><div class="n" id="r-mdl">--</div><div class="l">Models</div></div>
@@ -278,6 +348,10 @@ td .sub{margin-top:3px;font-size:11px;color:var(--dim);line-height:1.35}
       style="background:var(--red);border:0;cursor:pointer;font:inherit;text-transform:uppercase;letter-spacing:.08em;font-weight:700;font-size:14px;padding:10px">Red Alert</button>
     <button id="autod" type="button" class="blk" title="Red Alert, then gracefully reboot Kathryn and Jean-Luc"
       style="background:#5a0000;color:#fff;border:0;cursor:pointer;font:inherit;text-transform:uppercase;letter-spacing:.08em;font-weight:700;font-size:14px;padding:10px">Auto Destruct</button>
+    <button id="nasbtn" type="button" class="blk c3" title="Container overview of the Synology NAS (Container Manager). Separate from model loading."
+      style="border:0;cursor:pointer;font:inherit;text-transform:uppercase;letter-spacing:.08em;font-weight:700;font-size:14px;padding:10px">Deep Space NAS</button>
+    <button id="ctrbtn" type="button" class="blk c4" title="Running containers on Jean-Luc and Kathryn: memory, start time, owner, idle time. Stop one to free memory."
+      style="border:0;cursor:pointer;font:inherit;text-transform:uppercase;letter-spacing:.08em;font-weight:700;font-size:14px;padding:10px">Engineering</button>
     <div class="blk fill"></div>
     <div class="blk elbow-b"><div class="n" id="r-free">--</div><div class="l">GB Free</div></div>
   </div>
@@ -316,6 +390,26 @@ td .sub{margin-top:3px;font-size:11px;color:var(--dim);line-height:1.35}
       <tbody id="rows"></tbody></table>
 
   </div>
+
+  <div class="main" id="nasview">
+    <div class="top">
+      <div class="title">Deep Space <span>NAS</span></div>
+      <div class="bar"><button class="zb" id="nzo" type="button" title="Zoom out">&minus;</button><button class="zb" id="nzf" type="button" title="Fit the whole station to the window">Fit</button><button class="zb" id="nzi" type="button" title="Zoom in">+</button><span id="nasmeta">--</span></div>
+    </div>
+    <div id="nasmsg"></div>
+    <div class="sec"><div class="cap"></div><h2>Container Manager</h2><div class="rule"></div></div>
+    <div id="fitbox"><div class="ds9" id="ds9"><div id="core"><svg id="ds9svg" viewBox="0 0 1000 720" role="img" aria-label="Deep Space Nine (stylised drawing)"></svg>
+      <div id="pylons"></div><div class="hw" id="hw"></div></div><div id="ovf"></div></div></div>
+  </div>
+
+  <div class="main" id="ctrview">
+    <div class="top">
+      <div class="title">Main <span>Engineering</span></div>
+      <div class="bar"><span id="ctrmeta">--</span></div>
+    </div>
+    <div id="ctrmsg"></div>
+    <div id="ctrnodes"></div>
+  </div>
 </div>
 
 <script>
@@ -343,6 +437,7 @@ const gb=kb=>(kb/1048576).toFixed(1);
 const busy=new Set();
 const FILTERS=["all","jean-luc","kathryn","starfleet","dynamic","live","pinned","vision","embed","rerank","image"];
 /* the hash makes a view bookmarkable — open #kathryn to land straight on her models */
+const wantNas=location.hash==="#nas", wantCtr=location.hash==="#ctr";   /* read before setFilter() below rewrites the hash; opens the Deep Space NAS view */
 let filter=FILTERS.includes(location.hash.slice(1))?location.hash.slice(1):"all";
 let query="", last={nodes:{},models:[],running:[],pins:[],errors:{},loading:[]};
 /* Date.now() of the poll that produced last.loading, so the bar can tick every
@@ -1053,4 +1148,315 @@ async function refresh(){
   try{ render(await (await fetch("/api/state")).json()); }catch(e){}
 }
 refresh(); setInterval(refresh,3000);
+
+/* ================= Deep Space NAS =================
+   Containers of the Synology Container Manager, grouped by compose project (first word of the
+   container name). Biggest projects dock on the roomiest pylons, unused pylons are not drawn, and projects
+   beyond six stand in columns left and right of the station (the stage widens for them).
+   Start/Stop/Restart go through /api/nas/control -> nas_gate on the NAS. No model is touched. */
+const POS=[[50,12.8],[85,30.8],[85,69.2],[50,87.2],[15,69.2],[15,30.8]];   /* pylon anchors, % of the stage */
+const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+let nasOn=false, nasTimer=null, nasLast=null, nasBusy={};
+
+/* The picture of the station is ~/fleet-ui/ds9.jpg (served as /ds9.jpg, black background so it blends into the page).
+   While that file is missing, a drawn hub stands in; once the photo loads it replaces the drawn hub. */
+(function drawStation(){
+  const C=[500,360], R=118; let s=`<defs>
+    <radialGradient id="glow"><stop offset="0" stop-color="#f90" stop-opacity=".28"/><stop offset="1" stop-color="#f90" stop-opacity="0"/></radialGradient></defs>
+    <circle id="hubglow" cx="500" cy="360" r="215" fill="url(#glow)"/>`;
+  s+=`<g id="arms">`;
+  POS.forEach(([px,py],i)=>{
+    const A=[px*10,py*7.2], dx=A[0]-C[0], dy=A[1]-C[1], L=Math.hypot(dx,dy), d=[dx/L,dy/L], n=[-d[1],d[0]];
+    const k=i%2?1:-1, P0=[C[0]+d[0]*R,C[1]+d[1]*R], Q=[C[0]+dx*.5+n[0]*40*k,C[1]+dy*.5+n[1]*40*k];
+    const col=i%2?"#c9c":"#9cf", t=.55, b=(a,q,z)=>(1-t)*(1-t)*a+2*(1-t)*t*q+t*t*z;
+    s+=`<g class="lnk" data-i="${i}"><path d="M${P0} Q${Q} ${A}" fill="none" stroke="${col}" stroke-width="12" stroke-linecap="round" opacity=".85"/>
+        <path d="M${P0} Q${Q} ${A}" fill="none" stroke="#000" stroke-width="3" stroke-linecap="round" stroke-dasharray="2 12"/>
+        <circle cx="${b(P0[0],Q[0],A[0])}" cy="${b(P0[1],Q[1],A[1])}" r="11" fill="#000" stroke="${col}" stroke-width="4"/></g>`;
+  });
+  s+=`</g><g id="hubring"><circle cx="500" cy="360" r="${R}" fill="#0b0803" stroke="#f96" stroke-width="16"/>
+      <circle cx="500" cy="360" r="${R-26}" fill="none" stroke="#9cf" stroke-width="3"/>
+      <circle cx="500" cy="360" r="${R-40}" fill="none" stroke="#f90" stroke-width="2" stroke-dasharray="3 9"/>
+      <circle cx="500" cy="360" r="46" fill="#fc6"/><circle cx="500" cy="360" r="30" fill="#f90"/></g>
+      <text x="500" y="700" text-anchor="middle" fill="#a4855f" font-size="15" letter-spacing="4">DEEP SPACE NAS</text>`;
+  const svg=document.getElementById("ds9svg"); svg.innerHTML=s;
+  const im=new Image();   /* an <image> with a 404 would show the browser's broken-image icon, so add it only once it loads */
+  im.onload=()=>{
+    ["hubglow","hubring","arms"].forEach(id=>document.getElementById(id).remove());
+    /* 560x423 keeps the photo's 1000x755 ratio. Its black corners may sit under the panels (they are drawn on top).
+       One link per panel runs to a pylon of the real station: TIPS are points in photo pixels, in POS order
+       (top, upper right, lower right, bottom, lower left, upper left). */
+    const X=220, Y=148, K=.56, TIPS=[[443,74],[735,90],[700,520],[430,650],[120,380],[350,75]];
+    let g=`<image href="/ds9.jpg" x="${X}" y="${Y}" width="560" height="423"/>`;
+    POS.forEach(([px,py],i)=>{
+      const T=[X+K*TIPS[i][0],Y+K*TIPS[i][1]], A=[px*10,py*7.2], col=i%2?"#c9c":"#9cf";
+      g+=`<g class="lnk" data-i="${i}"><line x1="${T[0]}" y1="${T[1]}" x2="${A[0]}" y2="${A[1]}" stroke="${col}" stroke-width="3" stroke-dasharray="2 8" stroke-linecap="round" opacity=".9"/>
+          <circle cx="${T[0]}" cy="${T[1]}" r="9" fill="#000" stroke="${col}" stroke-width="3"/></g>`;
+    });
+    svg.insertAdjacentHTML("beforeend",g); nasFit();
+  };
+  im.src="/ds9.jpg";
+})();
+
+function nasKind(c){   /* [css class, label] from Container Manager's State / Status */
+  const st=c.Status||"";
+  if(c.State==="running") return /unhealthy/.test(st)?["bad","unhealthy"]:/starting/.test(st)?["warn","starting"]
+    :["ok",/healthy/.test(st)?"healthy":"running"];
+  if(c.State==="restarting"||c.State==="paused") return ["warn",c.State];
+  if(c.State==="exited"&&/Exited \(0\)/.test(st)) return ["idle","finished"];   /* one-shot jobs (migrate, init) */
+  return ["bad",c.State||"stopped"];
+}
+
+const NAS_SLOT=[2,4,1,5,0,3];   /* pylon fill order, roomiest first: lower right, lower left, upper right, upper left, top, bottom */
+function nasPanel(p,cls,attr){
+  const kinds=p.l.map(nasKind), st=kinds.some(k=>k[0]==="bad")?"crit":kinds.some(k=>k[0]==="warn")?"warn":"";
+  const n=p.l.filter(c=>c.State==="running").length;
+  return `<div class="pyl ${st} ${cls}" ${attr}><h3>${esc(p.t)}<small>${n}/${p.l.length} up</small></h3>`+p.l.map((c,j)=>{
+    const [k,lbl]=kinds[j], on=c.State==="running"||c.State==="restarting", b=nasBusy[c.Names], nm=esc(c.Names);
+    return `<div class="cn ${k}"><i></i><span class="tx"><span class="nm" title="${nm}">${nm}</span>
+      <span class="sub" title="${esc(c.Image)}">${b?esc(b):esc(lbl)} · ${esc(c.Status)}</span></span>
+      ${on?`<button class="nb" ${b?"disabled":""} onclick="nasAct('${nm}','restart')">${nasArmed(c.Names,"restart")?"Sure?":"Restart"}</button>
+            <button class="nb stop" ${b?"disabled":""} onclick="nasAct('${nm}','stop')">${nasArmed(c.Names,"stop")?"Sure?":"Stop"}</button>`
+          :`<button class="nb go" ${b?"disabled":""} onclick="nasAct('${nm}','start')">Start</button>`+
+            (["exited","created","dead"].includes(c.State)
+              ?(NAS_FROZEN.includes(c.Names.split(/[-_]/)[0])
+                ?`<button class="nb stop" disabled title="Frozen project: the gate never deletes it. Delete in DSM Container Manager.">Delete</button>`
+                :`<button class="nb stop" ${b?"disabled":""} title="Remove this stopped container (volumes stay)" onclick="nasAct('${nm}','rm')">${nasArmed(c.Names,"rm")?"Sure?":"Delete"}</button>`):"")}</div>`;
+  }).join("")+`</div>`;
+}
+function nasPaint(){
+  const d=nasLast; if(!d) return;
+  const cs=d.containers||[], g={};
+  cs.forEach(c=>(g[c.Names.split(/[-_]/)[0]]??=[]).push(c));
+  const keys=Object.keys(g).sort((a,b)=>g[b].length-g[a].length||a.localeCompare(b));   /* biggest first, ties by name */
+  const pyl=[]; keys.slice(0,6).forEach((k,i)=>pyl[NAS_SLOT[i]]={t:k,l:g[k]});
+  const up=cs.filter(c=>c.State==="running").length;
+  document.getElementById("nasmeta").textContent=
+    `${up} of ${cs.length} running · synced ${new Date(d.at*1000).toLocaleTimeString()}${d.error?" · STALE":""}`;
+  const msg=document.getElementById("nasmsg");
+  msg.style.display=d.error||nasLast.actionError?"block":"none";
+  msg.textContent=nasLast.actionError||(d.error?"NAS not answering - showing the last list. "+d.error:"");
+  document.getElementById("pylons").innerHTML=POS.map(([x,y],i)=>
+    pyl[i]?nasPanel(pyl[i],"",`id="pyl${i}" data-i="${i}" data-y="${y}" style="left:${x}%;top:${y}%"`):"").join("");
+  document.getElementById("ovf").innerHTML=keys.slice(6).map(k=>nasPanel({t:k,l:g[k]},"ovf","")).join("");
+  nasFit();
+}
+
+/* Place the panels: each side of the station stacks its docked panels without overlap (the left side starts below
+   the hardware panel), link lines follow their panel, and overflow panels fill columns outward, right then left. */
+let nasW=1200;
+function nasLayout(){
+  const H=864, GAP=10, CW=348+16, hw=document.getElementById("hw");
+  const stack=(ids,minTop)=>{
+    let prev=minTop;
+    const box=ids.map(i=>document.getElementById("pyl"+i)).filter(Boolean).map(el=>{
+      const h=el.offsetHeight, t=Math.max(+el.dataset.y/100*H-h/2,prev); prev=t+h+GAP; return [el,t,h]; });
+    let next=H; for(let k=box.length-1;k>=0;k--){ box[k][1]=Math.min(box[k][1],next-box[k][2]); next=box[k][1]-GAP; }
+    box.forEach(([el,t,h])=>{ el.style.top=t+h/2+"px";
+      const ln=document.querySelector(`#ds9svg .lnk[data-i="${el.dataset.i}"] line`); if(ln) ln.setAttribute("y2",(t+h/2)/1.2); });
+  };
+  stack([5,4],hw.offsetHeight?hw.offsetTop+hw.offsetHeight+GAP:0); stack([1,2],0); stack([0],0); stack([3],0);
+  document.querySelectorAll("#ds9svg .lnk").forEach(g=>g.style.display=document.getElementById("pyl"+g.dataset.i)?"":"none");
+  const col=[{n:0,y:0,used:0},{n:0,y:0,used:0}], at=[];   /* side 0 = right, 1 = left */
+  document.querySelectorAll("#ovf .pyl").forEach((el,k)=>{
+    const s=col[k%2], h=el.offsetHeight; if(s.y&&s.y+h>H){ s.n++; s.y=0; }
+    at.push([el,k%2,s.n,s.y]); s.y+=h+GAP; s.used=1; });
+  const nR=col[0].used&&col[0].n+1, nL=col[1].used&&col[1].n+1, L=nL*CW;
+  at.forEach(([el,side,n,y])=>{ el.style.left=(side?L-(n+1)*CW:L+1200+16+n*CW)+"px"; el.style.top=y+"px"; });
+  document.getElementById("core").style.left=L+"px";
+  nasW=1200+(nL+nR)*CW; document.getElementById("ds9").style.width=nasW+"px";
+}
+
+/* Scale the stage (1200x864, wider by the overflow columns) to the free window (fit), times the user's zoom. Browser zoom alone cannot do
+   this in fit mode (the stage re-fits), hence the buttons; the factor is kept in this browser. */
+let nasZoom=1; try{ nasZoom=+localStorage.getItem("nasZoom")||1; }catch(e){}
+function nasFit(){
+  if(!nasOn) return;
+  nasLayout();
+  const box=document.getElementById("fitbox"), top=box.getBoundingClientRect().top+scrollY;
+  const s=Math.max(.2,Math.min(document.getElementById("nasview").clientWidth/nasW,(innerHeight-top-12)/864))*nasZoom;
+  document.getElementById("ds9").style.transform=`scale(${s})`;
+  box.style.width=nasW*s+"px"; box.style.height=864*s+"px";
+}
+function nasSetZoom(z){
+  nasZoom=Math.min(3,Math.max(.4,z)); try{ localStorage.setItem("nasZoom",nasZoom); }catch(e){}
+  nasFit();
+}
+document.getElementById("nzi").onclick=()=>nasSetZoom(nasZoom*1.15);
+document.getElementById("nzo").onclick=()=>nasSetZoom(nasZoom/1.15);
+document.getElementById("nzf").onclick=()=>nasSetZoom(1);
+addEventListener("resize",nasFit);
+if(document.fonts) document.fonts.ready.then(nasFit);   /* the header height changes once Antonio loads */
+
+/* Hardware panel: numbers from the gate's `stats` verb (CPU, RAM, hottest sensor, physical NIC rates). */
+let nasStats=null;
+const hwGauge=p=>{ const on=Math.max(0,Math.min(20,Math.round(p/5)));
+  return `<div class="gauge">${"<i class=\"on\"></i>".repeat(on)+"<i></i>".repeat(20-on)}</div>`; };
+const hwRate=b=>b>=1e6?(b/1e6).toFixed(1)+" MB/s":(b/1e3).toFixed(0)+" kB/s";
+function nasPaintHw(){
+  const d=nasStats, el=document.getElementById("hw"), s=d&&d.stats;
+  if(!s){ el.innerHTML=`<h3>Hardware<small>no data</small></h3><div class="ft">${esc(d&&d.error||"waiting for the NAS")}</div>`; return; }
+  const ramP=100*s.mem_used_mb/s.mem_total_mb, hot=s.temps.reduce((m,t)=>t.c>m?t.c:m,-Infinity);
+  const netP=100*Math.max(s.net_rx_bps,s.net_tx_bps)/125e6;      /* of one 1 GbE link */
+  const mb=Math.max(s.net_rx_bps,s.net_tx_bps)>=1e6, nf=b=>mb?(b/1e6).toFixed(1):(b/1e3).toFixed(0);
+  const lvl=(p,w,c)=>p>=c?"crit":p>=w?"warn":"";
+  const row=(l,p,v,cls,tip)=>`<div class="kp ${cls}" title="${esc(tip||"")}"><b>${l}</b>${hwGauge(p)}<span class="v">${v}</span></div>`;
+  const up=s.uptime_s, ut=up>=86400?Math.floor(up/86400)+"d "+Math.floor(up%86400/3600)+"h":Math.floor(up/3600)+"h "+Math.floor(up%3600/60)+"m";
+  el.innerHTML=`<h3>Hardware<small>${d.error?"STALE · ":""}${esc(new Date(d.at*1000).toLocaleTimeString())}</small></h3>`+
+    row("CPU",s.cpu_pct,s.cpu_pct.toFixed(0)+" %",lvl(s.cpu_pct,70,90),`${s.cores} cores · load ${s.load.join(" ")}`)+
+    row("RAM",ramP,(s.mem_used_mb/1024).toFixed(1)+" / "+(s.mem_total_mb/1024).toFixed(1)+" GB",lvl(ramP,80,92),
+        `swap used ${s.swap_used_mb} MB`)+
+    (isFinite(hot)?row("Temp",hot,hot.toFixed(0)+" °C",lvl(hot,65,80),s.temps.map(t=>`${t.label} ${t.c} °C`).join("\n"))
+                  :row("Temp",0,"n/a","","the NAS shows no temperature sensor to the gate user"))+
+    row("Net",netP,`&darr;${nf(s.net_rx_bps)} &uarr;${nf(s.net_tx_bps)} ${mb?"MB/s":"kB/s"}`,"",
+        Object.entries(s.nics).map(([n,r])=>`${n} ↓${hwRate(r[0])} ↑${hwRate(r[1])}`).join("\n"))+
+    `<div class="ft">load ${s.load[0]} · up ${ut} · ${s.disk.free_gb} of ${s.disk.total_gb} GB free</div>`;
+}
+
+async function nasPoll(){
+  clearTimeout(nasTimer);
+  if(!nasOn) return;
+  fetch("/api/nas/stats").then(r=>r.json()).then(d=>{ nasStats=d; nasPaintHw(); }).catch(()=>{});   /* runs beside the container list */
+  try{ const keep=nasLast&&nasLast.actionError; nasLast=await (await fetch("/api/nas")).json(); if(keep) nasLast.actionError=keep; nasPaint(); }
+  catch(e){ if(nasLast){ nasLast.error=String(e); nasPaint(); } }
+  nasTimer=setTimeout(nasPoll,10000);
+}
+
+/* Two-click confirm instead of confirm(): dialogs are blocked in some embedded browsers and then every Stop/Delete silently did nothing. */
+const NAS_FROZEN=["kopia"];   /* same list as FROZEN in nas_gate.py */
+let nasArm=null, nasArmT=0;
+const nasArmed=(n,a)=>nasArm&&nasArm.n===n&&nasArm.a===a;
+async function nasAct(name,action){
+  if(action!=="start"&&!nasArmed(name,action)){
+    nasArm={n:name,a:action}; clearTimeout(nasArmT); nasArmT=setTimeout(()=>{ nasArm=null; nasPaint(); },4000);
+    nasPaint(); return;                     /* first click: button turns into "Sure?" for 4 s */
+  }
+  clearTimeout(nasArmT); nasArm=null;
+  nasBusy[name]={start:"starting...",stop:"stopping...",restart:"restarting...",rm:"deleting..."}[action]; nasPaint();
+  try{
+    const r=await fetch("/api/nas/control",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({target:name,action})});
+    const j=await r.json();
+    if(!r.ok) throw new Error(j.error||("HTTP "+r.status));
+    if(nasLast) nasLast.actionError="";
+  }catch(e){ if(nasLast) nasLast.actionError=`${action} ${name} failed: ${e.message}`; }
+  delete nasBusy[name]; nasPoll();
+}
+
+function nasToggle(on){
+  if(on&&ctrOn) ctrToggle(false);
+  nasOn=on; document.body.classList.toggle("nas",on);
+  document.getElementById("nasbtn").textContent=on?"Starfleet Command":"Deep Space NAS";
+  try{ history.replaceState(null,"",on?"#nas":"#"+(filter==="all"?"":filter)); }catch(e){}
+  if(on){ nasFit(); nasPoll(); } else clearTimeout(nasTimer);
+}
+document.getElementById("nasbtn").addEventListener("click",()=>nasToggle(!nasOn));
+if(wantNas) nasToggle(true);
+
+/* ================= Main Engineering =================
+   Running containers on both Sparks from /api/containers (a read-only probe per node, refreshed every 30 s by
+   the server). RAM = cgroup memory like `docker stats`; GPU = nvidia-smi memory of the container's processes.
+   Idle = how long the Claude Code / opencode session that owns it has been inactive, else how long the
+   container has used no CPU (counted since the Fleet service started, hence "≥"). Stop needs the Starfleet
+   key and a second click; model servers are not stopped here (Unload them in the Model Registry). */
+var ctrOn=false;
+let ctrTimer=null, ctrLast=null, ctrArm=null, ctrArmT=null, ctrBusy={};
+const ctrMB=m=>m==null?"–":m>=1024?(m/1024).toFixed(1)+" GB":m+" MB";
+const ctrDur=s=>s==null?"–":s<90?Math.round(s)+" s":s<5400?Math.round(s/60)+" min":s<172800?(s/3600).toFixed(s<36000?1:0)+" h":Math.round(s/86400)+" d";
+const CTR_KIND={gpu:"Model",session:"Session",service:"Service"};
+function ctrIdle(c){
+  if(c.session_idle_s!=null) return `<span class="${c.session_idle_s>86400?"idle-long":""}" title="Owning session last active ${ctrDur(c.session_idle_s)} ago">session ${ctrDur(c.session_idle_s)}</span>`;
+  if(c.cpu_idle_s==null) return "–";
+  if(c.cpu_idle_s<60&&!c.cpu_idle_ge) return `<span class="idle-act" title="Used CPU in the last minute">active</span>`;
+  return `<span class="${c.cpu_idle_s>86400?"idle-long":""}" title="No CPU use for this long${c.cpu_idle_ge?" (at least: counted since Fleet started watching)":""}">${c.cpu_idle_ge?"≥ ":""}${ctrDur(c.cpu_idle_s)}</span>`;
+}
+function ctrPaint(){
+  const d=ctrLast; if(!d) return;
+  const cs=d.containers||[], errs=d.errors||{}, now=Date.now()/1000;
+  document.getElementById("ctrmeta").textContent=`${cs.length} running · synced ${new Date(d.at*1000).toLocaleTimeString()}`;
+  const msg=document.getElementById("ctrmsg"), m=d.actionError||Object.entries(errs).map(([n,e])=>`${n} not answering - showing the last list. ${e}`).join(" · ");
+  msg.style.display=m?"block":"none"; msg.textContent=m||"";
+  document.getElementById("ctrnodes").innerHTML=["jean-luc","kathryn"].map(node=>{
+    const rows=cs.filter(c=>c.node===node), sum=k=>rows.reduce((a,c)=>a+(c[k]||0),0);
+    const title=node==="jean-luc"?"Jean-Luc":"Kathryn";
+    return `<div class="sec"><div class="cap"></div><h2>${title} · ${rows.length} running · ${ctrMB(sum("ram_mb"))} RAM · ${ctrMB(sum("gpu_mb"))} GPU</h2><div class="rule"></div></div>
+    <table><thead><tr><th>Container</th><th>Kind</th><th class="num">RAM</th><th class="num">GPU</th><th>Started</th>
+      <th>Launched by</th><th>Idle</th><th class="act"></th></tr></thead><tbody>`+(rows.length?rows.map(c=>{
+      const k=node+"/"+c.name, armed=ctrArm===k, b=ctrBusy[k], nm=esc(c.name);
+      const started=c.started?`<span title="${esc(new Date(c.started*1000).toLocaleString())}">${ctrDur(now-c.started)} ago</span>`:"–";
+      const btn=c.stoppable
+        ?`<button class="unl" ${b?"disabled":""} onclick="ctrStop('${node}','${nm}')">${b?"Stopping...":armed?"Sure?":"Stop"}</button>`
+        :`<button disabled title="Model server: unload it in the Model Registry (Starfleet Command), not here">Model</button>`;
+      return `<tr class="${c.kind==="gpu"?"pinned":""}"><td><div class="mid">${nm}</div><div class="sub" title="${esc(c.image)}">${esc(c.image)}</div></td>
+        <td><span class="tag k-${c.kind}">${CTR_KIND[c.kind]||c.kind}</span></td>
+        <td class="num">${ctrMB(c.ram_mb)}</td><td class="num">${ctrMB(c.gpu_mb)}</td><td>${started}</td>
+        <td>${esc(c.owner)}</td><td>${ctrIdle(c)}</td><td class="act">${btn}</td></tr>`;
+    }).join(""):`<tr><td colspan="8" class="empty">No running containers</td></tr>`)+`</tbody></table>`;
+  }).join("");
+}
+async function ctrPoll(){
+  clearTimeout(ctrTimer);
+  if(!ctrOn) return;
+  try{ const keep=ctrLast&&ctrLast.actionError; ctrLast=await (await fetch("/api/containers")).json(); if(keep) ctrLast.actionError=keep; ctrPaint(); }
+  catch(e){ if(ctrLast){ ctrLast.actionError="Fleet not answering: "+e; ctrPaint(); } }
+  ctrTimer=setTimeout(ctrPoll,10000);
+}
+async function ctrStop(node,name){
+  const k=node+"/"+name;
+  if(ctrArm!==k){   /* first click: the button turns into "Sure?" for 4 s */
+    ctrArm=k; clearTimeout(ctrArmT); ctrArmT=setTimeout(()=>{ ctrArm=null; ctrPaint(); },4000); ctrPaint(); return;
+  }
+  ctrArm=null; ctrBusy[k]=1; if(ctrLast) ctrLast.actionError=""; ctrPaint();
+  try{
+    const r=await fetch("/api/containers/stop",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({node,name})});
+    const j=await r.json();
+    if(r.status===403) throw new Error("Starfleet key missing or wrong (enter it on the Starfleet Command page, Save key)");
+    if(!r.ok) throw new Error(j.error||("HTTP "+r.status));
+  }catch(e){ if(ctrLast) ctrLast.actionError=`Stop ${name} on ${node} failed: ${e.message}`; }
+  delete ctrBusy[k]; ctrPoll();
+}
+function ctrToggle(on){
+  if(on&&nasOn) nasToggle(false);
+  ctrOn=on; document.body.classList.toggle("ctr",on);
+  document.getElementById("ctrbtn").textContent=on?"Starfleet Command":"Engineering";
+  try{ history.replaceState(null,"",on?"#ctr":"#"+(filter==="all"?"":filter)); }catch(e){}
+  if(on) ctrPoll(); else clearTimeout(ctrTimer);
+}
+document.getElementById("ctrbtn").addEventListener("click",()=>ctrToggle(!ctrOn));
+if(wantCtr) ctrToggle(true);
+
+/* Full screen: the whole display, not just a bigger panel. Safari before 16.4 only has the webkit-prefixed API.
+   Where the request is refused or silently ignored (the Starfleet Command Mac app's WKWebView without
+   isElementFullscreenEnabled, iPhone Safari), the same layout fills the window instead ("pseudo"); Esc leaves it too. */
+(()=>{
+  const d=document, el=d.documentElement, btn=d.getElementById("fsbtn");
+  const fsEl=()=>d.fullscreenElement||d.webkitFullscreenElement;
+  let pseudo=false;
+  btn.hidden=false;
+  const show=on=>{
+    d.body.classList.toggle("fs",on); el.classList.toggle("fs",on);
+    btn.textContent=on?"Exit full screen":"Full screen";
+    nasFit();
+  };
+  const fallback=()=>{ if(!fsEl()&&!pseudo){ pseudo=true; show(true); } };
+  const toggle=()=>{
+    if(fsEl()) return (d.exitFullscreen||d.webkitExitFullscreen).call(d);
+    if(pseudo){ pseudo=false; return show(false); }
+    const req=el.requestFullscreen||el.webkitRequestFullscreen;
+    if(!req||!(d.fullscreenEnabled||d.webkitFullscreenEnabled)) return fallback();
+    let p; try{ p=req.call(el); }catch(e){ return fallback(); }
+    if(p&&p.catch) p.catch(e=>{ console.warn("fullscreen:",e.message); fallback(); });
+    setTimeout(fallback,900);   /* ignored without an error: no fullscreenchange within the animation time */
+  };
+  const sync=()=>{ pseudo=false; show(!!fsEl()); };
+  btn.addEventListener("click",toggle);
+  d.addEventListener("fullscreenchange",sync); d.addEventListener("webkitfullscreenchange",sync);
+  d.addEventListener("keydown",e=>{
+    const t=e.target;
+    if(t.isContentEditable||/^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName)) return;   /* typing, not a shortcut */
+    if(d.getElementById("adov").classList.contains("on")) return;   /* auto-destruct dialog has the keyboard */
+    if(e.key==="Escape"&&pseudo){ pseudo=false; show(false); return; }   /* real full screen: the browser handles Esc */
+    if((e.key!=="f"&&e.key!=="F")||e.ctrlKey||e.metaKey||e.altKey||e.repeat) return;
+    e.preventDefault(); toggle();
+  });
+})();
 </script></body></html>

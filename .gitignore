@@ -28,3 +28,7 @@ panel-theme/.flashed-contract.json
 # Red Alert's klaxon: fleet.py serves fleet-ui/sounds/tng_red_alert1.mp3 from next to itself. The
 # clip is copyrighted, so it is never committed; without it the page plays a synthesized klaxon.
 fleet-ui/sounds/
+
+# Deep Space NAS backdrop: fleet.py serves fleet-ui/ds9.jpg when it exists. A real photo of the
+# station is copyrighted, so it is never committed; without it the page draws its own station.
+fleet-ui/ds9.jpg

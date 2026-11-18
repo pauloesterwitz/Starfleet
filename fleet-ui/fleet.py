@@ -26,6 +26,7 @@ import io
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import threading
@@ -1827,6 +1828,311 @@ def jobs_snapshot():
     return snap
 
 
+# ---------------------------------------------------------------- deep space nas
+# Container view of the Synology NAS. Same path as the synology-nas-docker MCP: ssh to the
+# `nas-deployer` alias, whose forced command (nas_gate.py on the NAS) owns the policy -- it only
+# knows ps/health/logs/control/..., so nothing here can reach a shell or raw docker. Nothing in
+# this block loads or unloads a model, so no Starfleet key is involved.
+NAS_HOST = "nas-deployer"
+NAS_TTL = 8.0            # one ssh round trip takes ~5 s; concurrent pollers share one answer
+_NAS = {"at": 0.0, "data": None}
+_NAS_LOCK = threading.Lock()
+
+
+def _nas_gate(*args, timeout=60):
+    r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", NAS_HOST,
+                        shlex.join(args)], capture_output=True, stdin=subprocess.DEVNULL, timeout=timeout)
+    out = r.stdout.decode("utf-8", "replace").strip()
+    try:
+        return json.loads(out)
+    except ValueError:
+        raise OSError((r.stderr.decode("utf-8", "replace").strip() or out or f"ssh exit {r.returncode}")[-300:])
+
+
+def nas_state(force=False):
+    """All containers (running and stopped) as Container Manager lists them; cached NAS_TTL seconds."""
+    with _NAS_LOCK:
+        if force or time.time() - _NAS["at"] > NAS_TTL:
+            try:
+                rows = _nas_gate("ps", "--all")
+                if isinstance(rows, dict):
+                    raise OSError(rows.get("error") or rows.get("message") or str(rows)[:200])
+                _NAS["data"] = {"containers": rows, "error": None}
+            except (OSError, subprocess.SubprocessError) as e:
+                # keep the last good list on screen, flag it stale
+                old = (_NAS["data"] or {}).get("containers", [])
+                _NAS["data"] = {"containers": old, "error": str(e)[:200]}
+            _NAS["at"] = time.time()
+        return dict(_NAS["data"], at=_NAS["at"])
+
+
+_NASS = {"at": 0.0, "data": None}
+_NASS_LOCK = threading.Lock()
+
+
+def nas_stats():
+    """Host KPIs from the gate's read-only `stats` verb (CPU, RAM, temperatures, network); cached like nas_state.
+    An older gate without the verb answers with an error: the last good numbers stay, flagged stale."""
+    with _NASS_LOCK:
+        if time.time() - _NASS["at"] > NAS_TTL:
+            try:
+                s = _nas_gate("stats")
+                if "error" in s:
+                    raise OSError(s.get("message") or s["error"])
+                _NASS["data"] = {"stats": s, "error": None}
+            except (OSError, subprocess.SubprocessError) as e:
+                _NASS["data"] = {"stats": (_NASS["data"] or {}).get("stats"), "error": str(e)[:200]}
+            _NASS["at"] = time.time()
+        return dict(_NASS["data"], at=_NASS["at"])
+
+
+def nas_control(target, action):
+    if action not in ("start", "stop", "restart", "rm"):
+        raise ValueError("action must be start, stop, restart or rm")
+    if target not in {c["Names"] for c in nas_state()["containers"]}:
+        raise ValueError("unknown container")
+    # rm = the gate's `rm` verb: stopped containers only, never frozen projects (the gate decides, not us)
+    res = _nas_gate("rm", target) if action == "rm" else _nas_gate("control", target, action, timeout=330)
+    _NAS["at"] = 0.0          # next poll re-reads the NAS
+    if isinstance(res, dict) and res.get("error"):
+        raise OSError(res.get("message") or res["error"])
+    return res
+
+
+# ---------------------------------------------------------------- node containers (Engineering tab)
+
+# One read-only probe per node: running containers, their memory (cgroup memory.current minus
+# inactive_file, the number `docker stats` shows), GPU memory per process mapped to its container,
+# cumulative CPU time, and the process table (to find who started each container).
+CT_PROBE = r"""ids=$(docker ps -q --no-trunc 2>/dev/null)
+echo "@I"
+[ -n "$ids" ] && docker inspect -f '{{.Id}}|{{.Name}}|{{.Config.Image}}|{{.State.StartedAt}}|{{index .Config.Labels "com.docker.compose.project"}}|{{.HostConfig.Runtime}}|{{if .HostConfig.DeviceRequests}}1{{else}}0{{end}}|{{.HostConfig.RestartPolicy.Name}}|{{.Config.OpenStdin}}' $ids
+echo "@C"
+for id in $ids; do d=/sys/fs/cgroup/system.slice/docker-$id.scope; [ -d "$d" ] || continue
+  echo "$id $(cat $d/memory.current) $(awk '$1=="inactive_file"{print $2}' $d/memory.stat) $(awk '$1=="usage_usec"{print $2}' $d/cpu.stat)"; done
+echo "@G"
+nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader,nounits 2>/dev/null | while IFS=', ' read -r p m; do
+  c=$(grep -o 'docker-[0-9a-f]\{64\}' /proc/$p/cgroup 2>/dev/null | head -1 | cut -c8-); [ -n "$c" ] && echo "$c $m"; done
+echo "@P"
+ps -eo pid=,ppid=,etimes=,unit=,uunit=,args= | cut -c1-400"""
+CT_TTL = 8.0            # concurrent viewers share one probe
+CT_POLL = 30            # background probe interval: keeps the CPU-idle clocks running with no tab open
+CPU_ACTIVE = 0.01       # cores; a container above this between two probes counts as active
+_CT = {"at": 0.0, "data": None}
+_CT_LOCK = threading.Lock()
+_CT_CPU = {}            # (node, id) -> [usage_usec, t_sample, t_last_active or None, t_first_seen]
+_SESSION_LABELS = ("Claude Code", "opencode")
+_OWNER_STOP = {"Claude Code", "opencode", "llama-swap", "systemd", "sshd", "init"}
+
+
+def _ct_probe(host):
+    cmd = ["bash", "-c", CT_PROBE] if host is None else [
+        "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host, CT_PROBE]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=45, stdin=subprocess.DEVNULL)
+    if "@P" not in r.stdout:
+        raise OSError((r.stderr or f"probe exit {r.returncode}").strip()[-200:])
+    out, sec = {"I": [], "C": [], "G": [], "P": []}, None
+    for line in r.stdout.splitlines():
+        if line in ("@I", "@C", "@G", "@P"):
+            sec = line[1]
+        elif sec and line.strip():
+            out[sec].append(line)
+    return out
+
+
+def _ps_table(lines):
+    t = {}
+    for line in lines:
+        f = line.split(None, 5)
+        if len(f) == 6 and f[0].isdigit() and f[1].isdigit() and f[2].isdigit():
+            unit = f[4] if f[4] != "-" else f[3]                       # a user unit beats user@UID.service
+            t[int(f[0])] = (int(f[1]), int(f[2]), f[5], unit)          # ppid, age s, args, systemd unit
+    return t
+
+
+def _proc_label(args):
+    a0 = args.split()[0] if args.split() else "?"
+    base = os.path.basename(a0)
+    if "ccd-cli" in a0 or base == "claude":
+        return "Claude Code"
+    if "opencode" in a0:
+        return "opencode"
+    if "llama-swap/llama-swap" in a0:
+        return "llama-swap"
+    if base in ("bash", "sh", "dash", "python3", "python") and len(args.split()) > 1:
+        arg = next((x for x in args.split()[1:] if not x.startswith("-")), "")
+        return os.path.basename(arg) or base
+    return {"systemd": "systemd", "sshd": "sshd"}.get(base, base)
+
+
+def _owner_chain(ps, pid):
+    """('llama-swap › run-x.sh', pid of the Claude Code/opencode session or None) for a client process:
+    walk its ancestors to the first agent, llama-swap, sshd or systemd."""
+    unit = ps[pid][3] if pid in ps else "-"
+    labels, session, seen = [], None, 0
+    while pid in ps and pid > 1 and seen < 8:
+        seen += 1
+        pid = ps[pid][0]
+        if pid not in ps:
+            break
+        lab = _proc_label(ps[pid][2])
+        if lab in _SESSION_LABELS and session is None:
+            session = pid
+        labels.append(lab)
+        if lab in _OWNER_STOP:
+            break
+    labels = [x for x in labels if x not in ("systemd", "init", "server", "node")] or labels[-1:]
+    if len(labels) > 1:
+        labels = [labels[-1], labels[0]]       # the top-level owner, then the direct launcher
+    if labels == ["systemd"] and unit not in ("-", ""):
+        labels = [f"systemd · {unit}"]
+    return " › ".join(dict.fromkeys(labels)), session
+
+
+def _find_client(ps, name, image, age, used):
+    """pid of the process that runs or follows this container: a `docker run|logs|attach` naming it,
+    else a `docker run` of the same image started within 4 s of it (random-named MCP containers)."""
+    hits = [pid for pid, (_, _, a, _) in ps.items()
+            if "docker " in a and (f"--name {name} " in a + " " or f" {name} " in f" {a} ") and pid not in used]
+    hits.sort(key=lambda p: " run " not in ps[p][2])          # prefer the `docker run` client
+    if hits:
+        return hits[0]
+    for pid, (_, et, a, _) in ps.items():
+        if pid not in used and a.startswith("docker run") and image in a and abs(et - age) <= 4:
+            return pid
+    return None
+
+
+def _cpu_idle(node, cid, usec, now):
+    e = _CT_CPU.get((node, cid))
+    if e is None:
+        _CT_CPU[(node, cid)] = e = [usec, now, None, now]
+    elif now - e[1] >= 1:
+        if (usec - e[0]) / 1e6 / (now - e[1]) > CPU_ACTIVE:
+            e[2] = now
+        e[0], e[1] = usec, now
+    return now - (e[2] or e[3]), e[2] is None
+
+
+def _parse_ts(started):
+    return datetime.datetime.fromisoformat(re.sub(r"(\.\d{6})\d*Z$", r"\1+00:00", started)
+                                           .replace("Z", "+00:00")).timestamp()
+
+
+def _ct_rows(node, raw, other_ps, now):
+    ps, used, rows = _ps_table(raw["P"]), set(), []
+    cg = {}
+    for line in raw["C"]:
+        f = line.split()
+        if len(f) == 4:
+            cg[f[0]] = (int(f[1]) - int(f[2] or 0), int(f[3]))
+    gpu = {}
+    for line in raw["G"]:
+        f = line.split()
+        if len(f) == 2 and f[1].isdigit():
+            gpu[f[0]] = gpu.get(f[0], 0) + int(f[1])
+    for line in raw["I"]:
+        f = line.split("|")
+        if len(f) != 9:
+            continue
+        cid, name, image, started, project, runtime, devreq, policy, stdin = f
+        project = "" if project == "<no value>" else project
+        name = name.lstrip("/")
+        try:
+            st = _parse_ts(started)
+        except ValueError:
+            st = None
+        is_gpu = runtime == "nvidia" or devreq == "1"
+        client = _find_client(ps, name, image, now - (st or now), used)
+        owner, session = (None, None)
+        if client:
+            used.add(client)
+            owner, session = _owner_chain(ps, client)
+        elif other_ps:
+            c2 = _find_client(other_ps[1], name, image, -1e9, set())
+            if c2:
+                owner = _owner_chain(other_ps[1], c2)[0] + f" (on {other_ps[0]})"
+        if not owner:
+            owner = (f"compose · {project}" if project else
+                     f"docker · restart {policy}" if policy in ("always", "unless-stopped") else "detached")
+        ram, usec = cg.get(cid, (None, None))
+        idle, idle_ge = _cpu_idle(node, cid, usec, now) if usec is not None else (None, False)
+        sess_idle = session_idle_s(session) if session and NODES.get(node) is None else None
+        kind = "gpu" if is_gpu else "session" if session else "service"
+        rows.append({"node": node, "name": name, "image": image, "started": st, "project": project or None,
+                     "ram_mb": round(ram / 1048576) if ram is not None else None,
+                     "gpu_mb": gpu.get(cid), "owner": owner, "kind": kind,
+                     "session_idle_s": round(sess_idle) if sess_idle is not None else None,
+                     "cpu_idle_s": round(idle) if idle is not None else None, "cpu_idle_ge": idle_ge,
+                     "stoppable": not is_gpu})
+    live = {(node, line.split("|")[0]) for line in raw["I"]}
+    for k in [k for k in _CT_CPU if k[0] == node and k not in live]:
+        del _CT_CPU[k]                                # vanished containers
+    return rows
+
+
+def containers_state(force=False):
+    """Running containers on every node, biggest first; cached CT_TTL seconds."""
+    with _CT_LOCK:
+        if force or time.time() - _CT["at"] > CT_TTL:
+            raw, errs = {}, {}
+
+            def grab(node, host):
+                try:
+                    raw[node] = _ct_probe(host)
+                except (OSError, subprocess.SubprocessError) as e:
+                    errs[node] = str(e)[:200]
+            ts = [threading.Thread(target=grab, args=(n, h)) for n, h in NODES.items()]
+            [t.start() for t in ts]
+            [t.join() for t in ts]
+            now, rows = time.time(), []
+            for node in NODES:
+                if node not in raw:
+                    rows += [r for r in ((_CT["data"] or {}).get("containers") or []) if r["node"] == node]
+                    continue
+                other = next(((n, _ps_table(raw[n]["P"])) for n in raw if n != node), None)
+                rows += _ct_rows(node, raw[node], other, now)
+            heads = {r["name"][:-5]: r["owner"] for r in rows if r["name"].endswith("-head")}
+            for r in rows:     # a TP worker is started detached over ssh: it belongs to its head's launcher
+                if r["name"].endswith("-worker") and r["owner"] == "detached" and r["name"][:-7] in heads:
+                    r["owner"] = heads[r["name"][:-7]] + " (worker)"
+            rows.sort(key=lambda r: -((r["ram_mb"] or 0) + (r["gpu_mb"] or 0)))
+            _CT["data"], _CT["at"] = {"containers": rows, "errors": errs}, now
+        return dict(_CT["data"], at=_CT["at"])
+
+
+def ct_worker():
+    while True:
+        try:
+            containers_state(force=True)
+        except Exception as e:          # never let the clock thread die
+            print(f"containers probe: {e}", flush=True)
+        time.sleep(CT_POLL)
+
+
+def container_stop(node, name, key):
+    """docker stop one container. Needs the Starfleet key. GPU containers are model servers that
+    llama-swap manages: they are refused here and are unloaded from the Model Registry instead."""
+    key_check(key)                                   # 403 without a valid key
+    if node not in NODES:
+        raise ValueError("unknown node")
+    row = next((r for r in containers_state(force=True)["containers"]
+                if r["node"] == node and r["name"] == name), None)
+    if row is None:
+        raise ValueError(f"{name} is not running on {node}")
+    if not row["stoppable"]:
+        raise PermissionError("Model server: unload it in the Model Registry, not here.")
+    script = "docker stop -t 10 " + shlex.quote(name)
+    host = NODES[node]
+    cmd = ["bash", "-c", script] if host is None else [
+        "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host, script]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+    if r.returncode != 0:
+        raise OSError((r.stderr or f"docker stop exit {r.returncode}").strip()[-200:])
+    _CT["at"] = 0.0
+    return {"ok": True, "node": node, "name": name, "freed_mb": row["ram_mb"]}
+
+
 # ---------------------------------------------------------------- http
 
 class Handler(BaseHTTPRequestHandler):
@@ -1849,6 +2155,18 @@ class Handler(BaseHTTPRequestHandler):
             with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "sounds",
                                   "tng_red_alert1.mp3"), "rb") as f:
                 return self._send(200, f.read(), "audio/mpeg")
+        if self.path == "/api/nas":
+            return self._send(200, json.dumps(nas_state()), "application/json")
+        if self.path == "/api/containers":
+            return self._send(200, json.dumps(containers_state()), "application/json")
+        if self.path == "/api/nas/stats":
+            return self._send(200, json.dumps(nas_stats()), "application/json")
+        if self.path == "/ds9.jpg":      # optional real photo; the page falls back to its drawn station
+            p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ds9.jpg")
+            if os.path.isfile(p):
+                with open(p, "rb") as f:
+                    return self._send(200, f.read(), "image/jpeg")
+            return self._send(404, "", "text/plain")
         if self.path == "/api/boot":
             with open("/proc/sys/kernel/random/boot_id") as f:
                 return self._send(200, json.dumps({"boot": f.read().strip()}), "application/json")
@@ -1968,6 +2286,28 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(502, json.dumps({"error": f"reboot NOT scheduled: {str(e)[:180]}"}),
                                   "application/json")
             print(f"AUTO DESTRUCT: {res}", flush=True)
+            return self._send(200, json.dumps(res), "application/json")
+        if self.path == "/api/nas/control":
+            try:
+                res = nas_control(body.get("target"), body.get("action"))
+            except ValueError as e:
+                return self._send(400, json.dumps({"error": str(e)}), "application/json")
+            except (OSError, subprocess.SubprocessError) as e:
+                return self._send(502, json.dumps({"error": str(e)[:200]}), "application/json")
+            print(f"NAS {body.get('action')} {body.get('target')}: ok", flush=True)
+            return self._send(200, json.dumps(res), "application/json")
+        if self.path == "/api/containers/stop":
+            try:
+                res = container_stop(body.get("node"), body.get("name"), key)
+            except urllib.error.HTTPError as e:
+                return self._send(403, json.dumps({"error": _err_text(e)}), "application/json")
+            except PermissionError as e:
+                return self._send(409, json.dumps({"error": str(e)}), "application/json")
+            except ValueError as e:
+                return self._send(400, json.dumps({"error": str(e)}), "application/json")
+            except (urllib.error.URLError, OSError, subprocess.SubprocessError) as e:
+                return self._send(502, json.dumps({"error": str(e)[:200]}), "application/json")
+            print(f"CONTAINER stop {res['node']}/{res['name']}: ok", flush=True)
             return self._send(200, json.dumps(res), "application/json")
         if self.path == "/api/redalert":
             try:
@@ -2146,8 +2486,21 @@ def page():
 
 # ---------------------------------------------------------------- entry
 
+def _ct_selfcheck():
+    ps = _ps_table(["1 0 99 - - /sbin/init", "10 1 90 - - /usr/bin/llama-swap/llama-swap -config x",
+                    "20 10 50 llama-swap.service - /bin/bash /h/run-x.sh",
+                    "30 20 40 llama-swap.service - docker logs -f x-head",
+                    "40 1 30 user@1000.service - /home/u/.opencode/bin/opencode",
+                    "41 40 30 user@1000.service - docker run -i --rm img:1 stdio"])
+    assert _owner_chain(ps, 30) == ("llama-swap › run-x.sh", None), _owner_chain(ps, 30)
+    assert _find_client(ps, "x-head", "i", 0, set()) == 30
+    assert _find_client(ps, "rand_name", "img:1", 31, set()) == 41
+    assert _owner_chain(ps, 41) == ("opencode", 40)
+
+
 def selfcheck():
     global _q_current, AUTODESTRUCT_CODE
+    _ct_selfcheck()
     # A pin missing from `running` (evicted by ttl, or by llama-swap swapping in a
     # different member of its swap:true group) must be touched immediately, same
     # tick, regardless of the refresh clock -- that's the whole fix.
@@ -2419,7 +2772,7 @@ def main():
         return selfcheck()
 
     host = a.host or default_host()
-    for fn in (poll_nodes, poll_swap, keepalive, ctx_max_worker, load_queue_worker):
+    for fn in (poll_nodes, poll_swap, keepalive, ctx_max_worker, load_queue_worker, ct_worker):
         threading.Thread(target=fn, daemon=True).start()
     pins = load_pins()
     print(f"Fleet on http://{host}:{a.port}   (llama-swap {SWAP})", flush=True)

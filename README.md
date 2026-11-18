@@ -24,7 +24,7 @@ front of 39 models and **Fleet**, a window in the app, as the control surface.
 
 <p align="center">
   <img src="docs/images/fleet-window.png" width="820" alt="The Fleet window: per-node status across the top, and below it the model registry, where every model has a Machine picker, a context size, a thinking effort and Pin/Unload">
-  <br><sub><b>Fleet</b>, the control surface — per-node status above, the model registry below.</sub>
+  <br><sub><b>Fleet</b>, the control surface: per-node status above, the model registry below. Names of private projects are replaced in the screenshots.</sub>
 </p>
 
 ---
@@ -47,6 +47,12 @@ front of 39 models and **Fleet**, a window in the app, as the control surface.
 - **Keeps the configuration honest.** The cluster's llama-swap config, launchers and
   guards live in this repo (`cluster/`), with a sync tool that compares them with the
   nodes before it overwrites anything. → [Repo layout](#repo-layout)
+- **Shows what holds the memory.** *Main Engineering* lists every running container on
+  both nodes with its RAM and GPU memory, when it started, what launched it and how
+  long it has been idle, and stops the ones you no longer need.
+  → [Main Engineering](#main-engineering-every-container-on-both-nodes)
+- **Looks after the NAS.** *Deep Space NAS* shows the Synology's containers and
+  hardware, with start, stop and restart. → [Deep Space NAS](#deep-space-nas-the-nas-containers)
 - **Watches the cluster.** GPU load, temperature, power and memory per node, which
   models are resident, and which coding-agent sessions are running — in the menu bar
   and on a desktop widget, with a notification when a session stalls.
@@ -198,6 +204,87 @@ From it you can:
 The backend also exposes the GPU job queue (a `pueue` queue and per-node capacity)
 at `/api/jobs`.
 
+Three views share the window. The left rail switches between them: **Starfleet
+Command** (the models), **Deep Space NAS** and **Engineering**. The address keeps the
+view (`#nas`, `#ctr`), so a reload or a bookmark opens the same one.
+
+### Main Engineering: every container on both nodes
+
+<p align="center">
+  <img src="docs/images/engineering.png" width="820" alt="Main Engineering: a table per node listing each running container with its kind, RAM, GPU memory, start time, the process that launched it, its idle time and a Stop button">
+  <br><sub><b>Main Engineering</b>: what holds the memory, and who started it. Names of private projects are replaced in this screenshot.</sub>
+</p>
+
+A table per node of every running container, biggest first:
+
+| Column | Where it comes from |
+| --- | --- |
+| **Kind** | *Model* (holds a GPU: vLLM, SGLang, embedders, ComfyUI), *Session* (an MCP server started by a coding-agent session) or *Service* (everything else) |
+| **RAM** | the container's cgroup: `memory.current` minus `inactive_file`, the number `docker stats` shows |
+| **GPU** | `nvidia-smi` memory of the container's processes, mapped through `/proc/<pid>/cgroup` |
+| **Started** | `docker inspect` `State.StartedAt` |
+| **Launched by** | the process tree: the `docker run` (or `docker logs -f`) client naming the container, walked up to llama-swap, a Claude Code or opencode session, or a systemd unit; else the compose project or restart policy. A TP worker started over ssh inherits its head's launcher |
+| **Idle** | for a session's container: how long that session has been inactive. Otherwise how long the container has used no CPU (under 1 % of a core between two probes). That clock starts with the Fleet service, so a container that has not moved since then shows `≥` |
+
+A background thread probes both nodes every 30 seconds (one read-only shell script per
+node, over ssh for Kathryn), so the idle clocks keep running while nobody has the view
+open; the view itself refreshes every 10 seconds.
+
+**Stop** runs `docker stop -t 10` on the container's node. It needs the Starfleet key and
+a second click (the button turns into *Sure?* for four seconds). Model servers have no
+Stop button here: stopping one behind llama-swap's back would leave it believing the
+model is loaded, so those are unloaded in the model registry, and a pinned model can
+never be stopped from this view. Containers started with `--rm` (most MCP servers) are
+gone after a stop; the session that started one loses that tool until it restarts it.
+
+| Call | Body | Does |
+| --- | --- | --- |
+| `GET /api/containers` | | every running container on every node, with `errors` per node that did not answer (its last list stays) |
+| `POST /api/containers/stop` | `{"node": "kathryn", "name": "qdrant"}` | stops it; 403 without the key, 409 for a model server, 400 for a container that is not running there |
+
+### Deep Space NAS: the NAS containers
+
+<p align="center">
+  <img src="docs/images/deep-space-nas.png" width="820" alt="Deep Space NAS: a drawn space station with the NAS's compose projects as panels on its pylons, each container with its state and Start, Stop, Restart or Delete, and a hardware panel with CPU, RAM, temperature and network">
+  <br><sub><b>Deep Space NAS</b>: the Synology's containers docked on the station's pylons.</sub>
+</p>
+
+The Synology's containers, grouped by compose project. The largest projects dock on the
+roomiest pylons, pylons with nothing to show are not drawn, and from the seventh project
+on the panels stand in columns to the left and right of the station, using the width of
+a wide or full-screen window. Each container has Start, Stop and Restart (and Delete
+once it has stopped), with a second click to confirm; a hardware panel shows the NAS's
+CPU, RAM, hottest sensor and network rates.
+
+Fleet reaches the NAS through one ssh alias, `nas-deployer`, whose forced command on
+the NAS (a small gate script, not part of this repo) answers `ps --all`, `stats`,
+`control <container> <start|stop|restart>` and `rm <container>` in JSON and owns the
+policy: what may be touched, and which projects are frozen. The station is drawn by
+the page; if `fleet-ui/ds9.jpg` exists next to `fleet.py` it is used as the backdrop
+instead (a real photo is copyrighted, so `.gitignore` keeps it out).
+
+| Call | Body | Does |
+| --- | --- | --- |
+| `GET /api/nas` | | all NAS containers, running and stopped |
+| `GET /api/nas/stats` | | the NAS's hardware figures |
+| `POST /api/nas/control` | `{"target": "...", "action": "start\|stop\|restart\|rm"}` | asks the gate to do it |
+
+### Full screen
+
+<p align="center">
+  <img src="docs/images/full-screen.png" width="820" alt="Fleet in full screen: the left rail and the header bar are hidden, and the node status and model registry fill the whole display">
+  <br><sub>Full screen: the rail and header give their space to the view.</sub>
+</p>
+
+The **Full screen** button in the top-right corner, or the `F` key (ignored while you
+type in a field), puts the window into the browser's own full screen
+(`requestFullscreen`, with the `webkit` prefix for older Safari). The left rail, the
+header bar and the scrollbars are hidden so the current view fills the display, and the
+table's column headings stay at the top while it scrolls. `Esc` or the button leaves.
+Where a browser refuses or ignores the request, the same layout fills the window
+instead. The app's `WKWebView` allows element full screen
+(`isElementFullscreenEnabled`, macOS 12.3 and later).
+
 ### What "pin" actually guarantees
 
 llama-swap's own idle `ttl` and swap-group exclusivity (see above) still fully
@@ -330,15 +417,20 @@ and 660 Hz sine tones).
    works well for keeping it up across reboots. Fleet reaches llama-swap through
    ctxproxy on `:28081` (`FLEET_SWAP` overrides it), so set up
    [the Starfleet key](#the-starfleet-key) first.
-2. For Red Alert's klaxon, put your own audio clip at `fleet-ui/sounds/tng_red_alert1.mp3`
+2. Optional: the [Deep Space NAS](#deep-space-nas-the-nas-containers) view needs the
+   `nas-deployer` ssh alias and its gate on the NAS, and the
+   [Main Engineering](#main-engineering-every-container-on-both-nodes) view needs
+   `docker`, `nvidia-smi` and ssh from the head node to the worker, which the rest of
+   Fleet already uses.
+3. For Red Alert's klaxon, put your own audio clip at `fleet-ui/sounds/tng_red_alert1.mp3`
    next to `fleet.py` on the head node; without one the page plays a synthesized
    klaxon. Auto Destruct also needs the `sudo` and ssh access described
    [above](#red-alert-and-auto-destruct).
-3. Point [`Sources/OpencodeMonitor/FleetView.swift`](Sources/OpencodeMonitor/FleetView.swift)'s
+4. Point [`Sources/OpencodeMonitor/FleetView.swift`](Sources/OpencodeMonitor/FleetView.swift)'s
    `fleetURL` and [`Sources/OpencodeMonitor/Info.plist`](Sources/OpencodeMonitor/Info.plist)'s
    `NSExceptionDomains` entry at your own head node's address — fleet-ui serves
    plain HTTP, so that ATS exception is what lets `WKWebView` load it.
-4. Build with `./package.sh`, same as the rest of the app (see below); Fleet
+5. Build with `./package.sh`, same as the rest of the app (see below); Fleet
    ships inside `Starfleet Command.app`, not as its own bundle.
 
 ---
@@ -646,7 +738,9 @@ cluster/                   the cluster's configuration and tooling: the llama-sw
                             that also gates every load, the status scripts the app runs over ssh,
                             and sync-hosts.sh to keep this repo and the nodes in step
 fleet-ui/                  Fleet's backend: fleet.py + fleet.html, copied to the head node
-                            (fleet-ui/sounds/ holds your own Red Alert clip and stays out of git)
+                            (fleet-ui/sounds/ holds your own Red Alert clip and fleet-ui/ds9.jpg an
+                            optional NAS backdrop; both stay out of git)
+docs/images/               screenshots of the Fleet views
 docs/menu-bar-app.md       deep-dive on the monitoring surfaces and their known limits
 panel-theme/               offline tooling for the optional USB panel's theme
 assets/                    icon + brand mark generators
