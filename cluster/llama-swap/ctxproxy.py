@@ -309,7 +309,18 @@ class Handler(BaseHTTPRequestHandler):
         raise EvictionRefused("refused: %s is not loaded. Only Starfleet Command (:8090) loads or "
                               "unloads models%s." % (model, "; it would evict " + ", ".join(victims) if victims else ""))
 
+    def _check(self):
+        """GET /starfleet/check: 204 when X-Starfleet-Key is the Starfleet key, else 403. Answered here, before
+        the guard and without llama-swap, so it can never fail open. Fleet's Computer view authenticates with it."""
+        ok = starfleet_ok(self.headers.get("X-Starfleet-Key"))
+        self.send_response(204 if ok else 403)
+        self.send_header("Content-Length", "0")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
     def _relay(self):
+        if self.path.split("?", 1)[0] == "/starfleet/check":
+            return self._check() if self.command == "GET" else self._fail(405, "GET only")
         length = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(length) if length else b""
         starfleet = starfleet_ok(self.headers.get("X-Starfleet-Key"))

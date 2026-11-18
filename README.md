@@ -665,10 +665,11 @@ in a load. To chat with another model, load it in the registry first.
   `~/.local/share/fleet-ui/computer/` (`FLEET_COMPUTER_DIR`), listed on the left of the
   view. Answers stream in, and the model's reasoning is kept with each one.
 
-Every `/api/computer` call needs the Starfleet key, and the check fails closed: the key
-counts only when ctxproxy confirms it with a no-op unload that answers 2xx while
-llama-swap is answering normally. A wrong key, a busy or unreachable gate, or no idle
-model to test against all reject; a confirmed key is remembered for two minutes. Without
+Every `/api/computer` call needs the Starfleet key, and the check fails closed: Fleet asks
+ctxproxy's `GET /starfleet/check`, which ctxproxy answers itself, before its guard and
+without llama-swap: 204 for the Starfleet key, 403 for anything else. Fleet accepts only a
+204; a 403, an error or no answer all reject, and nothing is cached, so a rotated key takes
+effect at once. Without
 the key the request body is never read. A chat answers one message at a time, and it is
 saved even when an answer fails or the browser goes away.
 

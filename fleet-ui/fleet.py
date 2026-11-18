@@ -2454,8 +2454,6 @@ COMPUTER_ROUNDS = 8           # model <-> tool round trips per message
 TOOL_TEXT_CAP = 12000         # characters of one tool result passed to the model
 HISTORY_CHARS = 240000        # characters of history sent with a request (oldest turns drop first)
 _NOT_CHAT = re.compile(r"embed|rerank|imagegen", re.I)
-_KEY_OK = {}                  # sha256(key) -> expiry: one gate round trip per 10 minutes, not per request
-_KEY_LOCK = threading.Lock()
 
 
 def _deny(msg=POLICY):
@@ -2463,35 +2461,22 @@ def _deny(msg=POLICY):
 
 
 def computer_auth(key):
-    """Fail closed. The key counts only when the gate itself confirms it: llama-swap answers /running quickly
-    (so the gate's guard is working and cannot fail open), then a no-op unload of a model that is not resident
-    answers 2xx. A 403, an error, a slow llama-swap or no idle model all reject. Cached 2 minutes."""
-    import hashlib
+    """Fail closed: the key counts only when ctxproxy's own check (GET /starfleet/check, answered before its
+    guard and without llama-swap) says 204. Anything else, including no answer, rejects. No cache: the check
+    is a local call, and a rotated key takes effect at once."""
     if not key:
         _deny()
-    h = hashlib.sha256(key.encode()).hexdigest()
-    with _KEY_LOCK:
-        for k in [k for k, t in _KEY_OK.items() if t < time.time()]:
-            del _KEY_OK[k]
-        if _KEY_OK.get(h, 0) > time.time():
-            return
     try:
-        with urllib.request.urlopen(SWAP + "/running", timeout=3) as r:     # quick answer = guard can read it too
-            running = {e.get("model") for e in (json.load(r) or {}).get("running") or []}
-    except (OSError, ValueError):
-        _deny("Cannot verify the Starfleet key right now (llama-swap not answering); try again in a moment.")
-    with LOCK:
-        idle = next((m for m in STATE["models"] if m not in running), None)
-    if not idle:
-        _deny("Cannot verify the Starfleet key right now (no idle model to test against).")
-    try:
-        swap_unload(idle, key=key)              # 2xx only when the gate accepted the key
+        req = urllib.request.Request(SWAP + "/starfleet/check", headers={KEY_HDR: key}, method="GET")
+        with urllib.request.urlopen(req, timeout=5) as r:
+            if r.status == 204:
+                return
     except urllib.error.HTTPError as e:
-        _deny(POLICY if e.code == 403 else "Cannot verify the Starfleet key right now (gate answered %d)." % e.code)
+        if e.code == 403:
+            _deny()
     except OSError:
-        _deny("Cannot verify the Starfleet key right now (gate not answering).")
-    with _KEY_LOCK:
-        _KEY_OK[h] = time.time() + 120
+        pass
+    _deny("Cannot verify the Starfleet key right now (gate not answering); try again in a moment.")
 
 
 def _env_value(name):
