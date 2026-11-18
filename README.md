@@ -204,6 +204,9 @@ From it you can:
 The backend also exposes the GPU job queue (a `pueue` queue and per-node capacity)
 at `/api/jobs`.
 
+Every table sorts by any column: click a heading, click again to reverse, a third time
+for the default order (numbers start with the biggest; the choice is kept in the browser).
+
 Three views share the window. The left rail switches between them: **Starfleet
 Command** (the models), **Deep Space NAS** and **Engineering**. The address keeps the
 view (`#nas`, `#ctr`), so a reload or a bookmark opens the same one.

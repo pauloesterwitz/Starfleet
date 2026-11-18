@@ -249,6 +249,11 @@ td .sub{margin-top:3px;font-size:11px;color:var(--dim);line-height:1.35}
 /* ---- Deep Space NAS view: a second page in the same frame; the rail button swaps which one shows ---- */
 body.nas .main:not(#nasview), body:not(.nas) #nasview{display:none}
 body.ctr .main:not(#ctrview), body:not(.ctr) #ctrview{display:none}
+/* sortable tables: click a heading */
+th[data-sort]{cursor:pointer;user-select:none;-webkit-user-select:none}
+th[data-sort]:hover{color:var(--text)}
+th.sorted{color:var(--amber)}
+th[data-sort]::after{content:attr(data-dir);margin-left:4px}
 /* ---- Main Engineering: running containers on both Sparks, stop one to free memory ---- */
 #ctrmsg{display:none;background:#2a0d0d;color:var(--red);border-left:8px solid var(--red);padding:6px 14px;
   font-size:13px;text-transform:uppercase;margin-top:6px}
@@ -385,8 +390,9 @@ html.fs{scrollbar-width:none} html.fs::-webkit-scrollbar{display:none}
       <button class="pill" data-f="image">Image</button>
       <span class="count" id="count"></span>
     </div>
-    <table><thead><tr><th>Model</th><th>Node</th><th>Speed</th><th>Context</th><th>Effort</th>
-      <th>State</th><th>TTL</th><th class="act">Persistent</th></tr></thead>
+    <table data-table="models"><thead><tr><th data-sort="name">Model</th><th data-sort="node">Node</th>
+      <th data-sort="speed" data-first="-1">Speed</th><th data-sort="ctx" data-first="-1">Context</th><th data-sort="effort">Effort</th>
+      <th data-sort="state">State</th><th data-sort="ttl" data-first="-1">TTL</th><th class="act" data-sort="pin" data-first="-1">Persistent</th></tr></thead>
       <tbody id="rows"></tbody></table>
 
   </div>
@@ -431,6 +437,31 @@ window.fetch=(url,opt={})=>{
     opt.headers={...opt.headers,"X-Starfleet-Key":skey.value.trim()};
   return _fetch(url,opt);
 };
+/* Sortable tables: click a heading to sort by it, again to reverse, a third time for the default order.
+   Numbers start biggest first (data-first="-1"), empty values always go last. Each table's choice is kept
+   in this browser. */
+var SORT={}; try{ SORT=JSON.parse(localStorage.getItem("fleetSort")||"{}")||{}; }catch(e){}
+function sorted(table,rows,get){
+  const s=SORT[table]; if(!s||!get[s.k]) return rows;
+  const val=r=>{ const v=get[s.k](r); return v==null||v===""||(typeof v==="number"&&isNaN(v))?null:v; };
+  return rows.map((r,i)=>[r,val(r),i]).sort((a,b)=>a[1]===null?(b[1]===null?a[2]-b[2]:1):b[1]===null?-1:
+    ((typeof a[1]==="number"&&typeof b[1]==="number"?a[1]-b[1]
+      :String(a[1]).localeCompare(String(b[1]),undefined,{numeric:true,sensitivity:"base"}))*s.d||a[2]-b[2])).map(x=>x[0]);
+}
+function sortMarks(){
+  document.querySelectorAll("table[data-table] th[data-sort]").forEach(th=>{
+    const s=SORT[th.closest("table").dataset.table], on=!!s&&s.k===th.dataset.sort;
+    th.classList.toggle("sorted",on); th.dataset.dir=on?(s.d>0?"▲":"▼"):"";
+    th.title=on?"Sorted. Click to reverse, or a third time for the default order":"Click to sort";
+  });
+}
+document.addEventListener("click",e=>{
+  const th=e.target.closest&&e.target.closest("table[data-table] th[data-sort]"); if(!th) return;
+  const t=th.closest("table").dataset.table, k=th.dataset.sort, first=+(th.dataset.first||1), s=SORT[t];
+  if(!s||s.k!==k) SORT[t]={k,d:first}; else if(s.d===first) SORT[t]={k,d:-first}; else delete SORT[t];
+  try{ localStorage.setItem("fleetSort",JSON.stringify(SORT)); }catch(e){}
+  if(t==="models"){ if(last) render(last); } else ctrPaint();
+});
 var queuedPos={};   /* model id -> 1-based place in the load queue; declared early because render() runs before later top-level lines */
 const TAG={"jean-luc":["jl","JEAN-LUC"],"kathryn":["ka","KATHRYN"],"dynamic":["dy","AUTO"]};
 const gb=kb=>(kb/1048576).toFixed(1);
@@ -1095,8 +1126,11 @@ function render(s){
     qb.textContent=((s.llm_loading||[]).length?`LLM loading (${s.llm_loading.join(", ")}) - `:"")+
       `Queue, one at a time: ${(s.queued||[]).map((id,i)=>`${i+1}. ${modelName(id)}`).join("  |  ")}`;
   }else qb.style.display="none";
-  const shown=grouped.filter(m=>keep(m,run)).sort((a,c)=>
-    (c.pinned-a.pinned)||((run[c.id]?1:0)-(run[a.id]?1:0))||a.id.localeCompare(c.id));
+  const stOf=m=>loadingIds.has(m.id)?"loading":busy.has(m.id)?"working":queuedPos[m.id]?"queued":(run[m.id]?run[m.id].state:"stopped");
+  const shown=sorted("models",grouped.filter(m=>keep(m,run)).sort((a,c)=>
+    (c.pinned-a.pinned)||((run[c.id]?1:0)-(run[a.id]?1:0))||a.id.localeCompare(c.id)),
+    {name:m=>modelName(m.id), node:m=>(m.nodes||[]).join(" "), speed:m=>m.tps, ctx:m=>m.ctx||m.ctx_deployed||m.ctx_max,
+     effort:m=>m.effort, state:stOf, ttl:m=>run[m.id]&&run[m.id].ttl, pin:m=>m.pinned?1:0});
   document.getElementById("count").textContent=
     `${shown.length} of ${grouped.filter(m=>!m.kind||m.kind==="llm").length}`;
 
@@ -1140,6 +1174,7 @@ function render(s){
           title="${r?"Unload this model and drop its pin":"Not loaded: drop the pin (cancels a load in progress)"}"
           onclick="act('/api/unload','${m.id}')">${r||(!m.pinned&&!queuedPos[m.id])?"Unload":queuedPos[m.id]&&!r?"Dequeue":"Unpin"}</button></td></tr>`;
   }).join("") : `<tr><td colspan="8" class="empty">No models match this filter</td></tr>`;
+  sortMarks();
 
   document.getElementById("clock").textContent=new Date().toLocaleTimeString();
 }
@@ -1376,11 +1411,15 @@ function ctrPaint(){
   const msg=document.getElementById("ctrmsg"), m=d.actionError||Object.entries(errs).map(([n,e])=>`${n} not answering - showing the last list. ${e}`).join(" · ");
   msg.style.display=m?"block":"none"; msg.textContent=m||"";
   document.getElementById("ctrnodes").innerHTML=["jean-luc","kathryn"].map(node=>{
-    const rows=cs.filter(c=>c.node===node), sum=k=>rows.reduce((a,c)=>a+(c[k]||0),0);
+    const rows=sorted("ctr",cs.filter(c=>c.node===node),{name:c=>c.name, kind:c=>CTR_KIND[c.kind]||c.kind, ram:c=>c.ram_mb,
+      gpu:c=>c.gpu_mb, started:c=>c.started, owner:c=>c.owner, idle:c=>c.session_idle_s??c.cpu_idle_s});
+    const sum=k=>rows.reduce((a,c)=>a+(c[k]||0),0);
     const title=node==="jean-luc"?"Jean-Luc":"Kathryn";
     return `<div class="sec"><div class="cap"></div><h2>${title} · ${rows.length} running · ${ctrMB(sum("ram_mb"))} RAM · ${ctrMB(sum("gpu_mb"))} GPU</h2><div class="rule"></div></div>
-    <table><thead><tr><th>Container</th><th>Kind</th><th class="num">RAM</th><th class="num">GPU</th><th>Started</th>
-      <th>Launched by</th><th>Idle</th><th class="act"></th></tr></thead><tbody>`+(rows.length?rows.map(c=>{
+    <table data-table="ctr"><thead><tr><th data-sort="name">Container</th><th data-sort="kind">Kind</th>
+      <th class="num" data-sort="ram" data-first="-1">RAM</th><th class="num" data-sort="gpu" data-first="-1">GPU</th>
+      <th data-sort="started" data-first="-1">Started</th><th data-sort="owner">Launched by</th>
+      <th data-sort="idle" data-first="-1">Idle</th><th class="act"></th></tr></thead><tbody>`+(rows.length?rows.map(c=>{
       const k=node+"/"+c.name, armed=ctrArm===k, b=ctrBusy[k], nm=esc(c.name);
       const started=c.started?`<span title="${esc(new Date(c.started*1000).toLocaleString())}">${ctrDur(now-c.started)} ago</span>`:"–";
       const btn=c.stoppable
@@ -1392,6 +1431,7 @@ function ctrPaint(){
         <td>${esc(c.owner)}</td><td>${ctrIdle(c)}</td><td class="act">${btn}</td></tr>`;
     }).join(""):`<tr><td colspan="8" class="empty">No running containers</td></tr>`)+`</tbody></table>`;
   }).join("");
+  sortMarks();
 }
 async function ctrPoll(){
   clearTimeout(ctrTimer);
