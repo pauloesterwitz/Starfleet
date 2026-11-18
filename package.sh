@@ -13,6 +13,15 @@ APP="Starfleet Command.app"
 # theme last flashed onto the panel is not the one this build speaks.
 python3 panel-theme/panel_contract.py check
 
+# In the macOS 27 SDK SwiftUI's @State is a macro, and its plugin (SwiftUIMacros) ships
+# with Xcode.app only: built with just the Command Line Tools selected, every @State fails
+# with "plugin for module 'SwiftUIMacros' not found". Use Xcode for this build when it is
+# installed and nothing else was chosen; DEVELOPER_DIR set by hand still wins.
+if [ -z "${DEVELOPER_DIR:-}" ] && [ -d /Applications/Xcode.app ] \
+   && xcode-select -p | grep -q CommandLineTools; then
+    export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
+fi
+
 swift build -c release
 
 rm -rf "$APP"

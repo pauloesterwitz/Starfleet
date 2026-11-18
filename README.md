@@ -1400,6 +1400,11 @@ it to `/Applications`. Use the `.app` rather than `swift run`: notifications and
 "Launch at Login" both need a real bundle identity. The ad-hoc signature changes with
 every build, so macOS may ask for the microphone again after a rebuild.
 
+Needs Xcode in `/Applications`, not only the Command Line Tools: from the macOS 27 SDK
+on, SwiftUI's `@State` is a macro whose plugin ships with Xcode alone. `package.sh`
+switches to Xcode for the build when the Command Line Tools are the selected developer
+directory; set `DEVELOPER_DIR` yourself for an Xcode installed elsewhere.
+
 ### 6. The iPhone app
 
 In [`ios/`](ios): an Xcode project, `ios/Starfleet.xcodeproj`, with one SwiftUI file and
