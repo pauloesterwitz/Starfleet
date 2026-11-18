@@ -683,6 +683,11 @@ saved even when an answer fails or the browser goes away.
 
 ### Memory Core: the wiki as a map
 
+<p align="center">
+  <img src="docs/images/memory-core.png" width="820" alt="Memory Core: the wiki drawn as rings of ticks by page type around a core, with Computer's course through it highlighted, the sessions and most consulted pages on the left and a page detail and access log on the right">
+  <br><sub><b>Memory Core</b>: the wiki as rings by page type; Computer's course (search hits, relation hops, numbered reads, cited pages) and its access log. Example data.</sub>
+</p>
+
 Memory Core draws the LLM wiki as the ship's memory core: one ring per page type
 (other, concepts, entities, sources, from the centre out), each page a tick whose length
 is its inbound link weight, with linked pages placed close together. A Computer chat
