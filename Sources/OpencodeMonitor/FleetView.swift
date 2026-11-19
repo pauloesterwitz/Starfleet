@@ -76,7 +76,8 @@ struct FleetDashboardView: View {
                 .ignoresSafeArea()
         }
         .background(FleetWindowChrome())
-        .modifier(FleetFullScreenEnabled())
+        // With the scene's .principal role (App.swift), so the window may go full screen.
+        .windowFullScreenBehavior(.enabled)
         .onReceive(NotificationCenter.default.publisher(for: .fleetReload)) { _ in
             load()
         }
@@ -182,18 +183,6 @@ private struct WindowDragStrip: NSViewRepresentable {
     func updateNSView(_ nsView: NSView, context: Context) {}
 }
 
-/// macOS 15+: the same full-screen opt-in at the SwiftUI level, so a later SwiftUI update of the
-/// window cannot bring the .associated role's "no full screen" back (see FleetWindowChrome).
-private struct FleetFullScreenEnabled: ViewModifier {
-    @ViewBuilder func body(content: Content) -> some View {
-        if #available(macOS 15.0, *) {
-            content.windowFullScreenBehavior(.enabled)
-        } else {
-            content
-        }
-    }
-}
-
 /// Two jobs: (1) strip the title bar down to just the traffic lights, floating
 /// over the page's own black background, so the LCARS header is the only
 /// header; (2) this app is normally .accessory (no Dock icon, no Cmd+Tab
@@ -210,12 +199,10 @@ private struct FleetWindowChrome: NSViewRepresentable {
             window.styleMask.insert(.fullSizeContentView)
             window.isMovableByWindowBackground = true
             window.backgroundColor = .black
-            // Green button = a full-screen Space of its own, scaled to the display, like any
-            // other app, not just Zoom. Since macOS 15 SwiftUI gives a Window scene that is not
-            // the app's first scene (MenuBarExtra is) the .associated role, which has no full
-            // screen of its own; and AppKit only guesses full-screen eligibility otherwise
-            // (Apple recommends opting primary windows in explicitly). The full-screen flags
-            // exclude each other, so the auxiliary/none ones go first.
+            // Green button = a full-screen Space of its own, scaled to the display. The scene's
+            // .principal role (App.swift) does it in SwiftUI; this is the same opt-in in AppKit,
+            // which Apple recommends for primary windows. The full-screen flags exclude each
+            // other, so the auxiliary/none ones go first.
             window.collectionBehavior.remove([.fullScreenAuxiliary, .fullScreenNone])
             window.collectionBehavior.insert(.fullScreenPrimary)
 

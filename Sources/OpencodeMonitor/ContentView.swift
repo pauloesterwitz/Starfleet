@@ -94,9 +94,7 @@ struct ContentView: View {
             }
             .font(.caption)
             if updater.running || updater.result != nil {
-                Text(updater.running
-                     ? "A new Mac build takes a few minutes and restarts the app."
-                     : updater.result ?? "")
+                Text(updater.running ? updater.phase ?? "" : updater.result ?? "")
                     .font(.caption2)
                     .foregroundStyle(updater.failed && !updater.running ? .red : .secondary)
                     .fixedSize(horizontal: false, vertical: true)

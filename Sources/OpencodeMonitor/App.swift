@@ -79,6 +79,10 @@ struct StarfleetCommandApp: App {
                 .frame(minWidth: 960, minHeight: 640)
         }
         .windowStyle(.hiddenTitleBar)
+        // The green button's full screen. SwiftUI gives a Window that is not the app's first
+        // scene (the MenuBarExtra is) the .associated role: such a window only joins another
+        // window's full screen and never gets one of its own. .principal is Apple's override.
+        .windowManagerRole(.principal)
 
         Window("Starfleet Command Help", id: "help") {
             HelpView()
@@ -113,9 +117,12 @@ final class SelfUpdate: ObservableObject {
         .appendingPathComponent("Library/Logs/Starfleet Command update.log")
 
     @Published private(set) var running = false
+    /// What a run is doing right now, read from its lines in the log; nil when idle.
+    @Published private(set) var phase: String?
     /// What the last run ended with, for the dropdown; nil before the first one ends.
     @Published private(set) var result: String?
     @Published private(set) var failed = false
+    private var poll: Timer?
 
     private let script: URL? = {
         guard Bundle.main.bundlePath.hasSuffix(".app"),
@@ -139,9 +146,17 @@ final class SelfUpdate: ObservableObject {
             let status = done.terminationStatus
             DispatchQueue.main.async { self.finished(status) }
         }
+        // This run's lines start at the log's current end.
+        let start = (try? FileManager.default.attributesOfItem(atPath: Self.log.path)[.size] as? UInt64) ?? 0
         do {
             try process.run()
             running = true
+            phase = "Looking for a newer version…"
+            let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
+                if let now = SelfUpdate.phase(inLogFrom: start), now != self?.phase { self?.phase = now }
+            }
+            RunLoop.main.add(timer, forMode: .common)
+            poll = timer
         } catch {
             finish("Could not start update.sh: \(error.localizedDescription)", failed: true)
         }
@@ -151,6 +166,9 @@ final class SelfUpdate: ObservableObject {
     /// failure, explained in the log.
     private func finished(_ status: Int32) {
         running = false
+        poll?.invalidate()
+        poll = nil
+        phase = nil
         let build = AboutPanel.buildCommit.map { " (build \($0))" } ?? ""
         switch status {
         case 0: finish("Up to date\(build).", failed: false)
@@ -165,6 +183,20 @@ final class SelfUpdate: ObservableObject {
     private func finish(_ message: String, failed: Bool) {
         result = message
         self.failed = failed
+    }
+
+    /// The step update.sh has reached, from the lines it logged since `offset`.
+    private static func phase(inLogFrom offset: UInt64) -> String? {
+        guard let handle = try? FileHandle(forReadingFrom: log) else { return nil }
+        defer { try? handle.close() }
+        try? handle.seek(toOffset: offset)
+        let lines = String(decoding: (try? handle.readToEnd()) ?? Data(), as: UTF8.self)
+        if let found = lines.range(of: "\nMac: rebuilding ") {
+            let commit = lines[found.upperBound...].prefix { !$0.isNewline }
+            return "Building \(commit), a few minutes; then the app restarts in the new version."
+        }
+        if lines.contains("\niPhone: building and installing") { return "Installing on the iPhone…" }
+        return nil
     }
 }
 

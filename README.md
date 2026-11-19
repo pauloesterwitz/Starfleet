@@ -1434,7 +1434,8 @@ it to `/Applications`. Use the `.app` rather than `swift run`: notifications and
 every build, so macOS may ask for the microphone again after a rebuild.
 
 Needs Xcode in `/Applications`, not only the Command Line Tools: from the macOS 27 SDK
-on, SwiftUI's `@State` is a macro whose plugin ships with Xcode alone. `package.sh`
+on, SwiftUI's `@State` is a macro whose plugin ships with Xcode alone. The app itself
+needs macOS 15 or later, for the Fleet window's own full screen. `package.sh`
 switches to Xcode for the build when the Command Line Tools are the selected developer
 directory; set `DEVELOPER_DIR` yourself for an Xcode installed elsewhere.
 

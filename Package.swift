@@ -3,7 +3,9 @@ import PackageDescription
 
 let package = Package(
     name: "OpencodeMonitor",
-    platforms: [.macOS(.v13)],
+    // 15: the Fleet window's full screen needs SwiftUI's windowManagerRole (App.swift). No
+    // real limit: building needs Xcode with the macOS 27 SDK, which needs a newer macOS anyway.
+    platforms: [.macOS("15.0")],
     targets: [
         .executableTarget(
             name: "OpencodeMonitor",
