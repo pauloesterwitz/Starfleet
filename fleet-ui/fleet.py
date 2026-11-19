@@ -3182,6 +3182,10 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(200, wikicore.graph_json(), "application/json")
                 if u.path == "/api/computer/wiki/trails":
                     return self._send(200, json.dumps({"trails": wikicore.trails(COMPUTER_DIR)}), "application/json")
+                if u.path == "/api/computer/wiki/page":       # Memory Core's Open button: one page's markdown, read-only
+                    p = (q.get("p") or [""])[0]
+                    return self._send(200, json.dumps({"p": p, "md": wikicore.page_md(p)}, ensure_ascii=False),
+                                      "application/json; charset=utf-8")
             except (OSError, ValueError) as e:
                 return self._send(404, json.dumps({"error": str(e)[:200]}), "application/json")
             return self._send(404, '{"error":"unknown"}', "application/json")

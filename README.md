@@ -702,6 +702,9 @@ chat has used the wiki, the side panels and the replay bar stay hidden.
 - **Connections.** Hover a page for its links, click it for its neighbourhood,
   double-click to zoom to it, Shift-click a second page (or **Path to…**) for the
   shortest chain of links between the two.
+- **Open.** The page card's **Open** button shows that page's markdown in a panel over
+  the map, with the frontmatter folded into "Properties". Wiki links in the text select
+  the linked page, and the open panel follows the selection. Esc closes it.
 - **Term probe.** Type terms: each becomes a pill wired to the pages whose title, tags
   or summary contain it. Pages that several terms share are the bridges between them.
 - **Computer.** A chat that used the wiki is drawn as a summary: its search terms, the
@@ -724,6 +727,7 @@ Both calls need the Starfleet key, like the rest of Computer.
 | --- | --- | --- |
 | `GET /api/computer/wiki/graph` | | the wiki's pages and links |
 | `GET /api/computer/wiki/trails` | | every wiki call of the recent Computer chats, with what it returned and what the answer cited |
+| `GET /api/computer/wiki/page?p=wiki/….md` | | one page's markdown, read from disk; only `.md` files inside the wiki folder (`FLEET_WIKI_ROOT`, default `~/llm-wiki`) |
 
 ### Full screen
 

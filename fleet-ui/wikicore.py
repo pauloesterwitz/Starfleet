@@ -210,7 +210,32 @@ def trails(chat_dir):
     return out
 
 
+# ---------------------------------------------------------------- one page (the Open button)
+
+WIKI_ROOT = os.path.expanduser(os.environ.get("FLEET_WIKI_ROOT", "~/llm-wiki"))   # its wiki/ holds the pages
+PAGE_MAX = 1_000_000        # characters returned of one page
+
+
+def page_md(rel):
+    """Markdown of one page by its graph path ("wiki/concepts/X.md"), read straight from disk, so it works while the
+    wiki-mcp container is stopped. Only .md files inside the wiki folder; anything resolving outside it is refused."""
+    base = os.path.realpath(os.path.join(WIKI_ROOT, "wiki"))
+    if not isinstance(rel, str) or not rel.startswith("wiki/") or not rel.lower().endswith(".md") or "\0" in rel:
+        raise ValueError("not a wiki page")
+    path = os.path.realpath(os.path.join(base, rel[len("wiki/"):]))
+    if not path.startswith(base + os.sep) or not os.path.isfile(path):
+        raise ValueError("not a wiki page")
+    with open(path, encoding="utf-8", errors="replace") as f:
+        return f.read(PAGE_MAX)
+
+
 if __name__ == "__main__":       # self-check: python3 wikicore.py
+    for bad in ("wiki/../etc/passwd.md", "../wiki/x.md", "/etc/passwd", "wiki/x.txt", "wiki/no-such-page.md", None):
+        try:
+            page_md(bad)
+            raise AssertionError(f"page_md accepted {bad!r}")
+        except ValueError:
+            pass
     s = _step("wiki_search", {"query": "example router"},
               "Search \"x\"\n1. `wiki/entities/Example Router.md` | Example Router | entity | entry (catalogue match: title)\n"
               "2. `wiki/entities/Example Server (v2).md` | Example Server (v2) | entity | via [[Example Router]] (related): x\n", 1.0)

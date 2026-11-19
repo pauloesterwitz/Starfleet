@@ -509,6 +509,7 @@ function tip(p,n){
 /* ---------------------------------------------------------------- selection, path, probe */
 function select(n,fly){
   sel=n||null; pathSel=null; pathMode=false; $("mcov").classList.remove("path");
+  if(docN&&docN!==sel) sel?openDoc(sel):closeDoc();   /* an open page follows the selection */
   if(fly&&n) flyTo([n,...n.adj.map(a=>a[0])],90);
   paintCard(); refocus();
 }
@@ -607,13 +608,14 @@ function paintCard(pathTo){
         pathSel.map((m,i)=>`<a data-p="${esc(m.p)}">${esc(m.t)}${i?`<small>${esc(kindOf(pathSel[i-1],m))}</small>`:""}</a>`).join("")+`</div>`
       :`<div class="nbh" style="color:var(--red)">No chain of links joins this page and ${esc(pathTo?pathTo.t:"that page")}.</div>`):"";
     el.style.display="block"; el.style.borderLeftColor=col;
-    el.innerHTML=`<h3 style="color:${col}">${esc(n.t)}<span><button type="button" id="mcpf" title="Zoom to this page and its neighbours">Focus</button><button
+    el.innerHTML=`<h3 style="color:${col}">${esc(n.t)}<span><button type="button" id="mcpo" class="${docN===n?"on":""}" title="Read this page's markdown">Open</button><button type="button" id="mcpf" title="Zoom to this page and its neighbours">Focus</button><button
         type="button" id="mcpp" class="${pathMode?"on":""}" title="Then click a second page: the shortest chain of links between the two (or Shift-click it)">Path to…</button><button type="button" id="mcpx">Close</button></span></h3>
       <div class="pth">${esc(n.type||"untyped")} · ${esc(n.p)}</div>${n.sum?`<p>${esc(n.sum)}</p>`:""}
       <div class="tg">${n.tags.map(t=>`<u title="Probe this tag">${esc(t)}</u>`).join("")}</div>
       <div class="kv"><span>Links<b>${n.adj.length}</b></span><span>Weight<b>${n.w}</b></span><span>Read by Computer<b>${reads}</b></span></div>
       ${path}${nbList(n)}`;
     $("mcpx").onclick=()=>select(null);
+    $("mcpo").onclick=()=>docN===n?closeDoc():openDoc(n);
     $("mcpf").onclick=()=>flyTo([n,...n.adj.map(a=>a[0])],90);
     $("mcpp").onclick=()=>{ pathMode=!pathMode; $("mcpp").classList.toggle("on",pathMode); $("mcov").classList.toggle("path",pathMode); };
     el.querySelectorAll(".tg u").forEach(u=>u.onclick=()=>{ $("mcq").value=u.textContent; setProbe(u.textContent); });
@@ -622,6 +624,37 @@ function paintCard(pathTo){
   document.querySelectorAll("#mcr .nb a").forEach(a=>{ const m=byPath[a.dataset.p]; if(!m) return;
     a.onclick=()=>select(m,!m.vis); a.onmouseenter=()=>{ hov=m; kick(); }; a.onmouseleave=()=>{ hov=null; kick(); }; });
 }
+/* Open: the selected page's markdown in a panel over the map, read from disk by /api/computer/wiki/page (works
+   while the wiki-mcp container is stopped). Frontmatter folds into "Properties"; [[wiki links]] select that page. */
+let docN=null, docSeq=0;
+function closeDoc(){ docN=null; docSeq++; const d=$("mcdoc"); if(d) d.remove(); if(sel) paintCard(); }
+async function openDoc(n){
+  let d=$("mcdoc");
+  if(!d){
+    d=document.createElement("div"); d.id="mcdoc";
+    d.addEventListener("click",e=>{ const a=e.target.closest("a[href^='#wiki:']"); if(!a) return;
+      e.preventDefault(); const m=resolve(decodeURIComponent(a.getAttribute("href").slice(6))); if(m) select(m,!m.vis); });
+    $("mcbox").appendChild(d);
+  }
+  docN=n; const seq=++docSeq, col=TYPES[n.ty][1];
+  d.style.borderLeftColor=col;
+  d.innerHTML=`<div class="hd"><b style="color:${col}">${esc(n.t)}</b><button type="button" id="mcdx" title="Close (Esc)">Close</button></div>
+    <div class="pth">${esc(n.p)}</div><div class="cm"><div class="body"><span class="st loading">loading...</span></div></div>`;
+  $("mcdx").onclick=closeDoc; if(sel) paintCard();
+  let text;
+  try{ text=(await compJSON("/api/computer/wiki/page?p="+encodeURIComponent(n.p))).md; }
+  catch(e){ if(seq===docSeq) d.querySelector(".body").innerHTML=`<span class="err">${esc(e.message||String(e))}</span>`; return; }
+  if(seq!==docSeq) return;                                   /* another page was opened meanwhile */
+  const fm=/^---\r?\n([\s\S]*?)\r?\n---\r?\n?/.exec(text), body=(fm?text.slice(fm[0].length):text)
+    .replace(/!\[\[/g,"[[")
+    .replace(/\[\[([^\]|#\n]+)(#[^\]|\n]*)?(?:\|([^\]\n]+))?\]\]/g,(m,t,h,a)=>`[${(a||t+(h||"")).replace(/[[\]]/g,"")}](#wiki:${encodeURIComponent(t.trim())})`);
+  const b=d.querySelector(".body");
+  b.innerHTML=(fm?`<details class="fm"><summary>Properties</summary><pre>${esc(fm[1])}</pre></details>`:"")+md(body);
+  b.querySelectorAll("a[href^='#wiki:']").forEach(a=>{ a.removeAttribute("target"); a.classList.toggle("dead",!resolve(decodeURIComponent(a.getAttribute("href").slice(6)))); });
+  if(window.compHL) compHL(b);
+}
+addEventListener("keydown",e=>{ if(e.key==="Escape"&&docN&&view==="wiki"&&!/^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName)) closeDoc(); });
+
 function funnel(t){
   const S=t.steps, u=a=>new Set(a.filter(Boolean)).size;
   return {search:S.filter(s=>s.tool==="search").length, hits:u(S.flatMap(s=>s.tool==="search"?s._hits.map(h=>h.n):[])),

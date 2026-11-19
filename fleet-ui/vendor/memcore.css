@@ -103,6 +103,19 @@ body.wiki #wikiview{display:flex;flex-direction:column;height:calc(100vh - 12px)
   padding:2px 9px;cursor:pointer;letter-spacing:.08em;text-transform:uppercase;white-space:nowrap}
 #mcr h3 button:hover,#mcr h3 button.on{background:var(--orange);color:#000}
 #mcpage .pth{font-size:11px;color:var(--dim);letter-spacing:.04em;margin:3px 0 6px;word-break:break-all}
+/* Open: one page's markdown over the right of the map */
+#mcdoc{position:absolute;top:8px;right:8px;bottom:8px;width:min(760px,calc(100% - 16px));z-index:6;display:flex;flex-direction:column;
+  background:#0b0803f5;border-left:8px solid var(--blue);box-shadow:0 0 0 2px #000,0 8px 30px #000a}
+#mcdoc .hd{display:flex;align-items:flex-start;gap:10px;padding:8px 12px 0}
+#mcdoc .hd b{flex:1;min-width:0;font-size:20px;font-weight:700;text-transform:uppercase;line-height:1.05;overflow-wrap:anywhere}
+#mcdoc .hd button{font:inherit;font-size:11px;font-weight:700;background:var(--grid);color:var(--text);border:0;border-radius:9px;
+  padding:2px 9px;cursor:pointer;letter-spacing:.08em;text-transform:uppercase}
+#mcdoc .hd button:hover{background:var(--orange);color:#000}
+#mcdoc .pth{font-size:11px;color:var(--dim);letter-spacing:.04em;padding:3px 12px 8px;word-break:break-all}
+#mcdoc .cm{flex:1;min-height:0;overflow:auto;padding:0 12px 12px}
+#mcdoc .cm .body{border-left:0;padding:4px 4px 8px;letter-spacing:normal}
+#mcdoc .fm{margin:0 0 8px;font-size:12px;color:var(--dim)} #mcdoc .fm summary{cursor:pointer;text-transform:uppercase;letter-spacing:.08em}
+#mcdoc a[href^="#wiki:"]{color:var(--blue);cursor:pointer} #mcdoc a.dead{color:var(--dim);cursor:default;text-decoration:line-through}
 #mcpage p,#mcprobe p{margin:0 0 6px;color:var(--text);font-size:13px;line-height:1.35;letter-spacing:.03em}
 #mcprobe p.d{color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.06em;margin-top:4px}
 #mcpage .tg{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:6px}
