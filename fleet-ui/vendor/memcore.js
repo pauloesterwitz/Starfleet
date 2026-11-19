@@ -11,7 +11,7 @@
    Computer: a session is drawn as search anatomy: term pills -> entry pages (catalogue match) -> pages reached over a
      relation (dashed) -> full-text fallback (dotted); related fans, numbered reads, cited pages, and the course between
      them. The bar under the map replays it step by step; the camera follows.
-   Data: /api/computer/wiki/graph (wiki-mcp's own link graph) and /api/computer/wiki/trails (Computer's chat files), both
+   Data: /api/computer/wiki/graph (memory-core's own link graph) and /api/computer/wiki/trails (Computer's chat files), both
    behind the Starfleet key like the rest of Computer. Read-only. Uses fleet.html's compJSON, esc, ago, view. */
 (()=>{
 const TYPES={other:["Other","#f96",.22],concept:["Concepts","#9cf",.45],entity:["Entities","#fc6",.67],source:["Sources","#c9c",.89]};
@@ -120,7 +120,7 @@ function kick(){ if(!raf) raf=requestAnimationFrame(frame); }
 async function loadGraph(){
   try{
     const j=await compJSON("/api/computer/wiki/graph");
-    if(j.error) msg(j.error,true); else msg(j.note||"");   /* note: wiki-mcp stopped, map read by a one-shot run */
+    if(j.error) msg(j.error,true); else msg(j.note||"");   /* note: memory-core is stopped (the map still reads the vault) */
     if(!j.graph){ setTimeout(()=>{ if(view==="wiki") loadGraph(); },3000); return; }
     if(G&&j.at===gAt) return;
     gAt=j.at;
@@ -625,7 +625,7 @@ function paintCard(pathTo){
     a.onclick=()=>select(m,!m.vis); a.onmouseenter=()=>{ hov=m; kick(); }; a.onmouseleave=()=>{ hov=null; kick(); }; });
 }
 /* Open: the selected page's markdown in a panel over the map, read from disk by /api/computer/wiki/page (works
-   while the wiki-mcp container is stopped). Frontmatter folds into "Properties"; [[wiki links]] select that page. */
+   while the memory-core service is stopped). Frontmatter folds into "Properties"; [[wiki links]] select that page. */
 let docN=null, docSeq=0;
 function closeDoc(){ docN=null; docSeq++; const d=$("mcdoc"); if(d) d.remove(); if(sel) paintCard(); }
 async function openDoc(n){

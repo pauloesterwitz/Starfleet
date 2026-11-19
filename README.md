@@ -716,10 +716,10 @@ chat has used the wiki, the side panels and the replay bar stay hidden.
   shows as **Locked**.
 
 It is read-only. [`wikicore.py`](fleet-ui) exports the graph with the wiki MCP server's
-own link scanner, run inside its container with `docker exec` (`FLEET_WIKI_CONTAINER`),
-so the map shows exactly the relations Computer's `wiki_search` and `wiki_related`
-follow; an export is reused for 10 minutes. While that container is stopped, a one-shot
-read-only, offline run of its image reads the wiki instead, and the last good map is
+own link scanner, run with that server's Python (`FLEET_MEMORY_CORE`, default
+`~/memory-core`), so the map shows exactly the relations Computer's `wiki_search` and
+`wiki_related` follow; an export is reused for 10 minutes. The export only reads the
+vault, so the map also works while the server is stopped, and the last good map is
 kept on disk. The courses come from Computer's chat files.
 Both calls need the Starfleet key, like the rest of Computer.
 
@@ -949,7 +949,7 @@ the page does not, and the app does not.
    | `FLEET_COMPUTER_DIR` | where Computer keeps its chats; default `~/.local/share/fleet-ui/computer` |
    | `FLEET_ASR_GATE` | the speech-to-text gate script Computer's voice input runs on the head node (`FLEET_ASR_GATE_REMOTE`: the same script on the other nodes, run over ssh) |
    | `FLEET_WIKI_PUBLIC_URL` | where the browser reaches the wiki; Computer rewrites the wiki's local links to it |
-   | `FLEET_WIKI_CONTAINER` | the wiki MCP server's container that Memory Core exports the graph from |
+   | `FLEET_MEMORY_CORE` | the wiki MCP server's project folder (with its `.venv`) that Memory Core exports the graph from; default `~/memory-core` |
 
 3. Optional: the [Deep Space NAS](#deep-space-nas-the-nas-containers) and
    [Memory Alpha](#memory-alpha-the-off-site-backup) views need the `nas-deployer` ssh

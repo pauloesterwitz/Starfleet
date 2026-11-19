@@ -1,9 +1,8 @@
 """Memory Core: the LLM wiki as one graph, and the path Computer took through it. Read-only.
 
-The graph comes from wiki-mcp's own link scanner (wiki_mcp.graph), so the map shows exactly the relations Computer's
-wiki_search and wiki_related follow. While the wiki-mcp container runs, it is read with docker exec; when it was stopped
-(e.g. to free memory), a one-shot container of the same image reads the wiki read-only, offline, for a few seconds and is
-removed. The last good map is also kept on disk, so a Fleet restart or a removed container still shows the core. The trails come from Computer's chat files
+The graph comes from memory-core's own link scanner (memory_core.graph, run with memory-core's venv python), so the map
+shows exactly the relations Computer's wiki_search and wiki_related follow. It only reads the vault, so it works while the
+memory-core service is stopped. The last good map is also kept on disk, so a Fleet restart still shows the core. The trails come from Computer's chat files
 (fleet.py COMPUTER_DIR): every wiki_* call with its arguments, what it returned, and what the answer cited.
 Nothing here writes to the wiki, the chats or the container."""
 import glob
@@ -15,18 +14,18 @@ import threading
 import time
 import urllib.parse
 
-CONTAINER = os.environ.get("FLEET_WIKI_CONTAINER", "wikidemo-mcp")
+MEMORY_CORE = os.path.expanduser(os.environ.get("FLEET_MEMORY_CORE", "~/memory-core"))   # the wiki MCP server's project folder
 TTL = 600          # seconds a graph export is reused; a stale one is served while the next builds in the background
 MAX_CHATS = 40     # newest chats scanned for trails
 MAX_HITS = 40      # hits kept per step
 CACHE_FILE = os.path.expanduser("~/.cache/fleet-ui/wiki-graph.json")
 
-# Runs inside the wiki-mcp container (python -). graph.get only stats and parses the vault.
+# Runs with memory-core's python (python -). graph.get only stats and parses the vault.
 _EXPORT = r'''
 import json, os
 from pathlib import Path
-from wiki_mcp import graph
-v = Path(os.environ.get("WIKI_VAULT", "/vault"))
+from memory_core import graph
+v = Path(os.environ["WIKI_VAULT"])
 g = graph.get(v)
 idx = {p: i for i, p in enumerate(g.nodes)}
 nodes = [[p, g.parsed[p]["title"], g.parsed[p]["type"], g.parsed[p]["tags"][:5], round(g.in_weight.get(p, 0), 2),
@@ -42,24 +41,14 @@ _cache = {"at": 0.0, "json": None, "error": None, "note": None, "busy": False}
 
 
 def _export_cmd():
-    """(argv, note): docker exec into the running wiki-mcp container, else a one-shot read-only run of its image."""
-    r = subprocess.run(["docker", "inspect", CONTAINER], capture_output=True, text=True, timeout=30)
-    if r.returncode != 0:
-        raise OSError(f"container {CONTAINER} not found")
-    c = json.loads(r.stdout)[0]
-    if c["State"].get("Running"):
-        return ["docker", "exec", "-i", CONTAINER, "python", "-"], None
-    vol = [m for m in c.get("Mounts", []) if m.get("Destination") == "/vault/wiki"]
-    if not vol:
-        raise OSError(f"container {CONTAINER} has no /vault/wiki mount")
-    cfg = c["Config"]
-    argv = ["docker", "run", "--rm", "-i", "--network", "none", "--read-only", "--tmpfs", "/tmp", "--memory", "1g",
-            "-v", f'{vol[0]["Source"]}:/vault/wiki:ro', "-e", "WIKI_VAULT=/vault", "-e", "PYTHONPATH=/app",
-            "-w", cfg.get("WorkingDir") or "/app", "--entrypoint", "python"]
-    if cfg.get("User"):
-        argv += ["--user", cfg["User"]]
-    return argv + [cfg["Image"], "-"], (f"{CONTAINER} is stopped: the map was read by a one-shot read-only run of its image. "
-                                        "Computer cannot use the wiki until it runs again.")
+    """(argv, note): memory-core's venv python reading the vault; the note says when the service is down."""
+    py = os.path.join(MEMORY_CORE, ".venv", "bin", "python")
+    if not os.access(py, os.X_OK):
+        raise OSError(f"{py} not found")
+    argv = ["env", f"PYTHONPATH={MEMORY_CORE}", "WIKI_VAULT=" + os.path.expanduser("~/llm-wiki"), py, "-"]
+    r = subprocess.run(["systemctl", "--user", "is-active", "memory-core"], capture_output=True, text=True, timeout=10)
+    note = None if r.stdout.strip() == "active" else "memory-core is stopped: Computer cannot use the wiki until it runs again."
+    return argv, note
 
 
 def _refresh():
@@ -80,7 +69,7 @@ def _refresh():
         except OSError:
             pass                             # the disk copy is a convenience only
     except (OSError, ValueError, IndexError, KeyError, subprocess.SubprocessError) as e:
-        err = f"wiki graph from container {CONTAINER}: {str(e)[:300]}"
+        err = f"wiki graph from memory-core: {str(e)[:300]}"
     with _lock:
         if data:
             _cache["json"], _cache["at"] = data, time.time()
@@ -218,7 +207,7 @@ PAGE_MAX = 1_000_000        # characters returned of one page
 
 def page_md(rel):
     """Markdown of one page by its graph path ("wiki/concepts/X.md"), read straight from disk, so it works while the
-    wiki-mcp container is stopped. Only .md files inside the wiki folder; anything resolving outside it is refused."""
+    memory-core service is stopped. Only .md files inside the wiki folder; anything resolving outside it is refused."""
     base = os.path.realpath(os.path.join(WIKI_ROOT, "wiki"))
     if not isinstance(rel, str) or not rel.startswith("wiki/") or not rel.lower().endswith(".md") or "\0" in rel:
         raise ValueError("not a wiki page")
