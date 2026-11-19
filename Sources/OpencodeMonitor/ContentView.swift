@@ -7,6 +7,7 @@ struct ContentView: View {
     @ObservedObject var widgetController: DesktopWidgetController
     @ObservedObject var panelController: PanelController
     @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
+    @ObservedObject private var updater = SelfUpdate.shared
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
@@ -84,8 +85,30 @@ struct ContentView: View {
                     }
                 }
 
-            Button("Quit") {
-                NSApplication.shared.terminate(nil)
+            Divider()
+            HStack(spacing: 8) {
+                CheckForUpdatesButton()
+                if updater.failed, !updater.running {
+                    Button("Log") { NSWorkspace.shared.open(SelfUpdate.log) }
+                }
+            }
+            .font(.caption)
+            if updater.running || updater.result != nil {
+                Text(updater.running
+                     ? "A new Mac build takes a few minutes and restarts the app."
+                     : updater.result ?? "")
+                    .font(.caption2)
+                    .foregroundStyle(updater.failed && !updater.running ? .red : .secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            HStack {
+                HelpButton()
+                Button("About") { AboutPanel.show() }
+                Spacer()
+                Button("Quit") {
+                    NSApplication.shared.terminate(nil)
+                }
             }
         }
         .padding(12)

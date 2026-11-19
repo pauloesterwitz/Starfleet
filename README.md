@@ -763,6 +763,10 @@ page's own `localStorage`, as in a browser.
   (press again to stop), the same as the page's own hotkey (Ctrl+Shift+Space by
   default), which only works while the window has focus. A global hotkey through
   Carbon's `RegisterEventHotKey`, so no Accessibility permission.
+- **Help and About.** **Help** in the dropdown (or the Help menu, `⌘?`, while the Fleet
+  window is open) opens a short guide: the menu bar icon, the shortcuts, Fleet's
+  address, updates and what to do when something is wrong. **About** shows the build's
+  commit and the credits.
 - **iPhone:** pull down to reload; when Fleet can't be reached (Tailscale off, head node
   down) an error card with Retry, and coming back from the Tailscale app retries by
   itself. Layout stays inside the safe area.
@@ -1461,18 +1465,39 @@ cd ios && grep -m1 -o 'DEVELOPMENT_TEAM = [A-Z0-9]*' Starfleet.xcodeproj/project
 ### Updates, at every start of the Mac app
 
 Build and install by hand once; after that the Mac app updates both apps itself. At
-every start it runs [`update.sh`](update.sh) from the clone it was built from
-(`package.sh` stamps that path and the commit into the bundle), in the background:
+every start, and from **Check for Updates…** in the dropdown or the app menu, it runs
+[`update.sh`](update.sh) from the clone it was built from (`package.sh` stamps that path
+and the commit into the bundle), in the background:
 
 1. `main` is fast-forwarded from `origin`. Never a merge; a clone on another branch, or
    with local commits, is left alone.
-2. **iPhone**: when `ios/` changed since the last install, the app is built with
-   `xcodebuild` and installed on the paired iPhone with `devicectl`, over the cable or
-   Wi-Fi. An iOS app cannot replace itself, so the Mac does it. Needs
-   `ios/Local.xcconfig` (see above) and the iPhone paired with Xcode once; when no
-   iPhone is reachable, the next start tries again.
-3. **Mac**: when the app's sources changed since the running build, `package.sh`
-   rebuilds it, and the app quits, is swapped for the new bundle and opens again.
+2. **Mac**: when the app's sources changed since the running build, `package.sh`
+   rebuilds it, and the app quits, is swapped for the new bundle and opens again. The
+   swap (renames only) happens before the app quits, so a folder it cannot be written
+   to, or a failed build, leaves the running app alone. Uncommitted changes
+   in the app's sources are not built: the stamp would pass them off as the commit.
+3. **iPhone**, once the Mac app is current (after a Mac update, the new app's own start
+   does this): when `ios/` changed since the last install, the app is built with
+   `xcodebuild` and installed with `devicectl` on the paired iPhone that is on the cable
+   or the same Wi-Fi now. An iOS app cannot replace itself, so the Mac does it. Needs
+   `ios/Local.xcconfig` (see above) and the iPhone paired with Xcode once. With a free
+   Apple ID the signature lasts 7 days: once the installed build's profile has expired,
+   it is signed and installed again without a change in `ios/`.
+
+One run at a time per clone, also when the app is quit and opened again during a build: a
+lock (`shlock`) that is dropped once its process is gone, and the update quits a copy
+opened again meanwhile too. The dropdown shows how the last run ended:
+
+- up to date, with the build's commit;
+- GitHub not reachable;
+- the clone is on another branch, cannot fast-forward, or has uncommitted changes in the
+  app's sources;
+- the iPhone app was not updated (phone away, or its build failed);
+- another update is still running;
+- a failure.
+
+All but "up to date" and "another update" come with a **Log** button. A run that finds a
+new Mac build ends with the app restarting.
 
 The page itself needs none of this: Fleet serves it fresh. The log is
 `~/Library/Logs/Starfleet Command update.log`. The first signed `xcodebuild` may ask once
@@ -1495,7 +1520,9 @@ Not needed for anything above: see [Add-on: the USB panel](#add-on-a-usb-panel-f
 
 ```
 Sources/OpencodeMonitor/   the app (the directory keeps the project's original name)
-  App.swift                 entry point; where the nodes are declared, MenuBarExtra + Fleet's Window scene
+  App.swift                 entry point; where the nodes are declared, MenuBarExtra + Fleet's Window scene,
+                            the self-update and Check for Updates
+  HelpAbout.swift           the Help window's text and the About panel
   StatusPoller.swift        SSH polling, stall detection, Tailscale re-auth
   Models.swift              payload decoding + session ordering
   ContentView.swift         menu bar dropdown
@@ -1504,6 +1531,7 @@ Sources/OpencodeMonitor/   the app (the directory keeps the project's original n
   Panel*.swift, GPUStream.swift   the optional USB panel: driver, controller, streamed GPU figures
 ios/                       the iPhone app: Starfleet.xcodeproj, Starfleet/StarfleetApp.swift, the icon
 package.sh, update.sh      build the Mac app; the self-update both apps get at every start of the Mac app
+                            and from Check for Updates
 cluster/                   the cluster's configuration and tooling: the llama-swap config and
                             launchers, the memory guard (memcheck.sh and friends), the context proxy
                             that also gates every load, the status scripts the app runs over ssh,

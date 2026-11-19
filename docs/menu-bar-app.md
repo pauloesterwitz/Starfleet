@@ -57,7 +57,7 @@ The session list (both hosts' Claude Code + opencode sections together)
 scrolls inside a capped `ScrollView` (max height 420pt) rather than growing
 the dropdown freely -- two hosts' worth of sessions, especially with a
 transcript expanded, can easily outgrow screen height otherwise. The
-"Show desktop widget"/"Launch at Login"/"Quit" controls sit below it,
+"Show desktop widget"/"Launch at Login"/"Check for Updates…"/"Help"/"About"/"Quit" controls sit below it,
 outside the scrollable area, so they're always reachable regardless of how
 long the session list gets.
 

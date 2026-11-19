@@ -12,6 +12,8 @@
     <string>com.oesterwitz.starfleetcommand</string>
     <key>CFBundleShortVersionString</key>
     <string>1.0</string>
+    <key>NSHumanReadableCopyright</key>
+    <string>Copyright © 2026 pauloesterwitz. MIT License.</string>
     <key>CFBundleIconFile</key>
     <string>app-icon</string>
     <key>LSUIElement</key>
