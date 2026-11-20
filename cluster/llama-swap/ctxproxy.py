@@ -39,12 +39,16 @@ import os
 import re
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # ponytail: llama-swap listens on the private :28079 (only Starfleet Command, fleet-ui, talks to it
 # directly); every other client reaches it through here on :28080/:28081 with the guard always on.
 UPSTREAM = ("127.0.0.1", 28079)
 LISTEN = [("127.0.0.1", 28080), ("127.0.0.1", 28081)]
+# ponytail: Deep Space NAS (same router) reaches :28080 on the LAN address; same guard as loopback.
+# CTXPROXY_LAN="" turns it off. Not 0.0.0.0: that would also open the tailnet and the 10.100.x fabric.
+LAN = (os.environ.get("CTXPROXY_LAN", "192.168.178.128"), 28080)
 LS_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG = os.path.join(LS_DIR, "config.yaml")
 CTX_DIR = os.path.join(os.environ.get("GB10_STATE_DIR") or os.path.expanduser("~/.gb10"), "ctx")
@@ -419,6 +423,20 @@ def selftest():
     print("ctxproxy selftest OK")
 
 
+def serve_lan():
+    """Retry until the NIC holds the address (boot race); never take the loopback listeners down for it."""
+    while True:
+        try:
+            srv = ThreadingHTTPServer(LAN, Handler)
+        except OSError as exc:
+            sys.stderr.write("ctxproxy: LAN listener %s:%d not up (%s), retrying in 10s\n" % (LAN + (exc,)))
+            time.sleep(10)
+            continue
+        srv.daemon_threads = True
+        sys.stderr.write("ctxproxy: also listening on %s:%d (LAN)\n" % LAN)
+        srv.serve_forever()
+
+
 if __name__ == "__main__":
     if "--selftest" in sys.argv:
         selftest()
@@ -431,4 +449,6 @@ if __name__ == "__main__":
                      % (LISTEN[0] + UPSTREAM + (CTX_DIR,)))
     for srv in srvs[1:]:
         threading.Thread(target=srv.serve_forever, daemon=True).start()
+    if LAN[0]:
+        threading.Thread(target=serve_lan, daemon=True).start()
     srvs[0].serve_forever()

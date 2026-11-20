@@ -1,0 +1,475 @@
+#!/usr/bin/env python3
+"""speech-ctl: start, stop and inspect ONE speech-to-text server on THIS machine (Shuttle Bay's Speech family).
+
+  speech-ctl status [ID]        JSON: this node's memory and every member's state (or one member)
+  speech-ctl fit ID             JSON: would ID fit right now? (never starts anything)
+  speech-ctl start ID           fit check, reserve memory in the shared ledger, launch, wait until ready
+  speech-ctl stop ID            stop, prove it is gone, reap leftovers, drop its weights from the page cache, report freed MB
+  speech-ctl dryrun ID          print the launch command, touch nothing (read-only, safe to probe)
+  speech-ctl selftest           synthetic stand-in member: proves start/stop frees memory (no real model is loaded)
+Fleet (Shuttle Bay) runs this locally for Jean-Luc and over ssh for Kathryn. stdout is always ONE JSON object.
+Exit codes: 0 ok, 3 does not fit, 1 failure.
+
+Why it looks like this (the incidents behind it, see the memory notes):
+ - A member is a systemd --user unit (native) or a docker container, NEVER a child of fleet-ui.service: a Fleet restart
+   must not kill a resident server (fleet-ui-restart-kills-embed-members).
+ - Stop must really stop. systemd KillMode=control-group / docker stop take the whole tree; then anything still
+   mentioning the weights or the unit name is reaped, and the weights leave the page cache (posix_fadvise DONTNEED,
+   no root needed) so "free" memory comes back, not just "available" (llama-swap-unload-leak-cmdstop).
+ - Memory is admitted against the SAME ledger as every model load (~/.gb10/reservations: "<pid> <mb>" lines, live while the
+   pid lives). memcheck.sh itself is not called: its ds4 orphan reaper killed a healthy pinned model (memcheck-reaps-ornith).
+"""
+import argparse, json, os, re, signal, subprocess, sys, tempfile, time, urllib.error, urllib.request
+
+HOME = os.path.expanduser("~")
+REGISTRY = os.environ.get("SPEECH_REGISTRY", f"{HOME}/llama-swap/speech-members.json")
+STATE = os.environ.get("GB10_STATE_DIR", f"{HOME}/.gb10")
+LOGDIR = os.environ.get("SPEECH_LOGDIR", f"{HOME}/llama-swap/logs")
+ENV = dict(os.environ, XDG_RUNTIME_DIR=os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+FLOOR_ENV = os.environ.get("SPEECH_FLOOR_MB")      # tests only: replaces the reserve below
+RESERVE_FLOOR_MB = 4096          # always leave this much; 6 GB while swap is over 80 % used
+OOM_ADJ = "800"                  # a speech server is the cheaper victim, never the pinned LLM
+DOCKER_STANDIN_IMAGE = os.environ.get("SPEECH_STANDIN_IMAGE", "vllm/vllm-openai:v0.27.1-aarch64")
+
+
+def out(obj, code=0):
+    print(json.dumps(obj))
+    sys.exit(code)
+
+
+def sh(cmd, timeout=60):
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=ENV)
+
+
+def meminfo():
+    d = {}
+    for line in open("/proc/meminfo"):
+        k, v = line.split(":", 1)
+        d[k] = int(v.split()[0]) // 1024
+    return d
+
+
+def reserved_mb():
+    tot = 0
+    for f in os.listdir(f"{STATE}/reservations") if os.path.isdir(f"{STATE}/reservations") else []:
+        try:
+            pid, mb = open(f"{STATE}/reservations/{f}").read().split()[:2]
+            os.kill(int(pid), 0)
+            tot += int(mb)
+        except (OSError, ValueError):
+            pass
+    return tot
+
+
+def fabric_ip():
+    for line in sh(["ip", "-4", "-o", "addr"]).stdout.splitlines():
+        m = re.search(r"inet (10\.100\.0\.\d+)/", line)
+        if m:
+            return m.group(1)
+    return "127.0.0.1"
+
+
+def members():
+    try:
+        return json.load(open(REGISTRY))["members"]
+    except (OSError, ValueError, KeyError):
+        return {}
+
+
+def member(mid):
+    m = members().get(mid)
+    if not m:
+        out({"ok": False, "error": f"unknown member {mid!r}"}, 1)
+    return m
+
+
+def unit(mid):
+    return "speech-" + re.sub(r"[^a-z0-9-]+", "-", mid.lower()).strip("-")
+
+
+def fmt(s, m, mid, host, port):
+    w = (m.get("weights") or [""])
+    return (str(s).replace("{host}", host).replace("{port}", str(port)).replace("{id}", mid)
+            .replace("{home}", HOME).replace("{weights0}", w[0]))
+
+
+# ---------------------------------------------------------------- state of one member
+def tree_pids(root):
+    kids = {}
+    for p in os.listdir("/proc"):
+        if p.isdigit():
+            try:
+                ppid = int(open(f"/proc/{p}/stat").read().rsplit(")", 1)[1].split()[1])
+                kids.setdefault(ppid, []).append(int(p))
+            except (OSError, ValueError, IndexError):
+                pass
+    seen, todo = [], [root]
+    while todo:
+        p = todo.pop()
+        seen.append(p)
+        todo += kids.get(p, [])
+    return seen
+
+
+def cgroup_mem_mb(pid):
+    try:
+        path = open(f"/proc/{pid}/cgroup").read().strip().split("::", 1)[1]
+        return int(open(f"/sys/fs/cgroup{path}/memory.current").read()) // (1 << 20)
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def rss_mb(pid):
+    tot = 0
+    for p in tree_pids(pid):
+        try:
+            tot += int(re.search(r"VmRSS:\s+(\d+)", open(f"/proc/{p}/status").read()).group(1)) // 1024
+        except (OSError, AttributeError):
+            pass
+    return tot
+
+
+def ready_http(m, host, port):
+    r = m.get("ready") or {}
+    try:
+        with urllib.request.urlopen(f"http://{host}:{port}{r.get('path', '/')}", timeout=3) as resp:
+            return resp.status < 500
+    except urllib.error.HTTPError as e:
+        return bool(r.get("any_http")) and e.code < 500
+    except (urllib.error.URLError, OSError):
+        return False
+
+
+def state_of(mid, m):
+    """{"running", "ready", "pid", "since", "mem_mb"}: what is true right now, asked of systemd or docker."""
+    u, port, host = unit(mid), m["port"], fabric_ip()
+    pid, since = 0, None
+    if m["engine"] == "docker":
+        r = sh(["docker", "inspect", "-f", "{{.State.Running}} {{.State.Pid}} {{.State.StartedAt}}", u], 20)
+        parts = r.stdout.split() if r.returncode == 0 else []
+        running = bool(parts) and parts[0] == "true"
+        if running:
+            pid = int(parts[1])
+            since = parts[2]
+    else:
+        r = sh(["systemctl", "--user", "show", u, "-p", "ActiveState", "-p", "MainPID", "-p", "ActiveEnterTimestamp"], 20)
+        kv = dict(l.split("=", 1) for l in r.stdout.splitlines() if "=" in l)
+        running = kv.get("ActiveState") in ("active", "activating")
+        pid = int(kv.get("MainPID") or 0)
+        since = kv.get("ActiveEnterTimestamp") or None
+    st = {"running": running, "ready": False, "pid": pid, "since": since, "mem_mb": None}
+    if running and pid:
+        st["mem_mb"] = cgroup_mem_mb(pid) or rss_mb(pid)
+        st["ready"] = ready_http(m, host, port)
+    return st
+
+
+# ---------------------------------------------------------------- fit
+def fit_of(mid, m):
+    mi = meminfo()
+    avail, res = mi["MemAvailable"], reserved_mb()
+    swap_used = 100 * (mi["SwapTotal"] - mi["SwapFree"]) // max(1, mi["SwapTotal"])
+    floor = int(FLOOR_ENV) if FLOOR_ENV is not None else RESERVE_FLOOR_MB + (2048 if swap_used > 80 else 0)
+    need = int(m["need_mb"])
+    eff = max(0, avail - res)
+    ok = eff >= need + floor
+    why = "fits" if ok else (f"needs {need/1024:.1f} GB plus {floor/1024:.1f} GB reserve, but only {eff/1024:.1f} GB is free "
+                             f"({avail/1024:.1f} GB available minus {res/1024:.1f} GB promised to loads in flight; swap {swap_used} % used). "
+                             f"Unload something on this machine first.")
+    return {"ok": ok, "need_mb": need, "floor_mb": floor, "avail_mb": avail, "reserved_mb": res, "eff_free_mb": eff, "swap_used_pct": swap_used, "reason": why}
+
+
+# ---------------------------------------------------------------- launch
+def launch_cmd(mid, m, host, port):
+    u, log = unit(mid), f"{LOGDIR}/{unit(mid)}.log"
+    if m["engine"] == "docker":
+        d = m["docker"]
+        c = ["docker", "run", "-d", "--name", u, "--restart", "no", "--oom-score-adj", OOM_ADJ,
+             "--label", "starfleet.speech=1", "--label", f"starfleet.speech.id={mid}", "-p", f"{host}:{port}:{d.get('container_port', port)}"]
+        if d.get("gpus", True):
+            c += ["--gpus", "all"]
+        if d.get("ipc_host"):
+            c += ["--ipc", "host"]
+        if d.get("entrypoint"):
+            c += ["--entrypoint", d["entrypoint"]]
+        if d.get("shm"):
+            c += ["--shm-size", d["shm"]]
+        for v in d.get("mounts", []):
+            c += ["-v", fmt(v, m, mid, host, port)]
+        for k, v in (d.get("env") or {}).items():
+            c += ["-e", f"{k}={fmt(v, m, mid, host, port)}"]
+        return c + [d["image"]] + [fmt(a, m, mid, host, port) for a in d.get("args", [])]
+    n = m["native"]
+    c = ["systemd-run", "--user", "--collect", "--unit", u, "--description", f"Shuttle Bay speech member {mid}",
+         "-p", "KillMode=control-group", "-p", "TimeoutStopSec=30", "-p", f"OOMScoreAdjust={OOM_ADJ}",
+         "-p", f"StandardOutput=append:{log}", "-p", f"StandardError=append:{log}"]
+    for k, v in (n.get("env") or {}).items():
+        c += ["--setenv", f"{k}={fmt(v, m, mid, host, port)}"]
+    return c + [fmt(n["exe"], m, mid, host, port)] + [fmt(a, m, mid, host, port) for a in n.get("args", [])]
+
+
+def stop_unit(mid, m):
+    u = unit(mid)
+    if m["engine"] == "docker":
+        sh(["docker", "stop", "-t", "30", u], 90)
+        sh(["docker", "rm", "-f", u], 60)
+    else:
+        sh(["systemctl", "--user", "stop", u], 90)
+        sh(["systemctl", "--user", "reset-failed", u], 20)
+
+
+def wfiles(m):
+    out_ = []
+    for w in m.get("weights", []):
+        if os.path.isfile(w):
+            out_.append(w)
+        elif os.path.isdir(w):
+            out_ += [os.path.join(r, f) for r, _, fs in os.walk(w) for f in fs]
+    return out_
+
+
+def holds(pid, inodes):
+    """True if the process has one of the weight files open or mapped (matched by device+inode, so a container's own path does not matter)."""
+    for d in ("fd", "map_files"):
+        try:
+            names = os.listdir(f"/proc/{pid}/{d}")
+        except OSError:
+            continue
+        for n in names:
+            try:
+                st = os.stat(f"/proc/{pid}/{d}/{n}")
+            except OSError:
+                continue
+            if (st.st_dev, st.st_ino) in inodes:
+                return True
+    return False
+
+
+def in_cgroup(pid, name):
+    try:
+        return name in open(f"/proc/{pid}/cgroup").read()
+    except OSError:
+        return False
+
+
+def leftovers(mid, m):
+    """Processes still inside this member's own cgroup (its systemd unit or docker scope): after a stop there must be none.
+    Deliberately NOT matched by "holds the weights": the bridge's one-shot whisper-cli maps the very same file, and killing a
+    memo's transcription because the Whisper member was unloaded would drop the memo."""
+    me, u = {os.getpid(), os.getppid()}, unit(mid)
+    return [{"pid": int(p), "cmd": open(f"/proc/{p}/cmdline").read().replace("\0", " ")[:160]}
+            for p in os.listdir("/proc") if p.isdigit() and int(p) not in me and in_cgroup(p, u) and os.path.exists(f"/proc/{p}/cmdline")]
+
+
+def weight_holders(mid, m):
+    """Other processes that hold the weights open or mapped (reported, never killed): they keep the page cache from dropping."""
+    inodes = set()
+    for f in wfiles(m):
+        try:
+            st = os.stat(f)
+            inodes.add((st.st_dev, st.st_ino))
+        except OSError:
+            pass
+    me = {os.getpid(), os.getppid()}
+    out_ = []
+    for p in os.listdir("/proc"):
+        if p.isdigit() and int(p) not in me and holds(int(p), inodes):
+            try:
+                out_.append({"pid": int(p), "cmd": open(f"/proc/{p}/cmdline").read().replace("\0", " ")[:160]})
+            except OSError:
+                pass
+    return out_
+
+
+def drop_cache(m):
+    """Evict the weight files from the page cache (clean pages only; pages a live process still maps stay). Returns MB dropped."""
+    before = meminfo()["Cached"]
+    for f in wfiles(m):
+        try:
+            fd = os.open(f, os.O_RDONLY)
+            try:
+                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+            finally:
+                os.close(fd)
+        except OSError:
+            pass
+    return max(0, before - meminfo()["Cached"])
+
+
+# ---------------------------------------------------------------- commands
+def cmd_status(a):
+    mi, ms = meminfo(), members()
+    res = {"node": os.uname().nodename, "fabric_ip": fabric_ip(), "avail_mb": mi["MemAvailable"], "free_mb": mi["MemFree"], "cached_mb": mi["Cached"],
+           "reserved_mb": reserved_mb(), "swap_used_pct": 100 * (mi["SwapTotal"] - mi["SwapFree"]) // max(1, mi["SwapTotal"]),
+           "members": {mid: state_of(mid, m) for mid, m in ms.items() if not a.id or mid == a.id}}
+    out(res)
+
+
+def cmd_fit(a):
+    out(fit_of(a.id, member(a.id)))
+
+
+def cmd_dryrun(a):
+    m = member(a.id)
+    out({"ok": True, "unit": unit(a.id), "cmd": launch_cmd(a.id, m, fabric_ip(), a.port or m["port"]), "fit": fit_of(a.id, m)})
+
+
+def cmd_start(a):
+    mid, m = a.id, member(a.id)
+    st = state_of(mid, m)
+    if st["running"]:
+        out({"ok": True, "already": True, **st})
+    fit = fit_of(mid, m)
+    if not fit["ok"]:
+        out({"ok": False, "error": "no_fit", **fit}, 3)
+    host, port = fabric_ip(), a.port or m["port"]
+    os.makedirs(f"{STATE}/reservations", exist_ok=True)
+    os.makedirs(LOGDIR, exist_ok=True)
+    rfile = f"{STATE}/reservations/{unit(mid)}"
+    with open(rfile, "w") as f:
+        f.write(f"{os.getpid()} {m['need_mb']} speech-ctl {mid}\n")      # live while THIS process waits for the load
+    t0, err = time.time(), None
+    try:
+        r = sh(launch_cmd(mid, m, host, port), 120)
+        if r.returncode != 0:
+            err = (r.stderr or r.stdout).strip()[-400:]
+        deadline = t0 + int((m.get("ready") or {}).get("timeout_s", 300))
+        while err is None:
+            s = state_of(mid, m)
+            if not s["running"]:
+                logs = sh(["docker", "logs", "--tail", "30", unit(mid)]).stdout if m["engine"] == "docker" else open(f"{LOGDIR}/{unit(mid)}.log").read()[-600:]
+                err = "the server exited while loading: " + logs.strip()[-400:]
+            elif s["ready"]:
+                break
+            elif time.time() > deadline:
+                err = f"not ready after {int(time.time()-t0)} s"
+            else:
+                time.sleep(1.5)
+    finally:
+        try:
+            os.remove(rfile)
+        except OSError:
+            pass
+    if err:
+        stop_unit(mid, m)
+        out({"ok": False, "error": err}, 1)
+    out({"ok": True, "url": f"http://{host}:{port}", "host": host, "port": port, "ready_s": round(time.time() - t0, 1), **state_of(mid, m)})
+
+
+def cmd_stop(a):
+    mid, m = a.id, member(a.id)
+    mi0 = meminfo()
+    st = state_of(mid, m)
+    stop_unit(mid, m)
+    left = leftovers(mid, m)
+    for h in left:                                   # anything the cgroup/container did not take with it
+        try:
+            os.kill(h["pid"], signal.SIGTERM)
+        except OSError:
+            pass
+    if left:
+        time.sleep(3)
+        for h in leftovers(mid, m):
+            try:
+                os.kill(h["pid"], signal.SIGKILL)
+            except OSError:
+                pass
+        time.sleep(1)
+    dropped = drop_cache(m)
+    time.sleep(2)                                    # let the kernel hand the pages back
+    mi1, still = meminfo(), leftovers(mid, m)
+    gone = not state_of(mid, m)["running"] and not still
+    out({"ok": gone, "was_running": st["running"], "mem_mb": st["mem_mb"], "freed_mb": max(0, mi1["MemAvailable"] - mi0["MemAvailable"]),
+         "weights_held_by": weight_holders(mid, m), "free_gain_mb": mi1["MemFree"] - mi0["MemFree"], "cache_dropped_mb": dropped, "leftovers_killed": left, "leftovers_alive": still,
+         "avail_mb": mi1["MemAvailable"]}, 0 if gone else 1)
+
+
+# ---------------------------------------------------------------- self test (no real model is loaded)
+STANDIN = r"""
+import http.server, subprocess, sys
+host, mb, port = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+buf = bytearray(mb << 20)
+for i in range(0, len(buf), 4096): buf[i] = 1
+subprocess.Popen(["sleep", "3600"])
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self): self.send_response(200); self.end_headers()
+    def log_message(self, *a): pass
+http.server.HTTPServer((host, port), H).serve_forever()
+"""
+
+
+def selftest(a, engine=None):
+    global REGISTRY, STATE, LOGDIR
+    if engine is None:                       # both engines; the docker one needs an image that has python3 (any vllm image here does)
+        selftest(a, "native")
+        if subprocess.run(["docker", "image", "inspect", DOCKER_STANDIN_IMAGE], capture_output=True).returncode == 0:
+            selftest(a, "docker")
+        else:
+            print(f"SKIP docker engine: {DOCKER_STANDIN_IMAGE} not on this machine")
+        return
+    d = tempfile.mkdtemp(prefix="speech-selftest-")
+    os.chmod(d, 0o755)
+    open(f"{d}/standin.py", "w").write(STANDIN)
+    weights = f"{d}/weights.bin"
+    open(weights, "wb").write(os.urandom(64 << 20))
+    port = 28190 if engine == "native" else 28191
+    if engine == "native":
+        spec = {"engine": "native", "native": {"exe": "/usr/bin/python3", "args": [f"{d}/standin.py", "{host}", "1024", "{port}"]}}
+    else:
+        spec = {"engine": "docker", "docker": {"image": DOCKER_STANDIN_IMAGE, "gpus": False, "entrypoint": "python3", "container_port": port,
+                                                "mounts": [f"{d}:/t:ro"], "args": ["/t/standin.py", "0.0.0.0", "1024", str(port)]}}
+    reg = {"members": {"selftest": {"need_mb": 1200, "port": port, "weights": [weights], "ready": {"path": "/", "timeout_s": 60}, **spec}}}
+    json.dump(reg, open(f"{d}/reg.json", "w"))
+    REGISTRY, STATE, LOGDIR = f"{d}/reg.json", f"{d}/state", f"{d}/logs"
+    os.makedirs(f"{STATE}/reservations")
+    tag = f"[{engine}] "
+    ok = lambda c, msg: print(("PASS " if c else "FAIL ") + tag + msg) or (c or sys.exit(1))
+    m = member("selftest")
+    ok(fit_of("selftest", m)["ok"], "fit: 1.2 GB fits on this machine now")
+    huge = dict(m, need_mb=10**7)
+    ok(not fit_of("selftest", huge)["ok"] and "Unload something" in fit_of("selftest", huge)["reason"], "fit: 10 TB is refused with a reason")
+    ok(not state_of("selftest", m)["running"], "state: not running before start")
+    dry = launch_cmd("selftest", m, "127.0.0.1", port)
+    ok(dry[0] in ("systemd-run", "docker") and not state_of("selftest", m)["running"], "dryrun: builds the command, starts nothing")
+    me = os.path.abspath(sys.argv[0])
+    env = dict(ENV, SPEECH_REGISTRY=REGISTRY, GB10_STATE_DIR=STATE, SPEECH_LOGDIR=LOGDIR)
+    r = subprocess.run([me, "start", "selftest"], capture_output=True, text=True, env=env, timeout=180)
+    j = json.loads(r.stdout or "{}")
+    ok(r.returncode == 0 and j.get("ok") and j.get("ready_s") is not None, f"start: ready in {j.get('ready_s')} s ({r.stdout.strip()[:100]})")
+    ok(not os.listdir(f"{STATE}/reservations"), "start: the ledger entry is gone once the server is up")
+    s = state_of("selftest", m)
+    ok(s["running"] and s["ready"] and (s["mem_mb"] or 0) > 900, f"state: running and ready, {s['mem_mb']} MB held")
+    ok(len(tree_pids(s["pid"])) >= 2, "state: the stand-in has a child process (a whole tree to stop)")
+    if engine == "native":
+        ok(len(leftovers("selftest", m)) >= 2, "reaper: sees the stand-in and its child by cgroup while it runs (positive control)")
+    rogue = subprocess.Popen(["python3", "-c", "import sys, time; f = open(sys.argv[1], 'rb'); time.sleep(3600)", weights])    # NOT part of the member (like the bridge's whisper-cli): reported, never killed
+    mi0 = meminfo()["MemAvailable"]
+    r = subprocess.run([me, "stop", "selftest"], capture_output=True, text=True, env=env, timeout=180)
+    j = json.loads(r.stdout)
+    ok(r.returncode == 0 and j["ok"], f"stop: gone ({r.stdout.strip()[:140]})")
+    ok(not state_of("selftest", m)["running"] and not tree_pids_alive(s["pid"]), "stop: no process of the tree is left")
+    ok(any(h["pid"] == rogue.pid for h in j["weights_held_by"]) and rogue.poll() is None, "stop: an unrelated process holding the weights is reported and left alone")
+    rogue.kill(); rogue.wait(timeout=5)
+    ok(j["freed_mb"] >= 600 or meminfo()["MemAvailable"] - mi0 >= 600, f"stop: memory came back, freed_mb={j['freed_mb']} of ~1024 held")
+    ok(subprocess.run([me, "stop", "selftest"], capture_output=True, text=True, env=env).returncode == 0, "stop: stopping a stopped member is fine")
+    print(f"ok - speech-ctl [{engine}]: fit, dryrun, start (ledger), tree stop, outsiders spared, memory returned")
+
+
+def tree_pids_alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    for name in ("status", "fit", "start", "stop", "dryrun"):
+        p = sub.add_parser(name)
+        p.add_argument("id", nargs=None if name not in ("status",) else "?")
+        p.add_argument("--port", type=int)
+    sub.add_parser("selftest")
+    a = ap.parse_args()
+    {"status": cmd_status, "fit": cmd_fit, "start": cmd_start, "stop": cmd_stop, "dryrun": cmd_dryrun, "selftest": selftest}[a.cmd](a)

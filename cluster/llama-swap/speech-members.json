@@ -1,0 +1,194 @@
+{
+ "members": {
+  "whisper-large-v3-turbo": {
+   "label": "Whisper large-v3-turbo",
+   "engine": "native",
+   "family": "whisper.cpp",
+   "precision": "FP16",
+   "params_b": 0.81,
+   "languages": "99 languages, auto-detect",
+   "need_mb": 4000,
+   "port": 28110,
+   "api": "whispercpp",
+   "endpoint": "/inference",
+   "max_audio": "any length",
+   "weights": [
+    "/home/pauloesterwitz/AI & SAP Consulting/Captain's Log/whisper.cpp/models/ggml-large-v3-turbo.bin"
+   ],
+   "ready": {
+    "path": "/",
+    "timeout_s": 180
+   },
+   "note": "the model the WhatsApp bridge and Captain's Log use",
+   "native": {
+    "exe": "/home/pauloesterwitz/AI & SAP Consulting/Captain's Log/whisper.cpp/build/bin/whisper-server",
+    "env": {
+     "LD_LIBRARY_PATH": "/home/pauloesterwitz/AI & SAP Consulting/Captain's Log/whisper.cpp/build/bin"
+    },
+    "args": [
+     "-m",
+     "{weights0}",
+     "--host",
+     "{host}",
+     "--port",
+     "{port}",
+     "-t",
+     "4",
+     "-bo",
+     "5",
+     "-bs",
+     "5",
+     "-l",
+     "auto"
+    ]
+   }
+  },
+  "cohere-transcribe-03-2026": {
+   "label": "Cohere Transcribe 03-2026",
+   "engine": "docker",
+   "family": "vLLM",
+   "precision": "BF16",
+   "params_b": 2,
+   "languages": "14 languages incl. German",
+   "need_mb": 9000,
+   "port": 28111,
+   "api": "openai",
+   "endpoint": "/v1/audio/transcriptions",
+   "max_audio": "30 min",
+   "weights": [
+    "/home/pauloesterwitz/models/cohere-transcribe-03-2026"
+   ],
+   "ready": {
+    "path": "/health",
+    "timeout_s": 900
+   },
+   "docker": {
+    "image": "speech-vllm:0.27.1",
+    "gpus": true,
+    "ipc_host": true,
+    "entrypoint": "vllm",
+    "container_port": 8000,
+    "mounts": [
+     "/home/pauloesterwitz/models:/models:ro"
+    ],
+    "args": [
+     "serve",
+     "/models/cohere-transcribe-03-2026",
+     "--served-model-name",
+     "cohere-transcribe-03-2026",
+     "--host",
+     "0.0.0.0",
+     "--port",
+     "8000",
+     "--max-model-len",
+     "4096",
+     "--gpu-memory-utilization",
+     "0.07",
+     "--enforce-eager"
+    ]
+   }
+  },
+  "voxtral-mini-3b-2507": {
+   "label": "Voxtral Mini 3B",
+   "engine": "docker",
+   "family": "vLLM",
+   "precision": "BF16",
+   "params_b": 3,
+   "languages": "8 languages incl. German",
+   "need_mb": 16000,
+   "port": 28112,
+   "api": "openai",
+   "endpoint": "/v1/audio/transcriptions",
+   "max_audio": "30 min",
+   "weights": [
+    "/home/pauloesterwitz/models/Voxtral-Mini-3B-2507"
+   ],
+   "ready": {
+    "path": "/health",
+    "timeout_s": 900
+   },
+   "docker": {
+    "image": "speech-vllm:0.27.1",
+    "gpus": true,
+    "ipc_host": true,
+    "entrypoint": "vllm",
+    "container_port": 8000,
+    "mounts": [
+     "/home/pauloesterwitz/models:/models:ro"
+    ],
+    "args": [
+     "serve",
+     "/models/Voxtral-Mini-3B-2507",
+     "--served-model-name",
+     "voxtral-mini-3b-2507",
+     "--host",
+     "0.0.0.0",
+     "--port",
+     "8000",
+     "--max-model-len",
+     "16384",
+     "--gpu-memory-utilization",
+     "0.13",
+     "--enforce-eager",
+     "--tokenizer-mode",
+     "mistral",
+     "--config-format",
+     "mistral",
+     "--load-format",
+     "mistral"
+    ]
+   }
+  },
+  "voxtral-small-24b-2507": {
+   "label": "Voxtral Small 24B",
+   "engine": "docker",
+   "family": "vLLM",
+   "precision": "BF16",
+   "params_b": 24,
+   "languages": "8 languages incl. German",
+   "need_mb": 62000,
+   "port": 28113,
+   "api": "openai",
+   "endpoint": "/v1/audio/transcriptions",
+   "max_audio": "30 min",
+   "weights": [
+    "/home/pauloesterwitz/models/Voxtral-Small-24B-2507"
+   ],
+   "ready": {
+    "path": "/health",
+    "timeout_s": 900
+   },
+   "docker": {
+    "image": "speech-vllm:0.27.1",
+    "gpus": true,
+    "ipc_host": true,
+    "entrypoint": "vllm",
+    "container_port": 8000,
+    "mounts": [
+     "/home/pauloesterwitz/models:/models:ro"
+    ],
+    "args": [
+     "serve",
+     "/models/Voxtral-Small-24B-2507",
+     "--served-model-name",
+     "voxtral-small-24b-2507",
+     "--host",
+     "0.0.0.0",
+     "--port",
+     "8000",
+     "--max-model-len",
+     "16384",
+     "--gpu-memory-utilization",
+     "0.5",
+     "--enforce-eager",
+     "--tokenizer-mode",
+     "mistral",
+     "--config-format",
+     "mistral",
+     "--load-format",
+     "mistral"
+    ]
+   }
+  }
+ }
+}

@@ -1,6 +1,6 @@
 <!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>LCARS · Starfleet Command</title>
+<title>LCARS · Shuttle Bay</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Antonio:wght@400;600;700&display=swap" rel="stylesheet">
@@ -493,7 +493,7 @@ html.fs{scrollbar-width:none} html.fs::-webkit-scrollbar{display:none}
   #rows td.empty{flex:1 1 100%}
 }
 </style><link rel="stylesheet" href="/vendor/atom-one-dark.min.css"><link rel="stylesheet" href="/vendor/memcore.css">
-<script src="/vendor/marked.min.js"></script><script src="/vendor/purify.min.js"></script><script src="/vendor/highlight.min.js"></script>
+<script src="/vendor/marked.min.js"></script><script src="/vendor/purify.min.js"></script><script src="/vendor/highlight.min.js"></script><script src="/vendor/speech.js"></script>
 </head><body>
 <div id="adov"><div class="box">
   <div class="e1"></div><div class="hd" id="adhd">Auto Destruct Sequence</div>
@@ -546,7 +546,7 @@ html.fs{scrollbar-width:none} html.fs::-webkit-scrollbar{display:none}
 
   <div class="main">
     <div class="top">
-      <div class="title">Starfleet <span>Command</span></div>
+      <div class="title">Shuttle <span>Bay</span></div>
       <div class="bar"><input id="skey" type="password" placeholder="Starfleet key" autocomplete="off" style="margin:6px 16px 0 22px;width:200px;height:24px;background:#000;color:#fff;border:1px solid #fff4;border-radius:12px;padding:0 10px;font:inherit;font-size:13px"><button id="ksave" type="button" style="margin:6px 8px 0 -8px;height:24px;background:#000;color:#fff;border:1px solid #fff4;border-radius:12px;padding:0 12px;font:inherit;font-size:13px;cursor:pointer">Save key</button><span id="clock">--:--:--</span></div>
     </div>
 
@@ -571,6 +571,7 @@ html.fs{scrollbar-width:none} html.fs::-webkit-scrollbar{display:none}
       <button class="pill" data-f="vision">Vision</button>
       <button class="pill" data-f="embed">Embeddings</button>
       <button class="pill" data-f="rerank">Rerankers</button>
+      <button class="pill" data-f="speech">Speech</button>
       <button class="pill" data-f="image">Image</button>
       <span class="count" id="count"></span>
     </div>
@@ -709,7 +710,7 @@ var queuedPos={};   /* model id -> 1-based place in the load queue; declared ear
 const TAG={"jean-luc":["jl","JEAN-LUC"],"kathryn":["ka","KATHRYN"],"dynamic":["dy","AUTO"]};
 const gb=kb=>(kb/1048576).toFixed(1);
 const busy=new Set();
-const FILTERS=["all","jean-luc","kathryn","starfleet","dynamic","live","pinned","vision","embed","rerank","image"];
+const FILTERS=["all","jean-luc","kathryn","starfleet","dynamic","live","pinned","vision","embed","rerank","speech","image"];
 /* the hash makes a view bookmarkable — open #kathryn to land straight on her models */
 const wantView=["nas","ctr","ma","def","comp","wiki"].find(v=>location.hash==="#"+v);   /* read before setFilter() below rewrites the hash: reopens that view */
 let filter=FILTERS.includes(location.hash.slice(1))?location.hash.slice(1):"all";
@@ -955,7 +956,8 @@ function keep(m,run){
   /* The Image tab is the ONLY one that shows image/video models. They are not
      llama-swap members, so node/ttl/context filters are meaningless for them and they
      would just be rows of dashes everywhere else -- including "All". */
-  if(filter==="image") return isImg(m);
+  if(filter==="speech") return isSpeech(m);
+  if(filter==="image") return isImg(m)&&!isSpeech(m);
   if(isImg(m)) return false;
   switch(filter){
     case "all": return true;
@@ -1339,6 +1341,7 @@ function paintLoading(){
 setInterval(paintLoading,1000);
 
 function render(s){
+  s=withSpeech(s);                   /* vendor/speech.js: state.speech -> rows, idempotent */
   last=s;
   loadAt=Date.now();
   paintLoading();
@@ -1374,7 +1377,7 @@ function render(s){
     modelName(a.id).localeCompare(modelName(c.id),undefined,{numeric:true,sensitivity:"base"})||a.id.localeCompare(c.id)),
     {name:m=>modelName(m.id), node:m=>(m.nodes||[]).join(" "), speed:m=>m.tps, ctx:m=>m.ctx||m.ctx_deployed||m.ctx_max,
      effort:m=>m.effort, state:stOf, ttl:m=>run[m.id]&&run[m.id].ttl, pin:m=>m.pinned?1:0});
-  document.getElementById("count").textContent=
+  document.getElementById("count").textContent=filter==="speech"?`${shown.length} servers`:
     `${shown.length} of ${grouped.filter(m=>!m.kind||m.kind==="llm").length}`;
 
   /* Never replace the table while a context dropdown has focus: the 3s poll would
@@ -1386,6 +1389,7 @@ function render(s){
   if(!_picking) document.getElementById("rows").innerHTML = shown.length ? shown.map(m=>{
     const r=run[m.id], working=busy.has(m.id), loading=loadingIds.has(m.id),
           st=loading?"loading":working?"working":queuedPos[m.id]?"queued":(r?r.state:"stopped");
+    if(isSpeech(m)) return speechRow(m, working);
     if(isImg(m)) return imgRow(m, working);
     return `<tr class="${m.pinned?"pinned":r?"live":""}">
       <td><div class="mid">${modelName(m.id)}${isEmbed(m)?(m.vision==="on"
@@ -1659,7 +1663,7 @@ function ctrPaint(){
       const started=c.started?`<span title="${esc(new Date(c.started*1000).toLocaleString())}">${ctrDur(now-c.started)} ago</span>`:"–";
       const btn=c.stoppable
         ?`<button class="unl" ${b?"disabled":""} onclick="ctrStop('${node}','${nm}')">${b?"Stopping...":armed?"Sure?":"Stop"}</button>`
-        :`<button disabled title="Model server: unload it in the Model Registry (Starfleet Command), not here">Model</button>`;
+        :`<button disabled title="Model server: unload it in the Model Registry (Shuttle Bay), not here">Model</button>`;
       const ck="c:"+k, on=ctrSel.has(ck);
       return `<tr class="${c.kind==="gpu"?"pinned":""} ${on?"picked":""}"><td class="ck"><input type="checkbox" class="ck" data-k="${esc(ck)}" ${on?"checked":""}
           ${c.stoppable?"":`disabled title="Model server: unload it in the Model Registry"`}></td><td><div class="mid">${nm}</div><div class="sub" title="${esc(c.image)}">${esc(c.image)}</div></td>
@@ -1727,7 +1731,7 @@ async function ctrRun(){
   try{
     const r=await fetch("/api/engineering/stop",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
     const j=await r.json();
-    if(r.status===403) throw new Error("Starfleet key missing or wrong (enter it on the Starfleet Command page, Save key)");
+    if(r.status===403) throw new Error("Starfleet key missing or wrong (enter it on the Shuttle Bay page, Save key)");
     if(!r.ok) throw new Error(j.error||("HTTP "+r.status));
     const bad=[...j.refused,...j.errors];
     ctrInfo(`Ended ${j.ended.length} session${j.ended.length===1?"":"s"}, stopped ${j.stopped.length} container${j.stopped.length===1?"":"s"}, freed about ${ctrMB(j.freed_mb)}`+
@@ -1767,7 +1771,7 @@ async function ctrStop(node,name){
   try{
     const r=await fetch("/api/containers/stop",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({node,name})});
     const j=await r.json();
-    if(r.status===403) throw new Error("Starfleet key missing or wrong (enter it on the Starfleet Command page, Save key)");
+    if(r.status===403) throw new Error("Starfleet key missing or wrong (enter it on the Shuttle Bay page, Save key)");
     if(!r.ok) throw new Error(j.error||("HTTP "+r.status));
   }catch(e){ if(ctrLast) ctrLast.actionError=`Stop ${name} on ${node} failed: ${e.message}`; }
   delete ctrBusy[k]; ctrPoll();
@@ -1839,7 +1843,7 @@ async function maBackup(){
   try{
     const r=await fetch("/api/memoryalpha/backup",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"});
     const j=await r.json();
-    if(r.status===403) throw new Error("Starfleet key missing or wrong (enter it on the Starfleet Command page, Save key)");
+    if(r.status===403) throw new Error("Starfleet key missing or wrong (enter it on the Shuttle Bay page, Save key)");
     if(!r.ok) throw new Error(j.error||("HTTP "+r.status));
   }catch(e){ maMsg="Back up now failed: "+e.message; }
   maBusy=false; maPoll();
@@ -1940,7 +1944,7 @@ document.querySelectorAll("#compbar [data-tool]").forEach(b=>{
 });
 async function compJSON(url,opt){
   const r=await fetch(url,opt), j=await r.json().catch(()=>({}));
-  if(r.status===403) throw new Error("Starfleet key missing or wrong: enter it on the Starfleet Command page and Save key.");
+  if(r.status===403) throw new Error("Starfleet key missing or wrong: enter it on the Shuttle Bay page and Save key.");
   if(!r.ok) throw new Error(j.error||("HTTP "+r.status));
   return j;
 }
@@ -2018,7 +2022,7 @@ async function compSend(){
   try{
     const r=await fetch("/api/computer/send",{method:"POST",headers:{"Content-Type":"application/json"},
       body:JSON.stringify({id:compChat&&compChat.id,text,model,tools:compTools(),images:imgs})});
-    if(r.status===403) throw new Error("Starfleet key missing or wrong: enter it on the Starfleet Command page and Save key.");
+    if(r.status===403) throw new Error("Starfleet key missing or wrong: enter it on the Shuttle Bay page and Save key.");
     const rd=r.body.getReader(), dec=new TextDecoder(); let buf="";
     for(;;){ const {value,done}=await rd.read(); if(done) break; buf+=dec.decode(value,{stream:true});
       let i; while((i=buf.indexOf("\n\n"))>=0){ const line=buf.slice(0,i); buf=buf.slice(i+2);
@@ -2053,7 +2057,7 @@ function wav16(f32){ const b=new ArrayBuffer(44+f32.length*2), v=new DataView(b)
 async function compMic(){
   const btn=document.getElementById("compmic");
   if(compRec){ compRec.stop(); return; }
-  if(!window.isSecureContext||!navigator.mediaDevices){ return compMsg(`Voice needs HTTPS. Open Starfleet Command over https (Tailscale serve) to use the microphone.`,true); }
+  if(!window.isSecureContext||!navigator.mediaDevices){ return compMsg(`Voice needs HTTPS. Open this page over https (Tailscale serve) to use the microphone.`,true); }
   let stream; try{ stream=await navigator.mediaDevices.getUserMedia({audio:true}); }catch(e){ return compMsg("Microphone not allowed: "+e.message,true); }
   const chunks=[]; compRec=new MediaRecorder(stream); btn.classList.add("rec"); btn.textContent="Stop";
   compRec.ondataavailable=e=>chunks.push(e.data);
@@ -2084,14 +2088,14 @@ document.addEventListener("keydown",e=>{
 },true);
 
 /* ================= views =================
-   The rail buttons switch between Starfleet Command and one other page at a time; the address keeps the page. */
+   The rail buttons switch between Shuttle Bay and one other page at a time; the address keeps the page. */
 const VIEWS={nas:["nasbtn","Deep Space NAS"],ctr:["ctrbtn","Engineering"],ma:["mabtn","Memory Alpha"],def:["defbtn","Defiant"],comp:["compbtn","Computer"],wiki:["wikibtn","Memory Core"]};
 var view="";
 function setView(v){
   if(v===view) v="";
   view=v;
   for(const [k,[b,l]] of Object.entries(VIEWS)){
-    document.body.classList.toggle(k,k===v); document.getElementById(b).textContent=k===v?"Starfleet Command":l; }
+    document.body.classList.toggle(k,k===v); document.getElementById(b).textContent=k===v?"Shuttle Bay":l; }
   nasOn=v==="nas"; ctrOn=v==="ctr"; maOn=v==="ma"; defOn=v==="def"; compOn=v==="comp";
   try{ history.replaceState(null,"",v?"#"+v:"#"+(filter==="all"?"":filter)); }catch(e){}
   if(nasOn){ nasFit(); nasPoll(); } else clearTimeout(nasTimer);

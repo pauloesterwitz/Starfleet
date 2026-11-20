@@ -81,7 +81,16 @@ case "$KEY" in
     # still clear 262,144 while returning ~4 GB of headroom to a node that also hosts ComfyUI,
     # vane and the MCP fleet. Left at 0.80 deliberately — it is measured and working — but if
     # Jean-Luc ever gets tight, trimming here is the cheapest place to find memory.
-    NEED=85000; MEMFRAC=0.80; CTX=16384
+    # MEMFRAC IS DERIVED SINCE 2026-11-17 (qwen-size.py). The fixed 0.80 above built only 79,808
+    # tokens on 2026-11-16 22:27 because Jean-Luc had 94 GB free instead of ~112, and OpenCode's
+    # 215k prompts were rejected. Now: fraction from free memory, pool capped at 2 x ctx via
+    # --max-total-tokens, and the load REFUSES if even 0.88 cannot hold one full-context request.
+    CTX=${CTX_LEN:-262144}
+    read -r MEMFRAC NEED MAXTOK SHORT <<< "$($LS/qwen-size.py "$CTX")"
+    if [ "${DRYRUN:-0}" != 1 ] && [ "$SHORT" != "0.0" ]; then
+      echo "serve-sglang[qwen38fn]: ctx $CTX needs ${SHORT} GB more free memory on Jean-Luc (fraction capped at 0.88) - refusing to load a shrunken window; free memory and retry" >&2
+      exit 1
+    fi
     #
     # ── MTP, MEASURED 2026-08-29. +35% single-stream. This is the whole tuning story. ─────────
     #   config                 single   agg@8   acceptance
@@ -273,7 +282,10 @@ case "$KEY" in
     # reload fired 1s after a write and killed the in-flight load, leaving an orphan container).
     # Only write config.yaml when the fleet is idle. This file is not watched, so notes go here.
     # IF "!" RUNS EVER REAPPEAR: drop the four --speculative-* flags first, then re-read this block.
-    FLAGS="--moe-runner-backend flashinfer_cutlass --disable-flashinfer-autotune --reasoning-parser qwen3-thinking --tool-call-parser qwen3_coder --speculative-algorithm NEXTN --speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 2" ;;
+    # NO --allow-auto-truncate (tried and removed 2026-11-17, Paul): in this image it cuts the END
+    # of the prompt (tokenizer_manager.py ~1205, `del input_ids[max_len:]`), i.e. the NEWEST
+    # messages, silently. A 400 the client can see beats a reply to a conversation it never read.
+    FLAGS="--moe-runner-backend flashinfer_cutlass --disable-flashinfer-autotune --reasoning-parser qwen3-thinking --tool-call-parser qwen3_coder --speculative-algorithm NEXTN --speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 2 --max-total-tokens ${MAXTOK}" ;;
   qwen38fn-long)
     # Qwen3.8-Flash-Next at 512k, via a YaRN rope override. SIBLING of `qwen38fn` above, which
     # stays at the native 262,144 with MTP K=1 -- this key changes nothing for that member.

@@ -41,13 +41,16 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import wikicore      # Memory Core view: wiki graph + Computer's wiki trails (read-only)
+import speech        # Shuttle Bay's Speech family: speech-to-text servers Fleet starts itself (speech.py)
 import clusterupdate  # "Install updates on Starfleet Cluster": NVIDIA Sync's Update, on both Sparks (clusterupdate.py)
 
 # All llama-swap traffic goes through ctxproxy (:28081). Loads/unloads need the Starfleet key, which this
 # process only passes through from the browser (X-Starfleet-Key) and never stores.
 SWAP = os.environ.get("FLEET_SWAP", "http://127.0.0.1:28081")
 KEY_HDR = "X-Starfleet-Key"
-POLICY = "Only Starfleet Command may load models and Agents may not load models on their own. This is a policy!"
+# Renamed 2026-11-20: the model-loading page is Shuttle Bay ("Starfleet Command" is the app). "Starfleet key" stays in the text on purpose: the phone
+# interface recognises a missing key by /Starfleet (Command|key)/ in this message (vendor/padd.js wantsKey).
+POLICY = "Only Shuttle Bay may load models, with the Starfleet key. Agents may not load models on their own. This is a policy!"
 
 # None = run the probe locally.  Anything else is an ssh host.
 # Use the *.fritz.box name, never the bare tailnet name: the latter hits
@@ -580,6 +583,11 @@ def red_alert(key):
             stopped[node] = names
         except (subprocess.SubprocessError, OSError) as e:
             errors[node] = str(e)[:200]
+    speech_stopped = []
+    try:
+        speech_stopped = sorted(speech.stop_all())      # speech servers may be plain systemd units, which gpu_containers() never sees
+    except Exception as e:
+        errors["speech"] = str(e)[:200]
     orphans, dormant = [], []
     try:
         orphans = orphaned_containers()
@@ -593,7 +601,7 @@ def red_alert(key):
     after = _mem_avail_mb()
     freed = max(0, after - before) if None not in (before, after) else None
     return {"ok": not errors and not swap_running(), "unloaded": unloaded, "stopped": stopped,
-            "orphans": orphans, "dormant": dormant, "errors": errors, "freed_mb": freed}
+            "orphans": orphans, "dormant": dormant, "speech": speech_stopped, "errors": errors, "freed_mb": freed}
 
 
 def _sudo_reboot(host, delay, unit="starfleet-autodestruct"):
@@ -4107,6 +4115,7 @@ class Handler(BaseHTTPRequestHandler):
                 live.append({"model": m, "elapsed": round(now - v["started"], 1),
                              "eta": v["eta"], "progress": frac, "phase": phase})
             snap["loading"] = sorted(live, key=lambda d: d["model"])
+            snap["speech"] = speech.state()     # Shuttle Bay's Speech family: its own key, STATE["models"] stays LLM + image rows only (phone page unaffected)
             return self._send(200, json.dumps(snap), "application/json")
         self._send(404, "not found", "text/plain")
 
@@ -4210,6 +4219,20 @@ class Handler(BaseHTTPRequestHandler):
                 ev_audit("Red Alert ran", f"Unloaded {len(res.get('unloaded') or [])} models, stopped "
                          f"{sum(len(v) for v in (res.get('stopped') or {}).values())} containers, freed {(res.get('freed_mb') or 0) // 1024} GB."
                          + (f" {len(res['errors'])} errors." if res.get("errors") else ""), go="#/bridge")
+            return self._send(200, json.dumps(res), "application/json")
+        if self.path in ("/api/speech/load", "/api/speech/unload"):      # Shuttle Bay's Speech family, keyed like every load (speech.py)
+            fn = speech.load if self.path == "/api/speech/load" else speech.unload
+            try:
+                res = fn(body.get("id"), body.get("node"), key)
+            except urllib.error.HTTPError as e:
+                return self._send(403, json.dumps({"error": _err_text(e)}), "application/json")
+            except PermissionError as e:
+                return self._send(409, json.dumps({"error": str(e)}), "application/json")
+            except ValueError as e:
+                return self._send(400, json.dumps({"error": str(e)}), "application/json")
+            except (urllib.error.URLError, OSError, subprocess.SubprocessError) as e:
+                return self._send(502, json.dumps({"error": str(e)[:200]}), "application/json")
+            print(f"SPEECH {self.path.rsplit('/', 1)[1]} {body.get('id')}@{body.get('node')}: ok={res.get('ok')}", flush=True)
             return self._send(200, json.dumps(res), "application/json")
         known = STATE["models"]
         img_ids = {m["id"] for m in image_models()}
@@ -4940,6 +4963,7 @@ def selfcheck():
     models = json.loads(swap_get("/v1/models"))["data"]
     json.loads(swap_get("/running"))
     assert "id=\"rows\"" in page(), "fleet.html missing the model table"
+    speech.selfcheck()
     print(f"selfcheck ok — llama-swap reachable, {len(models)} models, page {len(page())} bytes")
 
 
@@ -4965,6 +4989,16 @@ def main():
         return selfcheck()
 
     host = a.host or default_host()
+
+    def _speech_err(k):
+        with LOCK:
+            return STATE["errors"].get(k)
+
+    def _speech_clear(k):
+        with LOCK:
+            STATE["errors"].pop(k, None)
+    speech.init(NODES, key_check, enqueue_light, dequeue, queued_ids, _speech_err, _speech_clear)
+    threading.Thread(target=speech.probe_worker, daemon=True).start()
 
     def _cluster_busy():                     # model loads in flight or queued: no cluster update meanwhile
         with _loading_lock:
