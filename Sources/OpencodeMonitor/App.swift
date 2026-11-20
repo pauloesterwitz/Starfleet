@@ -73,8 +73,10 @@ struct StarfleetCommandApp: App {
         }
 
         // Singleton window (not WindowGroup -- there's only ever one Fleet
-        // dashboard), opened on demand via ContentView's "Open Fleet" button.
-        Window("Fleet", id: "fleet") {
+        // dashboard), opened on demand via ContentView's "Open Starfleet Command…"
+        // button. The title is what Stage Manager, Mission Control and the Window
+        // menu show (the title bar itself is hidden), so it carries the app's name.
+        Window("Starfleet Command", id: "fleet") {
             FleetDashboardView()
                 .frame(minWidth: 960, minHeight: 640)
         }
