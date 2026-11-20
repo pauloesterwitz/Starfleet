@@ -29,6 +29,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -1933,7 +1934,9 @@ echo "@G"
 nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader,nounits 2>/dev/null | while IFS=', ' read -r p m; do
   c=$(grep -o 'docker-[0-9a-f]\{64\}' /proc/$p/cgroup 2>/dev/null | head -1 | cut -c8-); [ -n "$c" ] && echo "$c $m"; done
 echo "@P"
-ps -eo pid=,ppid=,etimes=,unit=,uunit=,args= | cut -c1-400"""
+ps -eo pid=,ppid=,etimes=,unit=,uunit=,args= | cut -c1-400
+echo "@R"
+ps -eo pid=,rss="""
 CT_TTL = 8.0            # concurrent viewers share one probe
 CT_POLL = 30            # background probe interval: keeps the CPU-idle clocks running with no tab open
 CPU_ACTIVE = 0.01       # cores; a container above this between two probes counts as active
@@ -1950,9 +1953,9 @@ def _ct_probe(host):
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=45, stdin=subprocess.DEVNULL)
     if "@P" not in r.stdout:
         raise OSError((r.stderr or f"probe exit {r.returncode}").strip()[-200:])
-    out, sec = {"I": [], "C": [], "G": [], "P": []}, None
+    out, sec = {"I": [], "C": [], "G": [], "P": [], "R": []}, None
     for line in r.stdout.splitlines():
-        if line in ("@I", "@C", "@G", "@P"):
+        if line in ("@I", "@C", "@G", "@P", "@R"):
             sec = line[1]
         elif sec and line.strip():
             out[sec].append(line)
@@ -2083,7 +2086,7 @@ def _ct_rows(node, raw, other_ps, now):
                      "gpu_mb": gpu.get(cid), "owner": owner, "kind": kind,
                      "session_idle_s": round(sess_idle) if sess_idle is not None else None,
                      "cpu_idle_s": round(idle) if idle is not None else None, "cpu_idle_ge": idle_ge,
-                     "stoppable": not is_gpu})
+                     "stoppable": not is_gpu, "session_pid": session if NODES.get(node) is None else None})
     live = {(node, line.split("|")[0]) for line in raw["I"]}
     for k in [k for k in _CT_CPU if k[0] == node and k not in live]:
         del _CT_CPU[k]                                # vanished containers
@@ -2116,7 +2119,12 @@ def containers_state(force=False):
                 if r["name"].endswith("-worker") and r["owner"] == "detached" and r["name"][:-7] in heads:
                     r["owner"] = heads[r["name"][:-7]] + " (worker)"
             rows.sort(key=lambda r: -((r["ram_mb"] or 0) + (r["gpu_mb"] or 0)))
-            _CT["data"], _CT["at"] = {"containers": rows, "errors": errs}, now
+            sessions = []
+            for node, host in NODES.items():          # sessions: this host only (idle comes from local files)
+                if host is None:
+                    sessions += (_session_rows(node, raw[node], rows, now) if node in raw else
+                                 [s for s in ((_CT["data"] or {}).get("sessions") or []) if s["node"] == node])
+            _CT["data"], _CT["at"] = {"containers": rows, "sessions": sessions, "errors": errs}, now
         return dict(_CT["data"], at=_CT["at"])
 
 
@@ -2150,6 +2158,98 @@ def container_stop(node, name, key):
         raise OSError((r.stderr or f"docker stop exit {r.returncode}").strip()[-200:])
     _CT["at"] = 0.0
     return {"ok": True, "node": node, "name": name, "freed_mb": row["ram_mb"]}
+
+
+def _is_session(args):
+    """A Claude Code or opencode session process: the executable itself, not an MCP server living under
+    ~/.local/share/opencode (those are labelled "opencode" by _proc_label)."""
+    a0 = (args.split() or ["?"])[0]
+    return "ccd-cli" in a0 or os.path.basename(a0) in ("claude", "opencode")
+
+
+def _session_rows(node, raw, crows, now):
+    """Agent sessions on this host (top process of each tree): idle time (transcript or terminal), the memory of
+    the process tree (its MCP servers included) and of the containers it launched. Unknown idle stays None."""
+    ps, rss, kids, out = _ps_table(raw["P"]), {}, {}, []
+    for line in raw.get("R", []):
+        f = line.split()
+        if len(f) == 2 and f[0].isdigit() and f[1].isdigit():
+            rss[int(f[0])] = int(f[1])
+    for pid, (pp, _, _, _) in ps.items():
+        kids.setdefault(pp, []).append(pid)
+    for pid, (pp, age, args, _) in ps.items():
+        if not _is_session(args) or (pp in ps and _is_session(ps[pp][2])):
+            continue
+        tree, stack, seen = 0, [pid], set()
+        while stack:
+            p = stack.pop()
+            if p not in seen:
+                seen.add(p)
+                tree += rss.get(p, 0)
+                stack += kids.get(p, [])
+        mine = [r for r in crows if r.get("session_pid") == pid]
+        idle = session_idle_s(pid)
+        try:                                          # the probe cuts args at 400 characters; /proc has them all
+            with open(f"/proc/{pid}/cmdline") as f:
+                full = f.read().replace("\0", " ")
+            cwd = os.readlink(f"/proc/{pid}/cwd")
+        except OSError:
+            full, cwd = args, None
+        sid = re.search(r"--(?:resume|session-id)[= ]([0-9a-f]{8})-", full)
+        model = re.search(r"--model[= ](\S+)", full)
+        out.append({"node": node, "pid": pid, "tool": _proc_label(args), "started": now - age,
+                    "idle_s": round(idle) if idle is not None else None, "rss_mb": round(tree / 1024),
+                    "containers": len(mine), "ct_ram_mb": sum(r["ram_mb"] or 0 for r in mine),
+                    "session": sid.group(1) if sid else None, "model": model.group(1) if model else None,
+                    "cwd": cwd, "fleet": pid == os.getpid()})
+    out.sort(key=lambda s: -(s["rss_mb"] + s["ct_ram_mb"]))
+    return out
+
+
+def engineering_stop(containers, sessions, key):
+    """Bulk stop for Engineering (multi-select and Cleansing): end the chosen agent sessions (SIGTERM; their
+    `docker run -i --rm` MCP containers exit with them), then `docker stop` the chosen containers, one call per
+    node. Needs the Starfleet key; GPU containers (model servers) are refused, as in container_stop."""
+    key_check(key)
+    import signal
+    st = containers_state(force=True)
+    live_c = {(r["node"], r["name"]): r for r in st["containers"]}
+    live_s = {(s["node"], s["pid"]): s for s in st.get("sessions", [])}
+    res = {"ok": True, "stopped": [], "ended": [], "refused": [], "errors": [], "freed_mb": 0}
+    for s in sessions or []:
+        k = (s.get("node"), s.get("pid"))
+        row = live_s.get(k)
+        if row is None or row["fleet"]:
+            res["refused"].append({"node": k[0], "pid": k[1], "why": "not a running session"}); continue
+        try:
+            os.kill(row["pid"], signal.SIGTERM)
+            res["ended"].append({"node": k[0], "pid": k[1]}); res["freed_mb"] += row["rss_mb"] + row["ct_ram_mb"]
+        except OSError as e:
+            res["errors"].append({"node": k[0], "pid": k[1], "why": str(e)[:120]})
+    ended = {s["pid"] for s in res["ended"]}
+    by_node = {}
+    for c in containers or []:
+        row = live_c.get((c.get("node"), c.get("name")))
+        if row is None:
+            res["refused"].append({"node": c.get("node"), "name": c.get("name"), "why": "not running"})
+        elif not row["stoppable"]:
+            res["refused"].append({"node": row["node"], "name": row["name"], "why": "model server"})
+        elif row.get("session_pid") not in ended:      # a session's own containers go with the session
+            by_node.setdefault(row["node"], []).append(row)
+    for node, rows in by_node.items():
+        script = "docker stop -t 10 " + " ".join(shlex.quote(r["name"]) for r in rows)
+        host = NODES[node]
+        cmd = ["bash", "-c", script] if host is None else [
+            "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host, script]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=180, stdin=subprocess.DEVNULL)
+        done = set(r.stdout.split())
+        for row in rows:
+            if row["name"] in done:
+                res["stopped"].append({"node": node, "name": row["name"]}); res["freed_mb"] += row["ram_mb"] or 0
+            else:
+                res["errors"].append({"node": node, "name": row["name"], "why": (r.stderr or "docker stop failed").strip()[-160:]})
+    _CT["at"] = 0.0
+    return res
 
 
 # ---------------------------------------------------------------- Memory Alpha (off-site backup)
@@ -2454,13 +2554,17 @@ def defiant_state(force=False):
 COMPUTER_DIR = os.path.expanduser(os.environ.get("FLEET_COMPUTER_DIR", "~/.local/share/fleet-ui/computer"))
 ASR_GATE = os.path.expanduser(os.environ.get("FLEET_ASR_GATE", "~/.whatsapp-bridge/asr_gate.sh"))
 ENV_FILE = os.path.expanduser("~/.config/opencode/.env")
+# systemd's PATH has no nvm, so a bare "node" fails with ENOENT: take PATH's node, else the newest nvm one.
+NODE = shutil.which("node") or max(glob.glob(os.path.expanduser("~/.nvm/versions/node/*/bin/node")),
+                                   key=lambda p: [int(x) for x in re.findall(r"\d+", p.split("/node/")[-1])],
+                                   default="node")
 COMPUTER_MCP = {      # name -> how to reach it; tools = the allowed subset (None = all); web = talks to the internet
     "wiki": {"http": "http://127.0.0.1:18081/mcp", "token_env": "WIKI_MCP_TOKEN", "web": False,
              "link_rewrite": ("http://127.0.0.1:18081", os.environ.get("FLEET_WIKI_PUBLIC_URL", "")),
              "tools": {"wiki_overview", "wiki_related", "wiki_search", "wiki_read"}},
-    "vane": {"cmd": ["node", os.path.expanduser("~/.local/share/opencode/vane-mcp-server/dist/server.js")],
+    "vane": {"cmd": [NODE, os.path.expanduser("~/.local/share/opencode/vane-mcp-server/dist/server.js")],
              "web": True, "tools": {"vane_search", "vane_deep_research"}},
-    "google": {"cmd": ["node", os.path.expanduser("~/google-search-mcp/dist/server.js")], "web": True, "tools": None},
+    "google": {"cmd": [NODE, os.path.expanduser("~/google-search-mcp/dist/server.js")], "web": True, "tools": None},
 }
 try:                  # optional override file, same shape as COMPUTER_MCP
     with open(os.path.expanduser("~/.config/fleet-ui/computer-mcp.json")) as _f:
@@ -2940,6 +3044,31 @@ def _stream_completion(model, messages, tools, emit):
     return "".join(content), "".join(reasoning), [calls[i] for i in sorted(calls)]
 
 
+_TEXT_CALL = re.compile(r"<tool_call>\s*<function=([\w.-]+)>(.*?)</function>\s*(?:</tool_call>|$)", re.S)
+_TEXT_PARAM = re.compile(r"<parameter=([\w.-]+)>\n?(.*?)\n?</parameter>", re.S)
+
+
+def _text_tool_calls(reply, specs):
+    """Qwen's XML tool calls that reached `content` unparsed (the server's parser missed them) ->
+    (reply without them, calls). Only names among the offered tools count; schema strings stay strings."""
+    known = {sp["function"]["name"]: sp["function"].get("parameters") or {} for sp in specs}
+    calls = []
+    for m in _TEXT_CALL.finditer(reply):
+        if m.group(1) not in known:
+            continue
+        props, args = known[m.group(1)].get("properties") or {}, {}
+        for k, v in _TEXT_PARAM.findall(m.group(2)):
+            v = v.strip()
+            if (props.get(k) or {}).get("type") != "string":
+                try:
+                    v = json.loads(v)
+                except ValueError:
+                    pass
+            args[k] = v
+        calls.append({"id": "", "name": m.group(1), "arguments": json.dumps(args, ensure_ascii=False)})
+    return (_TEXT_CALL.sub("", reply).strip() if calls else reply), calls
+
+
 COMPUTER_TOOLS_PER_ROUND = 4      # tool calls run per model response; the rest are answered "skipped"
 COMPUTER_DEADLINE = 1200           # seconds per message, all rounds and tools included
 
@@ -3005,6 +3134,8 @@ def _computer_turn(chat, model, vision, text, images, enabled, emit):
         specs = [spec for name, (srv, spec) in reg["tools"].items()
                  if srv in enabled]
         reply, reasoning, calls = _stream_completion(model, _history(chat, vision), specs, emit)
+        if not calls and "<tool_call>" in reply:
+            reply, calls = _text_tool_calls(reply, specs)
         msg = {"role": "assistant", "content": reply, "at": time.time()}
         if reasoning:
             msg["reasoning"] = reasoning
@@ -3750,6 +3881,13 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(data or b"{}")
         except ValueError:
             return self._send(400, '{"error":"bad json"}', "application/json")
+        if self.path == "/api/computer/wiki/edit":     # Memory Core's Edit button: save / rename one page (wikiedit.py)
+            try:
+                out = wikicore.page_edit(body)
+            except (OSError, ValueError, subprocess.SubprocessError) as e:
+                return self._send(502, json.dumps({"error": str(e)[:300]}), "application/json")
+            return self._send(409 if out.get("conflict") else 400 if "error" in out else 200,
+                              json.dumps(out, ensure_ascii=False), "application/json; charset=utf-8")
         if self.path.startswith("/api/computer/push/"):
             try:
                 if self.path == "/api/computer/push/register":
@@ -3828,7 +3966,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(200, json.dumps({"trails": wikicore.trails(COMPUTER_DIR)}), "application/json")
                 if u.path == "/api/computer/wiki/page":       # Memory Core's Open button: one page's markdown, read-only
                     p = (q.get("p") or [""])[0]
-                    return self._send(200, json.dumps({"p": p, "md": wikicore.page_md(p)}, ensure_ascii=False),
+                    md_text, md_sha = wikicore.page_md(p)
+                    return self._send(200, json.dumps({"p": p, "md": md_text, "sha": md_sha}, ensure_ascii=False),
                                       "application/json; charset=utf-8")
                 if u.path == "/api/computer/push":              # push: is the sender set up, how many phones
                     return self._send(200, json.dumps(push_status()), "application/json")
@@ -4022,6 +4161,16 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(502, json.dumps({"error": str(e)[:200]}), "application/json")
             print("MEMORY ALPHA backup started", flush=True)
             ev_audit("Backup started", "A manual off-site backup was started.", go="#/systems/alpha")
+            return self._send(200, json.dumps(res), "application/json")
+        if self.path == "/api/engineering/stop":       # multi-select and Cleansing
+            try:
+                res = engineering_stop(body.get("containers"), body.get("sessions"), key)
+            except urllib.error.HTTPError as e:
+                return self._send(403, json.dumps({"error": _err_text(e)}), "application/json")
+            except (urllib.error.URLError, OSError, subprocess.SubprocessError) as e:
+                return self._send(502, json.dumps({"error": str(e)[:200]}), "application/json")
+            print(f"ENGINEERING stop: {len(res['ended'])} sessions ended, {len(res['stopped'])} containers stopped, "
+                  f"{len(res['refused'])} refused, {len(res['errors'])} failed", flush=True)
             return self._send(200, json.dumps(res), "application/json")
         if self.path == "/api/containers/stop":
             try:
@@ -4231,6 +4380,15 @@ def page_for(user_agent):
 # ---------------------------------------------------------------- entry
 
 def _ct_selfcheck():
+    # sessions: the top Claude Code / opencode process only; an MCP server under ~/.local/share/opencode is no session,
+    # and the tree memory includes it
+    raw = {"P": ["1 0 99 - - /sbin/init", "50 1 500 - - /h/.claude/remote/ccd-cli/2.1 --session-id 1234abcd-0000",
+                 "51 50 500 - - /h/.local/share/opencode/pptx2/.venv/bin/python server.py",
+                 "60 1 400 - - /h/.local/share/opencode/docling/.venv/bin/python orphan.py"],
+           "R": ["50 2048", "51 1024", "60 512"]}
+    s = _session_rows("x", raw, [{"session_pid": 50, "ram_mb": 7}], 1000)
+    assert [(r["pid"], r["rss_mb"], r["containers"], r["ct_ram_mb"]) for r in s] == [(50, 3, 1, 7)], s
+    assert _is_session("/usr/bin/opencode run") and not _is_session("/h/.local/share/opencode/x/python")
     ps = _ps_table(["1 0 99 - - /sbin/init", "10 1 90 - - /usr/bin/llama-swap/llama-swap -config x",
                     "20 10 50 llama-swap.service - /bin/bash /h/run-x.sh",
                     "30 20 40 llama-swap.service - docker logs -f x-head",
@@ -4485,6 +4643,14 @@ def _ev_selfcheck():
 def selfcheck():
     global _q_current, AUTODESTRUCT_CODE
     _ct_selfcheck()
+    # Qwen tool calls left as text in content (seen with Qwen3.8 on sglang, 2026-11-19)
+    _sp = [{"type": "function", "function": {"name": "wiki_search", "parameters": {"properties": {
+        "query": {"type": "string"}, "limit": {"type": "integer"}}}}}]
+    _r, _c = _text_tool_calls("Sure.\n<tool_call>\n<function=wiki_search>\n<parameter=query>\n2.0\n</parameter>\n"
+                              "<parameter=limit>\n5\n</parameter>\n</function>\n</tool_call>", _sp)
+    assert _r == "Sure." and _c[0]["name"] == "wiki_search" and json.loads(_c[0]["arguments"]) == {"query": "2.0", "limit": 5}
+    assert _text_tool_calls("<tool_call><function=rm_rf></function></tool_call>", _sp)[1] == []
+    assert os.path.basename(NODE) == "node"
     _ev_selfcheck()
     # phone interface: "/" serves it to phones only, and a session request can name nothing but a session
     assert page_for("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Starfleet Command/1.0 (macOS)") == PAGE_FILE

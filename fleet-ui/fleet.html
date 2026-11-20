@@ -336,6 +336,21 @@ th[data-sort]::after{content:attr(data-dir);margin-left:4px}
 #ctrview th.num{text-align:right}
 .tag.k-gpu{background:var(--magenta)} .tag.k-session{background:var(--blue)} .tag.k-service{background:var(--amber)}
 .idle-long{color:var(--amber)} .idle-act{color:var(--blue)}
+/* multi-select + Cleansing toolbar */
+#ctrbar{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:10px 0 2px}
+#ctrbar button{font-family:var(--lcars);font-size:13px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;border:0;
+  border-radius:12px;padding:5px 16px;cursor:pointer;background:var(--grid);color:var(--text)}
+#ctrbar button:hover:not(:disabled){background:var(--peach);color:#000}
+#ctrbar #ctrclean{background:var(--mauve);color:#000} #ctrbar #ctrgo:not(:disabled){background:#8a2222;color:#fff}
+#ctrbar button.armed{background:var(--red)!important;color:#000!important;animation:adblink 1s steps(2) infinite}
+#ctrbar button:disabled{opacity:.32;cursor:default}
+#ctrsum{font-size:13px;color:var(--dim);text-transform:uppercase;letter-spacing:.06em}
+#ctrinfo{display:none;background:#0d1a2a;color:var(--blue);border-left:8px solid var(--blue);padding:6px 14px;font-size:13px;
+  text-transform:uppercase;margin-top:6px}
+#ctrview td.ck,#ctrview th.ck{width:30px;padding-left:12px;padding-right:0}
+#ctrview input.ck{width:17px;height:17px;accent-color:var(--orange);cursor:pointer;vertical-align:middle}
+#ctrview input.ck:disabled{cursor:default;opacity:.25}
+#ctrview tr.picked td{background:#1d150a}
 #nasview{grid-column:2;min-width:0}
 #nasmsg{display:none;background:#2a0d0d;color:var(--red);border-left:8px solid var(--red);padding:6px 14px;
   font-size:13px;text-transform:uppercase;margin-top:6px}
@@ -569,7 +584,13 @@ html.fs{scrollbar-width:none} html.fs::-webkit-scrollbar{display:none}
       <div class="bar"><span id="ctrmeta">--</span></div>
     </div>
     <div id="ctrmsg"></div>
+    <div id="ctrbar"><button id="ctrclean" type="button" title="Select every agent session and container idle for more than 24 h, then click again to end them all">Cleansing</button>
+      <button id="ctrnone" type="button" title="Clear the selection">Select none</button>
+      <button id="ctrgo" type="button" disabled title="End the selected sessions and stop the selected containers (click twice)">Stop selected</button>
+      <span id="ctrsum">Tick rows to stop several at once</span></div>
+    <div id="ctrinfo"></div>
     <div id="ctrnodes"></div>
+    <div id="ctrsess"></div>
   </div>
 
   <div class="main" id="maview">
@@ -607,6 +628,7 @@ html.fs{scrollbar-width:none} html.fs::-webkit-scrollbar{display:none}
           <button class="tpill web on" data-tool="vane" title="vane research (internet). Every query is checked first: no customer names, secrets, personal data or pasted text leave this host.">Vane</button>
           <button class="tpill web on" data-tool="google" title="Google search (internet). Every query is checked first: no customer names, secrets, personal data or pasted text leave this host.">Google</button>
           <button class="tpill" id="comphot" title="Set the key combination that opens Computer and starts the microphone">Hotkey</button>
+          <button class="tpill" id="complogb" type="button" hidden title="Open this conversation's access log in Memory Core: which wiki pages Computer searched, read and cited">Access log</button>
           <span id="comphint"></span>
         </div>
         <div id="complog"></div>
@@ -667,7 +689,7 @@ document.addEventListener("click",e=>{
   const t=th.closest("table").dataset.table, k=th.dataset.sort, first=+(th.dataset.first||1), s=SORT[t];
   if(!s||s.k!==k) SORT[t]={k,d:first}; else if(s.d===first) SORT[t]={k,d:-first}; else delete SORT[t];
   try{ localStorage.setItem("fleetSort",JSON.stringify(SORT)); }catch(e){}
-  if(t==="models"){ if(last) render(last); } else if(t==="ctr") ctrPaint(); else defPaint();
+  if(t==="models"){ if(last) render(last); } else if(t==="ctr"||t==="ses") ctrPaint(); else defPaint();
 });
 var queuedPos={};   /* model id -> 1-based place in the load queue; declared early because render() runs before later top-level lines */
 const TAG={"jean-luc":["jl","JEAN-LUC"],"kathryn":["ka","KATHRYN"],"dynamic":["dy","AUTO"]};
@@ -1615,7 +1637,7 @@ function ctrPaint(){
     const sum=k=>rows.reduce((a,c)=>a+(c[k]||0),0);
     const title=node==="jean-luc"?"Jean-Luc":"Kathryn";
     return `<div class="sec"><div class="cap"></div><h2>${title} · ${rows.length} running · ${ctrMB(sum("ram_mb"))} RAM · ${ctrMB(sum("gpu_mb"))} GPU</h2><div class="rule"></div></div>
-    <table data-table="ctr"><thead><tr><th data-sort="name">Container</th><th data-sort="kind">Kind</th>
+    <table data-table="ctr"><thead><tr><th class="ck"><input type="checkbox" class="ck" data-all="c:${node}/" title="Select every container on ${title} that can be stopped"></th><th data-sort="name">Container</th><th data-sort="kind">Kind</th>
       <th class="num" data-sort="ram" data-first="-1">RAM</th><th class="num" data-sort="gpu" data-first="-1">GPU</th>
       <th data-sort="started" data-first="-1">Started</th><th data-sort="owner">Launched by</th>
       <th data-sort="idle" data-first="-1">Idle</th><th class="act"></th></tr></thead><tbody>`+(rows.length?rows.map(c=>{
@@ -1624,14 +1646,97 @@ function ctrPaint(){
       const btn=c.stoppable
         ?`<button class="unl" ${b?"disabled":""} onclick="ctrStop('${node}','${nm}')">${b?"Stopping...":armed?"Sure?":"Stop"}</button>`
         :`<button disabled title="Model server: unload it in the Model Registry (Starfleet Command), not here">Model</button>`;
-      return `<tr class="${c.kind==="gpu"?"pinned":""}"><td><div class="mid">${nm}</div><div class="sub" title="${esc(c.image)}">${esc(c.image)}</div></td>
+      const ck="c:"+k, on=ctrSel.has(ck);
+      return `<tr class="${c.kind==="gpu"?"pinned":""} ${on?"picked":""}"><td class="ck"><input type="checkbox" class="ck" data-k="${esc(ck)}" ${on?"checked":""}
+          ${c.stoppable?"":`disabled title="Model server: unload it in the Model Registry"`}></td><td><div class="mid">${nm}</div><div class="sub" title="${esc(c.image)}">${esc(c.image)}</div></td>
         <td><span class="tag k-${c.kind}">${CTR_KIND[c.kind]||c.kind}</span></td>
         <td class="num">${ctrMB(c.ram_mb)}</td><td class="num">${ctrMB(c.gpu_mb)}</td><td>${started}</td>
         <td>${esc(c.owner)}</td><td>${ctrIdle(c)}</td><td class="act">${btn}</td></tr>`;
-    }).join(""):`<tr><td colspan="8" class="empty">No running containers</td></tr>`)+`</tbody></table>`;
+    }).join(""):`<tr><td colspan="9" class="empty">No running containers</td></tr>`)+`</tbody></table>`;
   }).join("");
+  const ss=sorted("ses",d.sessions||[],{name:s=>s.tool+(s.session||""), model:s=>s.model, started:s=>s.started, idle:s=>s.idle_s,
+    mem:s=>s.rss_mb+s.ct_ram_mb, ctr:s=>s.containers});
+  const ssum=ss.reduce((a,s)=>a+s.rss_mb+s.ct_ram_mb,0);
+  document.getElementById("ctrsess").innerHTML=`<div class="sec"><div class="cap"></div><h2>Agent sessions · Jean-Luc · ${ss.length} running · ${ctrMB(ssum)}</h2><div class="rule"></div></div>
+    <table data-table="ses"><thead><tr><th class="ck"><input type="checkbox" class="ck" data-all="s:" title="Select every session"></th><th data-sort="name">Session</th>
+      <th data-sort="model">Model</th><th data-sort="started" data-first="-1">Started</th><th data-sort="idle" data-first="-1">Idle</th>
+      <th class="num" data-sort="mem" data-first="-1" title="The session's process tree (its MCP servers included) plus the containers it launched">Memory</th>
+      <th class="num" data-sort="ctr" data-first="-1">Containers</th></tr></thead><tbody>`+(ss.length?ss.map(s=>{
+      const ck=`s:${s.node}/${s.pid}`, on=ctrSel.has(ck), cwd=s.cwd?s.cwd.replace(/^\/home\/[^/]+/,"~"):"";
+      const idle=s.idle_s==null?`<span title="Unknown: no transcript or terminal to read. Cleansing never selects it.">–</span>`
+        :s.idle_s<60?`<span class="idle-act">active</span>`:`<span class="${s.idle_s>86400?"idle-long":""}" title="Last activity ${ctrDur(s.idle_s)} ago">${ctrDur(s.idle_s)}</span>`;
+      return `<tr class="${on?"picked":""}"><td class="ck"><input type="checkbox" class="ck" data-k="${esc(ck)}" ${on?"checked":""}></td>
+        <td><div class="mid">${esc(s.tool)}${s.session?` · ${esc(s.session)}`:""}</div><div class="sub" title="${esc(s.cwd||"")}">${esc(cwd)} · pid ${s.pid}</div></td>
+        <td>${esc(s.model||"–")}</td><td><span title="${esc(new Date(s.started*1000).toLocaleString())}">${ctrDur(now-s.started)} ago</span></td>
+        <td>${idle}</td><td class="num">${ctrMB(s.rss_mb+s.ct_ram_mb)}</td><td class="num">${s.containers?`${s.containers} · ${ctrMB(s.ct_ram_mb)}`:"–"}</td></tr>`;
+    }).join(""):`<tr><td colspan="7" class="empty">No agent sessions</td></tr>`)+`</tbody></table>`;
+  ctrBar();
   sortMarks();
 }
+
+/* Multi-select and Cleansing. Keys: "c:<node>/<container>" and "s:<node>/<pid>". The selection survives the
+   10 s refresh; what has gone is dropped. Cleansing selects every agent session and every stoppable container
+   idle for more than 24 h (unknown idle never counts) and arms itself: a second click within 8 s ends them.
+   Ending a session also ends the MCP containers it launched (docker run -i --rm). Needs the Starfleet key. */
+const ctrSel=new Set(), CTR_DAY=86400;
+let ctrGoArm=null, ctrGoT=null, ctrRunning=false;
+function ctrItems(){
+  const d=ctrLast||{}, m=new Map();
+  (d.containers||[]).forEach(c=>m.set(`c:${c.node}/${c.name}`,{t:"c",c,mb:c.ram_mb||0,ok:c.stoppable,
+    idle:c.session_idle_s??c.cpu_idle_s}));
+  (d.sessions||[]).forEach(s=>m.set(`s:${s.node}/${s.pid}`,{t:"s",s,mb:s.rss_mb+s.ct_ram_mb,ok:!s.fleet,idle:s.idle_s}));
+  return m;
+}
+function ctrBar(){
+  const it=ctrItems(); [...ctrSel].forEach(k=>{ if(!it.has(k)||!it.get(k).ok) ctrSel.delete(k); });
+  const sel=[...ctrSel].map(k=>it.get(k)), ns=sel.filter(x=>x.t==="s").length, nc=sel.length-ns;
+  const viaSess=new Set(sel.filter(x=>x.t==="s").map(x=>x.s.pid));
+  const mb=sel.reduce((a,x)=>a+(x.t==="c"&&viaSess.has(x.c.session_pid)?0:x.mb),0);
+  const go=document.getElementById("ctrgo"), cl=document.getElementById("ctrclean");
+  go.disabled=ctrRunning||!sel.length; go.classList.toggle("armed",ctrGoArm==="go");
+  go.textContent=ctrRunning?"Stopping...":ctrGoArm==="go"?`Sure? Stop ${sel.length}`:`Stop selected${sel.length?` (${sel.length})`:""}`;
+  cl.disabled=ctrRunning; cl.classList.toggle("armed",ctrGoArm==="clean");
+  cl.textContent=ctrGoArm==="clean"?`Sure? Cleanse ${sel.length}`:"Cleansing";
+  document.getElementById("ctrsum").textContent=sel.length
+    ?`${ns} session${ns===1?"":"s"} · ${nc} container${nc===1?"":"s"} selected · frees about ${ctrMB(mb)}`
+    :"Tick rows to stop several at once";
+}
+function ctrArmBar(kind){
+  ctrGoArm=kind; clearTimeout(ctrGoT); ctrGoT=setTimeout(()=>{ ctrGoArm=null; ctrBar(); },8000); ctrBar();
+}
+async function ctrRun(){
+  const it=ctrItems(), sel=[...ctrSel].map(k=>it.get(k)).filter(Boolean);
+  if(!sel.length) return;
+  ctrGoArm=null; ctrRunning=true; if(ctrLast) ctrLast.actionError=""; ctrInfo(""); ctrBar();
+  const body={containers:sel.filter(x=>x.t==="c").map(x=>({node:x.c.node,name:x.c.name})),
+              sessions:sel.filter(x=>x.t==="s").map(x=>({node:x.s.node,pid:x.s.pid}))};
+  try{
+    const r=await fetch("/api/engineering/stop",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+    const j=await r.json();
+    if(r.status===403) throw new Error("Starfleet key missing or wrong (enter it on the Starfleet Command page, Save key)");
+    if(!r.ok) throw new Error(j.error||("HTTP "+r.status));
+    const bad=[...j.refused,...j.errors];
+    ctrInfo(`Ended ${j.ended.length} session${j.ended.length===1?"":"s"}, stopped ${j.stopped.length} container${j.stopped.length===1?"":"s"}, freed about ${ctrMB(j.freed_mb)}`+
+      (bad.length?` · ${bad.length} not stopped: ${bad.slice(0,4).map(b=>`${b.name||"pid "+b.pid} (${b.why})`).join(", ")}`:""));
+    ctrSel.clear();
+  }catch(e){ if(ctrLast) ctrLast.actionError="Stop selected failed: "+e.message; }
+  ctrRunning=false; ctrPoll();
+}
+function ctrInfo(t){ const el=document.getElementById("ctrinfo"); el.style.display=t?"block":"none"; el.textContent=t||""; }
+document.getElementById("ctrview").addEventListener("change",e=>{
+  const x=e.target; if(!x.classList||!x.classList.contains("ck")) return;
+  if(x.dataset.all!=null){ ctrItems().forEach((v,k)=>{ if(v.ok&&k.startsWith(x.dataset.all)) x.checked?ctrSel.add(k):ctrSel.delete(k); }); ctrPaint(); return; }
+  x.checked?ctrSel.add(x.dataset.k):ctrSel.delete(x.dataset.k);
+  x.closest("tr").classList.toggle("picked",x.checked); ctrGoArm=null; ctrBar();
+});
+document.getElementById("ctrnone").onclick=()=>{ ctrSel.clear(); ctrGoArm=null; ctrPaint(); };
+document.getElementById("ctrgo").onclick=()=>{ if(ctrGoArm==="go") ctrRun(); else ctrArmBar("go"); };
+document.getElementById("ctrclean").onclick=()=>{
+  if(ctrGoArm==="clean") return ctrRun();
+  ctrSel.clear(); ctrItems().forEach((v,k)=>{ if(v.ok&&v.idle!=null&&v.idle>CTR_DAY) ctrSel.add(k); });
+  if(!ctrSel.size){ ctrInfo("Cleansing: nothing has been idle for more than 24 h."); ctrPaint(); return; }
+  ctrInfo(""); ctrPaint(); ctrArmBar("clean");
+};
 async function ctrPoll(){
   clearTimeout(ctrTimer);
   if(!ctrOn) return;
@@ -1786,6 +1891,10 @@ async function defPoll(){
    16 kHz WAV, transcribed by whisper.cpp on the Spark. A key combination of your choice opens Computer and
    starts the microphone; press it again to stop and transcribe. */
 var compOn=false;
+let compWiki=false;     /* this chat touched the wiki: Memory Core has an access log for it */
+function compWikiSet(on){ compWiki=!!on; document.getElementById("complogb").hidden=!compWiki; }
+document.getElementById("complogb").onclick=()=>{ if(!compChat||!compChat.id) return; const id=compChat.id;
+  if(view!=="wiki") setView("wiki"); if(window.wikiShowChat) wikiShowChat(id); };
 let compChat=null, compBusy=false, compImgs=[], compRec=null, compModels=[], compHot=null;
 const LS=(k,v)=>{ try{ if(v===undefined) return localStorage.getItem(k); localStorage.setItem(k,v); }catch(e){} return null; };
 compHot=LS("computerHotkey")||"Ctrl+Shift+Space";
@@ -1847,7 +1956,7 @@ async function compList(){
     (j.chats||[]).map(c=>`<div class="it ${compChat&&compChat.id===c.id?"on":""}" onclick="compLoad('${c.id}')"><span>${esc(c.title)}
       <small>${ago(c.updated)}</small></span><button title="Delete this chat" onclick="event.stopPropagation();compDel('${c.id}',this)">✕</button></div>`).join("");
 }
-function compNew(){ compChat=null; document.getElementById("complog").innerHTML=""; compList(); document.getElementById("comptext").focus(); }
+function compNew(){ compChat=null; compWikiSet(false); document.getElementById("complog").innerHTML=""; compList(); document.getElementById("comptext").focus(); }
 async function compDel(id,btn){
   if(btn.dataset.arm!=="1"){ btn.dataset.arm="1"; btn.textContent="Sure?"; setTimeout(()=>{ btn.dataset.arm=""; btn.textContent="✕"; },3000); return; }
   try{ await compJSON("/api/computer/delete",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id})}); }catch(e){ compMsg(e.message,true); }
@@ -1878,6 +1987,7 @@ async function compLoad(id){
     else if(m.role==="tool"&&bot){ (m.images||[]).forEach(u=>bot.querySelector(".thumbs").insertAdjacentHTML("beforeend",`<img src="${esc(u)}" alt="tool image">`)); }
   }
   log.scrollTop=log.scrollHeight; compList();
+  compWikiSet(compChat.wiki_used||compChat.messages.some(m=>m.role==="tool"&&/^wiki_/.test(m.name||"")));
   compMsg("");
 }
 async function compSend(){
@@ -1902,9 +2012,9 @@ async function compSend(){
         if(e.type==="token"){ txt+=e.text; if(!raf) raf=requestAnimationFrame(paint); }
         else if(e.type==="reasoning"){ think+=e.text; const d=bot.querySelector(".think"); d.hidden=false; d.querySelector("pre").textContent=think; }
         else if(e.type==="tool_call"){ if(txt){ txt+="\n\n"; } compChip(bot,e.name,e.args,WEB(e.name)); }
-        else if(e.type==="tool_result"){ if(e.guarded) compMsg("Web guard: a query with customer names, personal data, a secret or copied text was not sent; the model rephrases it.");
+        else if(e.type==="tool_result"){ if(/^wiki_/.test(e.name||"")) compWikiSet(true); if(e.guarded) compMsg("Web guard: a query with customer names, personal data, a secret or copied text was not sent; the model rephrases it.");
           (e.images||[]).forEach(u=>bot.querySelector(".thumbs").insertAdjacentHTML("beforeend",`<img src="${esc(u)}" alt="tool image">`)); }
-        else if(e.type==="chat"){ compChat={id:e.id,title:e.title}; }
+        else if(e.type==="chat"){ compChat={id:e.id,title:e.title}; compWikiSet(e.wiki_used); }
         else if(e.type==="error"){ compMsg(e.text,true); }
         else if(e.type==="done"){ compChat={id:e.id}; gotDone=true; } } }
     if(!gotDone) compMsg("The connection ended before the answer finished. Reopen this chat to see what was saved.",true);

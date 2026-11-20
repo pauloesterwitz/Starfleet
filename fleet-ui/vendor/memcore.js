@@ -629,9 +629,12 @@ function paintCard(pathTo){
 }
 /* Open: the selected page's markdown in a panel over the map, read from disk by /api/computer/wiki/page (works
    while the memory-core service is stopped). Frontmatter folds into "Properties"; [[wiki links]] select that page. */
-let docN=null, docSeq=0;
-function closeDoc(){ docN=null; docSeq++; const d=$("mcdoc"); if(d) d.remove(); if(sel) paintCard(); }
+let docN=null, docSeq=0, docText="", docSha="", docEd=null;   /* docEd: {stem, text} the editor started from */
+function docDirty(){ return docEd&&$("mcen")&&($("mcen").value.trim()!==docEd.stem||$("mcet").value!==docEd.text); }
+function docLeave(){ return !docDirty()||confirm("Discard your unsaved changes to this page?"); }
+function closeDoc(){ if(!docLeave()) return; docEd=null; docN=null; docSeq++; const d=$("mcdoc"); if(d) d.remove(); if(sel) paintCard(); }
 async function openDoc(n){
+  if(!docLeave()) return; docEd=null;
   let d=$("mcdoc");
   if(!d){
     d=document.createElement("div"); d.id="mcdoc";
@@ -641,13 +644,14 @@ async function openDoc(n){
   }
   docN=n; const seq=++docSeq, col=TYPES[n.ty][1];
   d.style.borderLeftColor=col;
-  d.innerHTML=`<div class="hd"><b style="color:${col}">${esc(n.t)}</b><button type="button" id="mcdx" title="Close (Esc)">Close</button></div>
+  d.innerHTML=`<div class="hd"><b style="color:${col}">${esc(n.t)}</b><button type="button" id="mcde" title="Edit this page's name and markdown">Edit</button><button type="button" id="mcdx" title="Close (Esc)">Close</button></div>
     <div class="pth">${esc(n.p)}</div><div class="cm"><div class="body"><span class="st loading">loading...</span></div></div>`;
-  $("mcdx").onclick=closeDoc; if(sel) paintCard();
+  $("mcdx").onclick=closeDoc; $("mcde").disabled=true; if(sel) paintCard();
   let text;
-  try{ text=(await compJSON("/api/computer/wiki/page?p="+encodeURIComponent(n.p))).md; }
+  try{ const j=await compJSON("/api/computer/wiki/page?p="+encodeURIComponent(n.p)); text=j.md; if(seq===docSeq){ docText=j.md; docSha=j.sha; } }
   catch(e){ if(seq===docSeq) d.querySelector(".body").innerHTML=`<span class="err">${esc(e.message||String(e))}</span>`; return; }
   if(seq!==docSeq) return;                                   /* another page was opened meanwhile */
+  $("mcde").disabled=false; $("mcde").onclick=editDoc;
   const fm=/^---\r?\n([\s\S]*?)\r?\n---\r?\n?/.exec(text), body=(fm?text.slice(fm[0].length):text)
     .replace(/!\[\[/g,"[[")
     .replace(/\[\[([^\]|#\n]+)(#[^\]|\n]*)?(?:\|([^\]\n]+))?\]\]/g,(m,t,h,a)=>`[${(a||t+(h||"")).replace(/[[\]]/g,"")}](#wiki:${encodeURIComponent(t.trim())})`);
@@ -655,6 +659,41 @@ async function openDoc(n){
   b.innerHTML=(fm?`<details class="fm"><summary>Properties</summary><pre>${esc(fm[1])}</pre></details>`:"")+md(body);
   b.querySelectorAll("a[href^='#wiki:']").forEach(a=>{ a.removeAttribute("target"); a.classList.toggle("dead",!resolve(decodeURIComponent(a.getAttribute("href").slice(6)))); });
   if(window.compHL) compHL(b);
+}
+/* Edit: rename the file and/or change its markdown. Saved by /api/computer/wiki/edit (wikiedit.py, memory-core's locks):
+   a rename also fixes every [[link]] to the page; a page changed on disk since it was opened is refused, not overwritten. */
+function editDoc(){
+  const n=docN, d=$("mcdoc"); if(!n||!d) return;
+  const stem=n.p.split("/").pop().replace(/\.md$/,""), dir=n.p.slice(0,n.p.length-stem.length-3);
+  docEd={stem, text:docText};
+  $("mcde").hidden=true;
+  d.querySelector(".cm").innerHTML=`<div class="ed">
+    <label>File name <span class="dir">${esc(dir)}</span><input id="mcen" spellcheck="false" autocomplete="off"><span class="dir">.md</span></label>
+    <small>Renaming fixes every [[link]] to this page. The title shown on the map is <code>title:</code> in the properties below.</small>
+    <textarea id="mcet" spellcheck="false"></textarea>
+    <div class="eb"><span id="mces"></span><button type="button" id="mcec">Cancel</button><button type="button" id="mcev" class="go">Save</button></div></div>`;
+  $("mcen").value=stem; $("mcet").value=docText; $("mcet").focus();
+  $("mcec").onclick=()=>{ if(docLeave()){ docEd=null; openDoc(n); } };
+  $("mcev").onclick=saveDoc;
+  d.querySelector(".ed").addEventListener("keydown",e=>{ if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==="s"){ e.preventDefault(); saveDoc(); }
+    else if(e.key==="Escape"){ e.stopPropagation(); $("mcec").click(); } });
+}
+async function saveDoc(){
+  const n=docN; if(!n||!docEd) return;
+  const stem=$("mcen").value.trim(), text=$("mcet").value, st=$("mces");
+  if(!stem){ st.textContent="The file name is empty."; st.className="err"; return; }
+  if(stem===docEd.stem&&text===docEd.text){ docEd=null; return openDoc(n); }
+  $("mcev").disabled=true; st.textContent="saving..."; st.className="";
+  try{
+    const r=await compJSON("/api/computer/wiki/edit",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({rel:n.p, sha:docSha, text:text===docEd.text?null:text, stem:stem===docEd.stem?null:stem})});
+    docEd=null;
+    await openDoc(Object.assign({},n,{p:r.rel}));
+    const k=(r.relinked||[]).length, pth=$("mcdoc")&&$("mcdoc").querySelector(".pth");
+    if(pth) pth.textContent+=` · saved${r.rel!==n.p?`, renamed, ${k} linking page${k===1?"":"s"} updated`:""}`;
+    const back=()=>{ gAt=0; loadGraph().then(()=>{ const x=byPath[r.rel]; if(x&&docN&&docN.p===r.rel){ docN=x; select(x); } }); };
+    back(); setTimeout(back,6000);                            /* the server re-exports the map in the background */
+  }catch(e){ if($("mces")){ st.textContent=e.message; st.className="err"; $("mcev").disabled=false; } }
 }
 addEventListener("keydown",e=>{ if(e.key==="Escape"&&docN&&view==="wiki"&&!/^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName)) closeDoc(); });
 
@@ -725,6 +764,11 @@ window.wikiOpen=()=>{
   loadGraph(); loadTrails(); clearInterval(timer);
   timer=setInterval(()=>{ if(view!=="wiki") return; loadTrails(); if(Date.now()/1000-gAt>600) loadGraph(); },15000);
   touch();
+};
+window.wikiShowChat=id=>{      /* Computer's "Access log" button: that conversation's trail, whole session shown */
+  chatSel=id; LS.set("mcNoChat",false); stepHot=null; if(play) stopPlay();
+  if(built&&trails.find(t=>t.id===id)){ showAll(); paintLists(); }   /* not loaded yet: loadTrails keeps chatSel when it finds it */
+  const l=$("mclog"); if(l) l.scrollTop=0;
 };
 window.wikiClose=()=>{ clearInterval(timer); timer=null; if(play) stopPlay(); };
 if(typeof view!=="undefined"&&view==="wiki") wikiOpen();

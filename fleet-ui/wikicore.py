@@ -6,6 +6,7 @@ memory-core service is stopped. The last good map is also kept on disk, so a Fle
 (fleet.py COMPUTER_DIR): every wiki_* call with its arguments, what it returned, and what the answer cited.
 Nothing here writes to the wiki, the chats or the container."""
 import glob
+import hashlib
 import json
 import os
 import re
@@ -214,8 +215,33 @@ def page_md(rel):
     path = os.path.realpath(os.path.join(base, rel[len("wiki/"):]))
     if not path.startswith(base + os.sep) or not os.path.isfile(path):
         raise ValueError("not a wiki page")
-    with open(path, encoding="utf-8", errors="replace") as f:
-        return f.read(PAGE_MAX)
+    with open(path, "rb") as f:
+        raw = f.read()
+    return raw.decode("utf-8", errors="replace")[:PAGE_MAX], hashlib.sha256(raw).hexdigest()
+
+
+EDIT_BACKUP = os.path.expanduser("~/.cache/fleet-ui/wiki-edits")
+
+
+def page_edit(req):
+    """Memory Core's Edit button: save and/or rename one page through wikiedit.py, run with memory-core's python so it
+    takes memory-core's vault locks and link rules. Returns its answer dict ({"rel", "sha", ...} or {"error", ...})."""
+    if not isinstance(req, dict):
+        raise ValueError("bad request")
+    py = os.path.join(MEMORY_CORE, ".venv", "bin", "python")
+    argv = ["env", f"PYTHONPATH={MEMORY_CORE}", "WIKI_VAULT=" + WIKI_ROOT, "WIKI_EDIT_BACKUP=" + EDIT_BACKUP, py,
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "wikiedit.py")]
+    r = subprocess.run(argv,
+                       input=json.dumps({k: req.get(k) for k in ("rel", "sha", "text", "stem")}),
+                       capture_output=True, text=True, timeout=120)
+    try:
+        out = json.loads(r.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        raise OSError((r.stderr or "wikiedit failed").strip().splitlines()[-1][:300])
+    if "rel" in out:                         # the map shows the new name and links after the next export
+        with _lock:
+            _cache["at"] = 0.0
+    return out
 
 
 if __name__ == "__main__":       # self-check: python3 wikicore.py
