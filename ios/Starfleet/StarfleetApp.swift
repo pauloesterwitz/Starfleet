@@ -6,9 +6,12 @@ import WebKit
 /// the page and kept in the page's localStorage (the web view's persistent store).
 /// Fleet serves a phone its phone interface (padd.html); that page talks to the app
 /// through `PaddBridge` for what a web page cannot do: haptics, drawing under the
-/// status bar, opening a link in Safari.
+/// status bar, opening a link in Safari, and for messages: notification permission, the push
+/// token, taps, the icon badge (Push.swift).
 @main
 struct StarfleetApp: App {
+    @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+
     var body: some Scene {
         WindowGroup { FleetScreen() }
     }
@@ -132,6 +135,10 @@ final class PaddBridge: NSObject, WKScriptMessageHandler {
         case "ready":
             readyCount += 1
             onReady?(body["edgeToEdge"] as? Bool ?? false)
+            Task { @MainActor in PaddPush.shared.pageReady() }
+        case "push-status", "push-enable", "push-disable", "badge":
+            let n = (body["n"] as? NSNumber)?.intValue ?? 0
+            Task { @MainActor in PaddPush.shared.handle(type, n) }
         case "haptic":
             haptic(body["style"] as? String ?? "light")
         case "open":
@@ -165,6 +172,8 @@ private struct FleetWebView: UIViewRepresentable {
     func makeUIView(context: Context) -> WKWebView {
         webView.navigationDelegate = context.coordinator
         webView.uiDelegate = context.coordinator
+        // Here, not in makeWebView: that runs again whenever FleetScreen is rebuilt and only the first view is kept.
+        Task { @MainActor in PaddPush.shared.webView = webView }
         let refresh = UIRefreshControl()
         refresh.tintColor = .white
         refresh.addAction(UIAction { _ in context.coordinator.reload(webView) }, for: .valueChanged)
@@ -205,6 +214,8 @@ private struct FleetWebView: UIViewRepresentable {
 
         func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
             parent.loadError = nil
+            // A tapped notification now waits for the new page's "ready".
+            Task { @MainActor in PaddPush.shared.pageLoading() }
         }
 
         func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
@@ -219,6 +230,8 @@ private struct FleetWebView: UIViewRepresentable {
 
         /// iOS can end the page's process while the app is in the background: bring the page back.
         func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+            // The old page is gone: a tapped notification waits for the new page's "ready".
+            Task { @MainActor in PaddPush.shared.pageLoading() }
             if let url = parent.url { webView.load(URLRequest(url: url)) }
         }
 

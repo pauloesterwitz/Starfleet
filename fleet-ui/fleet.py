@@ -19,8 +19,10 @@ stdlib only.  Run:  python3 fleet.py
 """
 
 import argparse
+import base64
 import glob
 import datetime
+import hashlib
 import hmac
 import io
 import json
@@ -29,6 +31,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -79,6 +82,8 @@ PROBE = (
     'echo "GPU:$(nvidia-smi --query-gpu=utilization.gpu,temperature.gpu,power.draw '
     '--format=csv,noheader,nounits 2>/dev/null | head -1)"; '
     'echo "DOCKER:$(docker ps --format "{{.Names}}" 2>/dev/null | paste -sd, -)"; '
+    'echo "BOOT:$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"; '
+    "echo \"LINK:$(i=$(ip -o route show default 2>/dev/null | awk '{print $5; exit}'); cat /sys/class/net/$i/speed 2>/dev/null)\"; "
     # Live entries only: a reservation whose owner pid is gone is stale and must
     # not be shown as held memory (memcheck.sh prunes those on its next run).
     'echo "RES:$(t=0; for f in $HOME/.gb10/reservations/*; do [ -e "$f" ] || continue; '
@@ -359,6 +364,13 @@ def parse_probe(text):
                 out["reserved_mb"] = int(line[4:].strip() or 0)
             except ValueError:
                 out["reserved_mb"] = 0
+        elif line.startswith("BOOT:"):
+            out["boot"] = line[5:].strip()
+        elif line.startswith("LINK:"):
+            try:
+                out["link_mbps"] = int(line[5:].strip())
+            except ValueError:
+                pass
     return out if "mem_total_kb" in out else None
 
 
@@ -1394,6 +1406,7 @@ def apply_effort(model, label, key=None):
             resident = any(r.get("model") == model for r in STATE["running"])
         if not resident:
             return False
+        _CFG_CHANGED[model] = time.time()
         swap_unload(model, key=key)
         return True
 
@@ -1427,6 +1440,7 @@ def apply_ctx(model, ctx, key=None):
             resident = any(r.get("model") == model for r in STATE["running"])
         if not resident:
             return False
+        _CFG_CHANGED[model] = time.time()
         swap_unload(model, key=key)
         return True
 
@@ -1501,6 +1515,7 @@ def touch(model, key=None):
         # snapshot and this call. Averaging those in drags every ETA to zero.
         if cold and elapsed >= MIN_COLD_LOAD:
             record_load_time(model, elapsed)
+            ev_append("info", "load-done", "Model loaded", f"{_family_base(model)} is ready (took {int(elapsed // 60)} min {int(elapsed % 60)} s).", go="#/models")
         with LOCK:
             STATE["errors"].pop(model, None)
         return True
@@ -1521,6 +1536,8 @@ def touch(model, key=None):
         return False
     with LOCK:
         STATE["errors"][model] = msg
+    if cold:
+        ev_append("info", "load-failed", "Load failed", f"{_family_base(model)} did not start: {msg[:120]}", go="#/models")
     return False
 
 
@@ -3132,6 +3149,552 @@ def session_tail(node, sid, tool):
     return _sess_script(NODES[node], "opencode-export-tail.py", [sid, "5", tool], 45)
 
 
+# ---------------------------------------------------------------- messages (phone interface)
+# What went wrong or needs you, written down once and kept, so the phone can show it after the fact and push
+# it when the app is closed. One watcher thread compares what Fleet already collects with a few rules
+# (ev_detect: pure functions, testable without a server). An EPISODE opens when a rule has held long enough
+# ("for_s": a flapping probe never opens one), may repeat as a reminder, and resolves when the rule stops
+# holding. Open episodes are saved, so a restart does not announce them again.
+# Levels: "act" is pushed to a phone, "notice" is a list entry that counts as unread, "info" is list only.
+# Texts carry node and model names, counts and generic words, never a session title or a path: a push passes
+# through Apple.
+
+EV_DIR = os.path.expanduser(os.environ.get("FLEET_EVENTS_DIR", "~/.local/share/fleet-ui"))
+EV_FILE = os.path.join(EV_DIR, "events.jsonl")
+EV_STATE = os.path.join(EV_DIR, "events-state.json")
+EV_CONF = os.path.expanduser("~/.config/fleet-ui/events.json")    # optional: {"mute": ["web-down:app.example.org", "link-slow:"]} (key prefixes)
+EV_KEEP = 500            # entries kept
+EV_REMIND_S = 6 * 3600   # an open act episode repeats after this, twice at most
+EV_HEAVY = 120           # seconds between the slow checks (backup, web server, sessions, containers)
+EV_GRACE = 45            # seconds after start before the first look: the probes must have run
+EV_PUSH_PER_H = 6        # most pushes an hour; a burst becomes one summary
+EV_MEM_LOW, EV_MEM_OK = 3.0, 3.5     # GB free: opens below the memory guard's floor. Closes just above it: Jean-Luc idles near 3.9
+                                     # with a big model resident (measured), so a higher mark would never be reached
+EV_STALE_H = 30                      # last off-site snapshot older than this (same as MA_SNAP_H)
+
+_EV = {"last": 0, "items": [], "lines": 0, "boots": {}, "ma": None, "blob": ""}
+_EV_LOCK = threading.RLock()
+_EP = {}                 # episode key -> {"spec", "since", "open", "gone", "sent", "reminders"}
+_AD_AT = 0.0             # when Auto Destruct last ran: reboots shortly after are expected
+_CFG_CHANGED = {}        # model -> when its context or effort was changed (the unload that follows is ours)
+
+
+def _ev_hash(text, n=10):
+    """An opaque short id: session ids and episode keys must not leave the machine as they are."""
+    return hashlib.sha1(str(text).encode()).hexdigest()[:n]
+
+
+def ev_load():
+    items, st = [], {}
+    try:
+        with open(EV_FILE, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    items.append(json.loads(line))
+                except ValueError:
+                    pass
+    except OSError:
+        pass
+    try:
+        with open(EV_STATE, encoding="utf-8") as f:
+            st = json.load(f)
+    except (OSError, ValueError):
+        pass
+    with _EV_LOCK:
+        _EV["items"], _EV["lines"] = items[-EV_KEEP:], len(items)
+        _EV["last"] = max([e.get("id", 0) for e in items] + [st.get("last", 0)])
+        _EV["boots"] = dict(st.get("boots") or {})
+        for k, e in (st.get("eps") or {}).items():
+            _EP[k] = {"spec": e["spec"], "since": e["since"], "open": True, "gone": None,
+                      "sent": e.get("sent", 0), "reminders": e.get("reminders", 0)}
+
+
+def ev_save_state():
+    with _EV_LOCK:
+        blob = json.dumps({"last": _EV["last"], "boots": _EV["boots"],
+                           "eps": {k: {"spec": e["spec"], "since": e["since"], "sent": e["sent"], "reminders": e["reminders"]}
+                                   for k, e in _EP.items() if e["open"]}})
+        if blob == _EV["blob"]:
+            return
+        _EV["blob"] = blob
+    try:
+        os.makedirs(EV_DIR, exist_ok=True)
+        tmp = EV_STATE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(blob)
+        os.replace(tmp, EV_STATE)
+    except OSError as e:
+        print(f"events: cannot save state: {e}", flush=True)
+
+
+def ev_append(level, kind, title, text, go="", node="", state="point", episode="", reminder=0):
+    """Add one entry. level: act | notice | info; state: open | resolved | point."""
+    with _EV_LOCK:
+        _EV["last"] += 1
+        e = {"id": _EV["last"], "at": round(time.time(), 1), "kind": kind, "level": level, "state": state,
+             "episode": episode, "title": title, "text": text[:400], "go": go, "node": node, "reminder": reminder}
+        _EV["items"].append(e)
+        del _EV["items"][:-EV_KEEP]
+        try:
+            os.makedirs(EV_DIR, exist_ok=True)
+            with open(EV_FILE, "a", encoding="utf-8") as f:
+                f.write(json.dumps(e, ensure_ascii=False) + "\n")
+            _EV["lines"] += 1
+            if _EV["lines"] > EV_KEEP + 100:           # trim: rewrite the newest EV_KEEP lines
+                tmp = EV_FILE + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    f.write("".join(json.dumps(x, ensure_ascii=False) + "\n" for x in _EV["items"]))
+                os.replace(tmp, EV_FILE)
+                _EV["lines"] = len(_EV["items"])
+        except OSError as ex:
+            print(f"events: cannot write {EV_FILE}: {ex}", flush=True)
+    return e
+
+
+def ev_audit(title, text, go=""):
+    """A one-off record of something done through Fleet (Red Alert, a stop, a backup start): list only."""
+    ev_append("info", "audit", title, text, go=go)
+
+
+def events_json():
+    with _EV_LOCK:
+        return {"events": list(_EV["items"][-200:]), "latest": _EV["last"],
+                "open": sorted(k for k, e in _EP.items() if e["open"]), "at": time.time()}
+
+
+def ev_step(eps, conds, hold, now):
+    """Pure episode logic. conds: key -> spec for every rule that holds right now. hold: key prefixes whose
+    source is unknown at the moment (episodes under them are left alone). Returns [(action, key, spec, n)]
+    with action open | reminder | resolve."""
+    acts = []
+    for key, spec in conds.items():
+        e = eps.get(key)
+        if e is None:
+            e = eps[key] = {"spec": spec, "since": now, "open": False, "gone": None, "sent": 0, "reminders": 0}
+        e["spec"], e["gone"] = spec, None
+        if not e["open"]:
+            if now - e["since"] >= spec.get("for_s", 0):
+                e["open"], e["sent"] = True, now
+                acts.append(("open", key, spec, 0))
+        elif spec.get("remind") and e["reminders"] < 2 and now - e["sent"] >= EV_REMIND_S:
+            e["reminders"] += 1
+            e["sent"] = now
+            acts.append(("reminder", key, spec, e["reminders"]))
+    for key in list(eps):
+        if key in conds or any(key.startswith(p) for p in hold):
+            continue
+        e = eps[key]
+        if e["gone"] is None:
+            e["gone"] = now
+        if now - e["gone"] >= e["spec"].get("clear_s", 0):
+            if e["open"]:
+                acts.append(("resolve", key, e["spec"], 0))
+            del eps[key]
+    return acts
+
+
+def ev_filter(conds, eps, mute):
+    """Drop muted rules, and forget their episodes without a word (a muted rule is not a recovery)."""
+    for k in [k for k in eps if any(k.startswith(p) for p in mute)]:
+        del eps[k]
+    return {k: v for k, v in conds.items() if not any(k.startswith(p) for p in mute)}
+
+
+def _ev_mute():
+    try:
+        with open(EV_CONF, encoding="utf-8") as f:
+            return [str(p) for p in (json.load(f).get("mute") or []) if p]
+    except (OSError, ValueError, AttributeError):
+        return []
+
+
+def ev_apply(acts):
+    """Write the entries for ev_step's actions. Returns [(event, push text)] for the ones to push."""
+    out = []
+    for act, key, spec, n in acts:
+        kw = dict(kind=spec["kind"], title=spec["title"], go=spec.get("go", ""), node=spec.get("node", ""), episode=key)
+        if act == "resolve":
+            ev_append(spec["level"], text=spec.get("ok") or "Back to normal.", state="resolved", **kw)
+        else:
+            text = spec["text"] if act == "open" else "Still open: " + spec["text"]
+            out.append((ev_append(spec["level"], text=text, state="open", reminder=n, **kw),
+                        spec.get("push") or (spec["title"] if spec["level"] == "act" else spec["text"])))
+    return out
+
+
+def ev_detect(w, open_keys):
+    """The rules. w is a snapshot of what Fleet knows (see ev_world); open_keys the open episodes (for the
+    hysteresis). Returns (conds, hold). A source that is None is unknown: its episodes are held, not closed."""
+    now, conds, hold = w["now"], {}, []
+    label = lambda n: n.title()                                           # "jean-luc" -> "Jean-Luc"
+    # models: llama-swap down, or a pin that is not running
+    swap = w["errors"].get("_swap")
+    if swap:
+        conds["swap-down"] = dict(kind="swap-down", level="act", title="llama-swap not answering", text=swap[:140], go="#/models",
+                                  push="llama-swap does not answer. No model can load.", for_s=120, remind=True,
+                                  ok="llama-swap answers again.")
+        hold.append("model-lost:")                                        # the running list is stale meanwhile
+    else:
+        known = w.get("models")
+        for m in w["pins"]:
+            if known and m not in known:            # renamed or removed in config.yaml; the phone cannot unpin it
+                conds["pin-unknown:" + m] = dict(kind="pin-unknown", level="notice", title="Pinned model missing", go="#/models", for_s=300,
+                                                 text=f"{_family_base(m)} is pinned but is not in the llama-swap configuration any more.",
+                                                 ok=f"{_family_base(m)} is no longer pinned.")
+                continue
+            if m in w["running"] or m in w["busy"] or now - w["cfg"].get(m, 0) < 1800:
+                continue
+            if len(node_of(m)) > 1 and any(len(node_of(r)) > 1 for r in w["running"] if r != m):
+                continue                            # another two-node model took its place in the exclusive group: the user's own choice
+            nm, err = _family_base(m), (w["errors"].get(m) or "").strip().replace("\n", " ")
+            conds["model-lost:" + m] = dict(
+                kind="model-lost", level="act", title="Pinned model lost", go="#/models", for_s=120, remind=True,
+                text=f"{nm} is pinned but not running." + (f" Last error: {err[:120]}" if err else "") +
+                     " Fleet does not reload it by itself: open Models and press Load.",
+                push=f"{nm} is pinned but not running. Open Models and press Load.",
+                ok=f"{nm} is running again, or no longer pinned.")
+    # nodes
+    for n, info in w["nodes"].items():
+        lab = label(n)
+        if info is None:
+            hold += [f"node-down:{n}", f"memory-low:{n}", f"link-slow:{n}"]
+            continue
+        if info.get("error"):
+            conds[f"node-down:{n}"] = dict(kind="node-down", level="act", title=f"{lab} not answering", node=n, go="#/bridge",
+                                           text=f"{lab} does not answer. {info['error'][:100]}".strip(), push=f"{lab} does not answer.",
+                                           for_s=90, remind=True, ok=f"{lab} answers again.")
+            hold += [f"memory-low:{n}", f"link-slow:{n}"]                 # no numbers while it is down
+            continue
+        avail = (info.get("mem_avail_kb") or 0) / 1048576
+        if avail < (EV_MEM_OK if f"memory-low:{n}" in open_keys else EV_MEM_LOW):
+            conds[f"memory-low:{n}"] = dict(
+                kind="memory-low", level="act", title=f"{lab} low on memory", node=n, go=f"#/systems/engineering/{n}", for_s=30, remind=True,
+                text=f"Only {avail:.1f} GB of memory free on {lab}. Loads may be refused or stopped. Open Engineering to see what holds it.",
+                push=f"Only {avail:.1f} GB of memory free on {lab}.", clear_s=300, ok=f"{lab} has enough free memory again.")
+        mbps = info.get("link_mbps")
+        if not isinstance(mbps, int) or mbps <= 0:
+            hold.append(f"link-slow:{n}")                                   # no reading (cable out): unknown, not fixed
+        elif mbps < 1000:
+            conds[f"link-slow:{n}"] = dict(kind="link-slow", level="notice", title=f"{lab}'s network is slow", node=n, go="#/bridge", for_s=300, clear_s=300,
+                                           text=f"{lab}'s network port runs at {mbps} Mb/s instead of 1000. Backups and downloads crawl. Check the cable and plug.",
+                                           ok=f"{lab}'s network port is back to full speed.")
+    # off-site backup
+    a = w.get("alpha")
+    if a is None:
+        hold += ["backup"]
+    else:
+        last = a.get("last") or {}
+        age_h = (now - last["end"]) / 3600 if last.get("end") else None
+        stale = age_h is not None and age_h > EV_STALE_H
+        if stale or a.get("status") == "error":
+            txt = (f"The last off-site snapshot is {int(age_h)} hours old." if stale else
+                   "Memory Alpha cannot be read: " + ((a.get("errors") or ["no answer"])[0])[:100])
+            conds["backup"] = dict(kind="backup", level="act", title="Backup failed or stale", text=txt + " Open Memory Alpha.",
+                                   push=txt if stale else "The off-site backup cannot be checked.",
+                                   go="#/systems/alpha", for_s=120 if stale else 900, clear_s=300, remind=True, ok="The off-site backup is current again.")
+        elif a.get("problems"):
+            conds["backup-warn"] = dict(kind="backup-warn", level="notice", title="Backup needs a look", text=a["problems"][0][:140] + ".",
+                                        go="#/systems/alpha", for_s=300, clear_s=300, ok="The backup warning is gone.")
+    # web server
+    d = w.get("defiant")
+    if d is None:
+        hold += ["web-host", "web-down:", "cert:", "reboot-needed"]
+    elif d.get("configured") is not False:
+        if d.get("errors") and not d.get("sites"):
+            conds["web-host"] = dict(kind="web-down", level="act", title="Web server not answering", go="#/systems/defiant", for_s=300, remind=True,
+                                     text="Defiant cannot be checked: " + d["errors"][0][:100], push="The web server cannot be checked.",
+                                     clear_s=300, ok="The web server answers again.")
+            hold += ["web-down:", "cert:", "reboot-needed"]
+        else:
+            if not d.get("sites"):
+                hold += ["web-down:", "cert:"]
+            for s in d.get("sites") or []:
+                dm = s.get("domain")
+                if s.get("error") or not s.get("status") or (s["status"] >= 400 and s["status"] != 401):
+                    conds[f"web-down:{dm}"] = dict(kind="web-down", level="act", title="Web site down", go="#/systems/defiant", for_s=200, remind=True,
+                                                   text=f"{dm} does not answer ({s.get('error') or s.get('status')}). Open Defiant.",
+                                                   push="A web site on Defiant does not answer.", clear_s=300, ok=f"{dm} answers again.")
+                elif s.get("cert_days") is not None and s["cert_days"] < 14:
+                    conds[f"cert:{dm}"] = dict(kind="cert", level="notice", title="Certificate ends soon", go="#/systems/defiant",
+                                               text=f"The certificate of {dm} ends in {s['cert_days']} days.", clear_s=300, ok=f"The certificate of {dm} is renewed.")
+            if d.get("reboot_required"):
+                conds["reboot-needed"] = dict(kind="reboot-needed", level="notice", title="Web server needs a reboot", go="#/systems/defiant",
+                                              text="Defiant has installed updates and needs a reboot.", ok="Defiant has rebooted.")
+    # coding sessions waiting for you: stalled for 30 minutes to 6 hours (older ones are abandoned, not waiting)
+    s = w.get("sessions")
+    if s is None:
+        hold.append("sessions-waiting:")
+    else:
+        for n, v in (s.get("nodes") or {}).items():
+            if not v or v.get("error"):
+                hold.append(f"sessions-waiting:{n}:")
+                continue
+            for x in v.get("sessions") or []:
+                age, key = x.get("updated_secs_ago") or 0, f"sessions-waiting:{n}:{_ev_hash(x.get('id'))}"
+                if x.get("stalled") and age >= 1800 and (age <= 21600 or key in open_keys):
+                    conds[key] = dict(kind="sessions-waiting", level="act", title="Session waiting", node=n, go="#/systems/sessions", for_s=0, clear_s=600,
+                                      text=f"A coding session on {label(n)} has been waiting for you for {int(age / 60)} minutes. Open Sessions.",
+                                      push=f"A coding session on {label(n)} has been waiting for you for 30 minutes or more.",
+                                      ok="A waiting session is moving again or was closed.")
+    # containers of idle sessions that hold memory
+    c = w.get("containers")
+    if c is None:
+        hold.append("idle-sessions:")
+    else:
+        for n in w["nodes"]:
+            if (c.get("errors") or {}).get(n):
+                hold.append(f"idle-sessions:{n}")
+                continue
+            rows = [r for r in c.get("containers") or [] if r.get("node") == n and r.get("kind") == "session" and (r.get("session_idle_s") or 0) > 86400]
+            gb = sum(r.get("ram_mb") or 0 for r in rows) / 1024
+            if len(rows) >= 5 and gb >= 3:
+                conds[f"idle-sessions:{n}"] = dict(kind="idle-sessions", level="notice", title="Idle sessions hold memory", node=n,
+                                                   go=f"#/systems/engineering/{n}", for_s=600,
+                                                   text=f"{len(rows)} containers of coding sessions idle for over a day hold {gb:.0f} GB on {label(n)}. Stop the ones you no longer use.",
+                                                   ok=f"The idle sessions on {label(n)} no longer hold much memory.")
+    return conds, hold
+
+
+def ev_world(now, heavy):
+    with LOCK:
+        nodes = {n: (dict(v) if isinstance(v, dict) else None) for n, v in STATE["nodes"].items()}
+        running = {r.get("model") for r in STATE["running"]}
+        errors = dict(STATE["errors"])
+        models = set(STATE["models"])
+    for n in NODES:
+        nodes.setdefault(n, None)
+    with _loading_lock:
+        loading = set(_loading)
+    return dict(heavy, now=now, nodes=nodes, running=running, errors=errors, pins=load_pins(), models=models,
+                busy=loading | set(queued_ids()) | set(_llm_busy), cfg=dict(_CFG_CHANGED))
+
+
+def _ev_heavy():
+    out = {}
+    for k, fn in (("alpha", memory_alpha_state), ("defiant", defiant_state), ("sessions", sessions_state), ("containers", containers_state)):
+        try:
+            out[k] = fn()
+        except Exception as e:                    # a failing source is unknown, never "all clear"
+            print(f"events: {k}: {e.__class__.__name__}: {str(e)[:120]}", flush=True)
+            out[k] = None
+    return out
+
+
+def ev_points(w):
+    """One-off entries: a node that rebooted on its own, a manual backup that ended."""
+    for n, info in w["nodes"].items():
+        boot = info and info.get("boot")
+        if not boot:
+            continue
+        with _EV_LOCK:
+            prev, _EV["boots"][n] = _EV["boots"].get(n), boot
+        with _EV_LOCK:
+            planned = any(e.get("title") == "Auto Destruct ran" and w["now"] - e.get("at", 0) < 1200 for e in _EV["items"][-50:])
+        if prev and prev != boot and w["now"] - _AD_AT > 1200 and not planned:
+            ev_append("notice", "node-rebooted", f"{n.title()} rebooted", go="#/bridge", node=n,
+                      text=f"{n.title()} started again (noticed at {time.strftime('%H:%M')}). If you did not expect it, check the memory guard and the power.")
+    a = w.get("alpha")
+    if a is not None:
+        m = a.get("manual") or {}
+        cur = m.get("state")
+        prev, _EV["ma"] = _EV["ma"], cur
+        if prev == "running" and cur and cur != "running":
+            ok = m.get("exit") in (0, None) and not m.get("error")
+            ev_append("info", "backup-done", "Backup finished" if ok else "Backup failed", go="#/systems/alpha",
+                      text="The backup you started has finished." if ok else f"The backup you started ended with an error: {(m.get('error') or 'exit ' + str(m.get('exit')))[:100]}")
+
+
+def events_worker():
+    ev_load()
+    time.sleep(EV_GRACE)
+    heavy, heavy_at = {}, 0.0
+    while True:
+        try:
+            if time.time() - heavy_at >= EV_HEAVY:
+                heavy, heavy_at = _ev_heavy(), time.time()
+            now = time.time()
+            w = ev_world(now, heavy)
+            with _EV_LOCK:
+                conds, hold = ev_detect(w, {k for k, e in _EP.items() if e["open"]})
+                conds = ev_filter(conds, _EP, _ev_mute())
+                pairs = ev_apply(ev_step(_EP, conds, hold, now))
+            ev_points(w)
+            ev_save_state()
+            push_dispatch(pairs)
+        except Exception as e:
+            print(f"events: {e.__class__.__name__}: {e}", flush=True)
+        time.sleep(5)
+
+
+# ---------------------------------------------------------------- push (Apple Push Notification service)
+# Needs the paid Apple Developer Program: a key made at developer.apple.com (a .p8 file) kept on this host,
+# readable by this user only, with its ids in the service environment (a drop-in with EnvironmentFile, like
+# the Auto Destruct code): APNS_KEY_FILE, APNS_KEY_ID, APNS_TEAM_ID, optionally APNS_TOPIC. Without them the
+# sender is off and everything else keeps working. The request goes out through curl, which speaks HTTP/2;
+# the token is signed here with `cryptography` and handed to curl on stdin, never on the command line.
+
+PUSH_DEV_FILE = os.path.expanduser("~/.config/fleet-ui/push-devices.json")
+APNS_TOPIC = "com.oesterwitz.starfleetcommand.ios"
+APNS_HOSTS = {"development": "api.sandbox.push.apple.com", "production": "api.push.apple.com"}
+_PUSH_SENT = []                   # timestamps of recent pushes
+_PUSH_LOCK = threading.Lock()
+_APNS = {"jwt": None, "iat": 0}
+
+
+def push_devices():
+    try:
+        with open(PUSH_DEV_FILE, encoding="utf-8") as f:
+            return [d for d in json.load(f) if isinstance(d, dict) and d.get("token")]
+    except (OSError, ValueError):
+        return []
+
+
+def _push_save(devs):
+    os.makedirs(os.path.dirname(PUSH_DEV_FILE), exist_ok=True)
+    tmp = PUSH_DEV_FILE + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(devs, f)
+    os.replace(tmp, PUSH_DEV_FILE)
+
+
+def push_register(token, env):
+    if not re.fullmatch(r"[0-9a-f]{32,200}", token or "") or env not in APNS_HOSTS:
+        raise ValueError("not a device token")
+    with _PUSH_LOCK:
+        devs = [d for d in push_devices() if d["token"] != token] + [{"token": token, "env": env, "added": int(time.time())}]
+        _push_save(devs[-5:])
+        return min(len(devs), 5)
+
+
+def push_unregister(token):
+    with _PUSH_LOCK:
+        devs = [d for d in push_devices() if d["token"] != token]
+        _push_save(devs)
+        return len(devs)
+
+
+def push_status():
+    devs = push_devices()
+    key, kid, tid = (os.environ.get(k) or "" for k in ("APNS_KEY_FILE", "APNS_KEY_ID", "APNS_TEAM_ID"))
+    if not (key and kid and tid):
+        reason = "No push key on Fleet yet."
+    elif not os.path.isfile(os.path.expanduser(key)):
+        reason = "The push key file is missing."
+    else:
+        reason = ""
+    return {"sender": "off" if reason else "ready", "reason": reason, "devices": len(devs), "env": devs[0]["env"] if devs else ""}
+
+
+def _apns_jwt():
+    """The provider token: ES256 over {iss: team, iat}; Apple accepts one for up to an hour."""
+    now = int(time.time())
+    if _APNS["jwt"] and now - _APNS["iat"] < 3000:
+        return _APNS["jwt"]
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec, utils
+    with open(os.path.expanduser(os.environ["APNS_KEY_FILE"]), "rb") as f:
+        key = serialization.load_pem_private_key(f.read(), password=None)
+    b64 = lambda b: base64.urlsafe_b64encode(b).rstrip(b"=")
+    head = b64(json.dumps({"alg": "ES256", "kid": os.environ["APNS_KEY_ID"]}, separators=(",", ":")).encode())
+    body = b64(json.dumps({"iss": os.environ["APNS_TEAM_ID"], "iat": now}, separators=(",", ":")).encode())
+    r, s = utils.decode_dss_signature(key.sign(head + b"." + body, ec.ECDSA(hashes.SHA256())))
+    _APNS["jwt"], _APNS["iat"] = (head + b"." + body + b"." + b64(r.to_bytes(32, "big") + s.to_bytes(32, "big"))).decode(), now
+    return _APNS["jwt"]
+
+
+def apns_post(dev, payload, collapse=""):
+    """One push to one device. Returns (http status, Apple's reason). The headers (with the token) go to curl on stdin."""
+    host = os.environ.get("FLEET_APNS_HOST") or APNS_HOSTS[dev["env"]]
+    collapse = re.sub(r"[^A-Za-z0-9:._-]", "-", collapse)[:60]     # a header line in curl's config: no quote or newline gets through
+    conf = "\n".join([f'url = "https://{host}/3/device/{dev["token"]}"',
+                      f'header = "authorization: bearer {_apns_jwt()}"',
+                      f'header = "apns-topic: {os.environ.get("APNS_TOPIC") or APNS_TOPIC}"',
+                      'header = "apns-push-type: alert"', 'header = "apns-priority: 10"'] +
+                     ([f'header = "apns-collapse-id: {collapse}"'] if collapse else []))
+    with tempfile.NamedTemporaryFile("w", suffix=".json") as f:              # 0600; removed on close
+        json.dump(payload, f)
+        f.flush()
+        r = subprocess.run(["curl", "-sS", "--http2", "-m", "15", "-K", "-", "--data-binary", "@" + f.name, "-w", "\n%{http_code}"],
+                           input=conf, capture_output=True, text=True, timeout=25)
+    body, _, code = r.stdout.rpartition("\n")
+    try:
+        reason = json.loads(body).get("reason", "") if body.strip() else ""
+    except ValueError:
+        reason = body[:80]
+    code = int(code) if code.strip().isdigit() else 0
+    if not code and not reason:
+        reason = f"curl exit {r.returncode}: {(r.stderr or '').strip()[:100]}"       # curl's own error text holds no header
+    return code, reason
+
+
+def push_send(title, body, go="", badge=0, collapse=""):
+    """Send to every registered device. Returns how many Apple accepted. Dead tokens are dropped."""
+    if push_status()["sender"] != "ready":
+        return 0
+    payload = {"aps": {"alert": {"title": title[:80], "body": body[:200]}, "sound": "default", "badge": int(badge), "thread-id": collapse[:60] or "starfleet"}, "go": go}
+    if collapse == "test":
+        payload["test"] = True                                              # the app shows this one even while it is open
+    sent = 0
+    for dev in push_devices():
+        try:
+            code, reason = apns_post(dev, payload, collapse)
+        except (OSError, subprocess.SubprocessError, ImportError, ValueError, KeyError) as e:
+            print(f"push: {e.__class__.__name__}: {str(e)[:120]}", flush=True)
+            continue
+        if code == 200:
+            sent += 1
+        else:
+            print(f"push: Apple answered {code} {reason}", flush=True)
+            if code == 410 or reason in ("BadDeviceToken", "Unregistered", "DeviceTokenNotForTopic"):
+                push_unregister(dev["token"])
+    return sent
+
+
+_PUSH_PENDING = []                # [(not before, (title, text, go, thread), tries)]: sends that failed or waited for budget
+
+
+def push_dispatch(pairs):
+    """Push the act-level entries that just opened, and retry earlier failures (called every tick, also with nothing new).
+    At most EV_PUSH_PER_H an hour: more than three at once become one summary; waiting coding sessions are one push of their
+    own, and the last two slots of the hour are kept for the other kinds."""
+    now = time.time()
+    due = [(e, t) for e, t in pairs if e["level"] == "act" and e["state"] == "open"]
+    if not (due or _PUSH_PENDING) or push_status()["sender"] != "ready" or not push_devices():
+        return
+    msgs = []                                                   # (title, text, go, thread, tries)
+    with _PUSH_LOCK:
+        for item in [x for x in _PUSH_PENDING if x[0] <= now]:
+            _PUSH_PENDING.remove(item)
+            msgs.append(item[1] + (item[2],))
+    waiting = [x for x in due if x[0].get("kind") == "sessions-waiting"]
+    rest = [x for x in due if x[0].get("kind") != "sessions-waiting"]
+    if len(rest) > 3:
+        msgs.append((f"{len(rest)} things need you", "; ".join(e["title"] for e, _ in rest[:3]) + "...", "#/command/messages", "summary", 0))
+    else:
+        msgs += [(e["title"], t, e["go"], _ev_hash(e["episode"], 20), 0) for e, t in rest]
+    if len(waiting) == 1:
+        e, t = waiting[0]
+        msgs.append((e["title"], t, e["go"], "sessions", 0))
+    elif waiting:
+        msgs.append(("Sessions waiting", f"{len(waiting)} coding sessions are waiting for you.", "#/systems/sessions", "sessions", 0))
+    with _EV_LOCK:
+        badge = sum(1 for k, e in _EP.items() if e["open"] and e["spec"].get("level") == "act")
+    for title, text, go, thread, tries in msgs:
+        with _PUSH_LOCK:
+            _PUSH_SENT[:] = [t for t in _PUSH_SENT if now - t < 3600]
+            room = EV_PUSH_PER_H - len(_PUSH_SENT)
+        if room <= (2 if thread == "sessions" else 0):
+            print("push: hourly limit reached", flush=True)
+            continue
+        if push_send(title, text, go, badge, thread):
+            with _PUSH_LOCK:
+                _PUSH_SENT.append(now)
+        elif tries < 3:                                         # a timeout or an Apple 5xx: try again in a minute
+            with _PUSH_LOCK:
+                _PUSH_PENDING.append((now + 60, (title, text, go, thread), tries + 1))
+
+
 # ---------------------------------------------------------------- http
 
 CSP = ("default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' "
@@ -3187,6 +3750,23 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(data or b"{}")
         except ValueError:
             return self._send(400, '{"error":"bad json"}', "application/json")
+        if self.path.startswith("/api/computer/push/"):
+            try:
+                if self.path == "/api/computer/push/register":
+                    return self._send(200, json.dumps({"ok": True, "devices": push_register(body.get("token"), body.get("env"))}), "application/json")
+                if self.path == "/api/computer/push/unregister":
+                    return self._send(200, json.dumps({"ok": True, "devices": push_unregister(body.get("token") or "")}), "application/json")
+                if self.path == "/api/computer/push/test":
+                    if push_status()["sender"] != "ready":
+                        return self._send(409, json.dumps({"error": "Push is not set up on Fleet yet."}), "application/json")
+                    if not push_devices():
+                        return self._send(409, json.dumps({"error": "No iPhone has registered yet."}), "application/json")
+                    ev_append("info", "test", "Test message", "A test from Fleet. If you read this as a notification, push works.", go="#/command/messages")
+                    sent = push_send("Starfleet test", "Push works. This test came from Fleet.", "#/command/messages", 0, "test")
+                    return self._send(200 if sent else 502, json.dumps({"ok": bool(sent), "sent": sent} if sent else {"error": "Apple did not accept the test. See the Fleet log."}), "application/json")
+            except ValueError as e:
+                return self._send(400, json.dumps({"error": str(e)}), "application/json")
+            return self._send(404, '{"error":"unknown"}', "application/json")
         if self.path == "/api/computer/delete":
             try:
                 os.remove(_chat_path(body.get("id")))
@@ -3250,6 +3830,8 @@ class Handler(BaseHTTPRequestHandler):
                     p = (q.get("p") or [""])[0]
                     return self._send(200, json.dumps({"p": p, "md": wikicore.page_md(p)}, ensure_ascii=False),
                                       "application/json; charset=utf-8")
+                if u.path == "/api/computer/push":              # push: is the sender set up, how many phones
+                    return self._send(200, json.dumps(push_status()), "application/json")
                 if u.path == "/api/computer/sessions":         # coding-agent sessions, for the phone interface
                     return self._send(200, json.dumps(sessions_state()), "application/json")
                 if u.path == "/api/computer/sessions/tail":
@@ -3270,6 +3852,8 @@ class Handler(BaseHTTPRequestHandler):
             with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "sounds",
                                   "tng_red_alert1.mp3"), "rb") as f:
                 return self._send(200, f.read(), "audio/mpeg")
+        if self.path == "/api/events":
+            return self._send(200, json.dumps(events_json()), "application/json")
         if self.path == "/api/nas":
             return self._send(200, json.dumps(nas_state()), "application/json")
         if self.path == "/api/memoryalpha":
@@ -3412,6 +3996,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(502, json.dumps({"error": f"reboot NOT scheduled: {str(e)[:180]}"}),
                                   "application/json")
             print(f"AUTO DESTRUCT: {res}", flush=True)
+            if not body.get("check"):
+                global _AD_AT
+                _AD_AT = time.time()
+                ev_audit("Auto Destruct ran", "Both Sparks were scheduled to reboot.", go="#/bridge")
             return self._send(200, json.dumps(res), "application/json")
         if self.path == "/api/nas/control":
             try:
@@ -3421,6 +4009,7 @@ class Handler(BaseHTTPRequestHandler):
             except (OSError, subprocess.SubprocessError) as e:
                 return self._send(502, json.dumps({"error": str(e)[:200]}), "application/json")
             print(f"NAS {body.get('action')} {body.get('target')}: ok", flush=True)
+            ev_audit("NAS container changed", f"{str(body.get('action'))[:12]} {str(body.get('target'))[:60]} on the NAS.", go="#/systems/nas")
             return self._send(200, json.dumps(res), "application/json")
         if self.path == "/api/memoryalpha/backup":
             try:
@@ -3432,6 +4021,7 @@ class Handler(BaseHTTPRequestHandler):
             except (urllib.error.URLError, OSError, subprocess.SubprocessError) as e:
                 return self._send(502, json.dumps({"error": str(e)[:200]}), "application/json")
             print("MEMORY ALPHA backup started", flush=True)
+            ev_audit("Backup started", "A manual off-site backup was started.", go="#/systems/alpha")
             return self._send(200, json.dumps(res), "application/json")
         if self.path == "/api/containers/stop":
             try:
@@ -3445,6 +4035,7 @@ class Handler(BaseHTTPRequestHandler):
             except (urllib.error.URLError, OSError, subprocess.SubprocessError) as e:
                 return self._send(502, json.dumps({"error": str(e)[:200]}), "application/json")
             print(f"CONTAINER stop {res['node']}/{res['name']}: ok", flush=True)
+            ev_audit("Container stopped", f"{str(res['name'])[:60]} on {str(res['node']).title()} was stopped, freeing {res.get('freed_mb', 0)} MB.", go="#/systems/engineering")
             return self._send(200, json.dumps(res), "application/json")
         if self.path == "/api/redalert":
             try:
@@ -3454,6 +4045,10 @@ class Handler(BaseHTTPRequestHandler):
             except (urllib.error.URLError, OSError, subprocess.SubprocessError) as e:
                 return self._send(502, json.dumps({"error": str(e)[:200]}), "application/json")
             print(f"RED ALERT: {res}", flush=True)
+            if not body.get("check"):
+                ev_audit("Red Alert ran", f"Unloaded {len(res.get('unloaded') or [])} models, stopped "
+                         f"{sum(len(v) for v in (res.get('stopped') or {}).values())} containers, freed {(res.get('freed_mb') or 0) // 1024} GB."
+                         + (f" {len(res['errors'])} errors." if res.get("errors") else ""), go="#/bridge")
             return self._send(200, json.dumps(res), "application/json")
         known = STATE["models"]
         img_ids = {m["id"] for m in image_models()}
@@ -3647,9 +4242,250 @@ def _ct_selfcheck():
     assert _owner_chain(ps, 41) == ("opencode", 40)
 
 
+def _ev_selfcheck():
+    """The message rules, the episode logic, the store and the push sender, against synthetic worlds."""
+    global EV_DIR, EV_FILE, EV_STATE, PUSH_DEV_FILE, push_send, apns_post
+    saved = (EV_DIR, EV_FILE, EV_STATE, PUSH_DEV_FILE, push_send, apns_post, subprocess.run, dict(_EV), dict(_EP), dict(_PUSH_SENT and {} or {}),
+             {k: os.environ.get(k) for k in ("APNS_KEY_FILE", "APNS_KEY_ID", "APNS_TEAM_ID", "FLEET_APNS_HOST")}, dict(_APNS))
+    tmp = tempfile.mkdtemp(prefix="fleet-ev-")
+    try:
+        EV_DIR, EV_FILE, EV_STATE, PUSH_DEV_FILE = tmp, os.path.join(tmp, "events.jsonl"), os.path.join(tmp, "events-state.json"), os.path.join(tmp, "push.json")
+        _EV.update(last=0, items=[], lines=0, boots={}, ma=None, blob="")
+        _EP.clear()
+        _PUSH_SENT.clear()
+        for k in ("APNS_KEY_FILE", "APNS_KEY_ID", "APNS_TEAM_ID", "FLEET_APNS_HOST"):
+            os.environ.pop(k, None)
+        names = lambda acts: [a[0] for a in acts]
+
+        # ---- episodes: debounce, once, reminders, flapping, clear delay, held sources
+        spec = dict(kind="x", level="act", title="T", text="t", for_s=120, remind=True, ok="fine")
+        eps = {}
+        assert ev_step(eps, {"k": spec}, [], 0) == [] and ev_step(eps, {"k": spec}, [], 119) == []
+        assert names(ev_step(eps, {"k": spec}, [], 121)) == ["open"] and ev_step(eps, {"k": spec}, [], 130) == []
+        assert names(ev_step(eps, {"k": spec}, [], 121 + EV_REMIND_S)) == ["reminder"]
+        assert names(ev_step(eps, {"k": spec}, [], 121 + 2 * EV_REMIND_S)) == ["reminder"]
+        assert ev_step(eps, {"k": spec}, [], 121 + 3 * EV_REMIND_S) == [], "two reminders at most"
+        assert names(ev_step(eps, {}, [], 10 ** 6)) == ["resolve"] and eps == {}
+        eps = {}
+        ev_step(eps, {"k": spec}, [], 0)
+        ev_step(eps, {}, [], 50)                                                   # flapped away: the clock starts over
+        ev_step(eps, {"k": spec}, [], 60)
+        assert ev_step(eps, {"k": spec}, [], 150) == [] and names(ev_step(eps, {"k": spec}, [], 181)) == ["open"]
+        slow = dict(spec, for_s=0, clear_s=600)
+        eps = {}
+        ev_step(eps, {"k": slow}, [], 0)
+        assert ev_step(eps, {}, [], 100) == [] and ev_step(eps, {"k": slow}, [], 200) == [] and "k" in eps
+        ev_step(eps, {}, [], 300)
+        assert names(ev_step(eps, {}, [], 901)) == ["resolve"]
+        eps = {}
+        ev_step(eps, {"model-lost:a": dict(spec, for_s=0)}, [], 0)
+        assert ev_step(eps, {}, ["model-lost:"], 5000) == [] and "model-lost:a" in eps, "an unknown source closes nothing"
+
+        # ---- rules
+        W = lambda **kw: dict({"now": 100000.0, "nodes": {"jean-luc": {"mem_avail_kb": 20 * 1048576, "link_mbps": 1000}, "kathryn": {"mem_avail_kb": 20 * 1048576}},
+                               "running": {"a"}, "errors": {}, "pins": [], "busy": set(), "cfg": {}, "alpha": None, "defiant": None, "sessions": None,
+                               "containers": None}, **kw)
+        D = lambda w, open_keys=(): ev_detect(w, set(open_keys))
+        assert D(W(pins=["a"]))[0] == {}
+        c, h = D(W(pins=["b"], errors={"b": "boom"}))
+        assert c["model-lost:b"]["for_s"] == 120 and c["model-lost:b"]["level"] == "act" and "boom" in c["model-lost:b"]["text"] and "boom" not in c["model-lost:b"]["push"]
+        assert D(W(pins=["b"], busy={"b"}))[0] == {}, "loading or queued is not lost"
+        assert D(W(pins=["b"], cfg={"b": 100000 - 100}))[0] == {}, "our own unload after a context change"
+        assert "model-lost:b" in D(W(pins=["b"], cfg={"b": 100000 - 2000}))[0]
+        c, h = D(W(pins=["b"], errors={"_swap": "down"}))
+        assert list(c) == ["swap-down"] and "model-lost:" in h
+        c, h = D(W(nodes={"jean-luc": {"mem_avail_kb": 20 * 1048576}, "kathryn": {"error": "timed out"}}))
+        assert c["node-down:kathryn"]["for_s"] == 90 and "memory-low:kathryn" in h
+        assert D(W(nodes={"jean-luc": None, "kathryn": None}))[0] == {}
+        low = lambda gb: W(nodes={"jean-luc": {"mem_avail_kb": int(gb * 1048576)}, "kathryn": {"mem_avail_kb": 20 * 1048576}})
+        assert "memory-low:jean-luc" in D(low(2.5))[0] and D(low(4))[0] == {}
+        ml = ["memory-low:jean-luc"]
+        assert "memory-low:jean-luc" in D(low(3.2), ml)[0] and D(low(3.9), ml)[0] == {} and D(low(7), ml)[0] == {}, "closes at the idle level of this machine"
+        assert ev_detect(low(2.5), set())[0]["memory-low:jean-luc"]["clear_s"] == 300
+        assert "link-slow:jean-luc" in D(W(nodes={"jean-luc": {"mem_avail_kb": 20 * 1048576, "link_mbps": 100}, "kathryn": {"mem_avail_kb": 20 * 1048576}}))[0]
+        now = 100000.0
+        A = lambda **kw: W(alpha=dict({"status": "ok", "problems": [], "errors": [], "last": {"end": now - 29 * 3600}}, **kw))
+        assert D(A())[0] == {} and "backup" in D(A(last={"end": now - 31 * 3600}))[0]
+        assert D(A(status="error", last=None, errors=["gate down"]))[0]["backup"]["for_s"] == 900
+        assert list(D(A(status="warn", problems=["object lock renewal is off"]))[0]) == ["backup-warn"]
+        assert D(W())[1].count("backup") == 1, "backup unknown while its source is None"
+        site = lambda **kw: dict({"domain": "example.org", "status": 200}, **kw)
+        Df = lambda **kw: W(defiant=dict({"configured": True, "sites": [site()], "errors": [], "reboot_required": False}, **kw))
+        assert D(Df())[0] == {} and D(Df(configured=False))[0] == {}
+        assert "web-down:example.org" in D(Df(sites=[site(status=502)]))[0] and "web-down:example.org" in D(Df(sites=[site(status=None, error="timeout")]))[0]
+        assert D(Df(sites=[site(status=401)]))[0] == {}, "401 is a protected site, not a down one"
+        assert "cert:example.org" in D(Df(sites=[site(cert_days=9)]))[0] and "reboot-needed" in D(Df(reboot_required=True))[0]
+        c, h = D(Df(sites=[], errors=["ssh failed"]))
+        assert "web-host" in c and "web-down:" in h
+        K1 = "sessions-waiting:jean-luc:" + _ev_hash("s1")
+        Ss = lambda *x, **kw: W(sessions={"nodes": {"jean-luc": dict({"error": None, "sessions": list(x)}, **kw)}})
+        ses = lambda age, **kw: dict({"id": "s1", "stalled": True, "updated_secs_ago": age}, **kw)
+        assert K1 in D(Ss(ses(3000)))[0] and D(Ss(ses(600)))[0] == {}
+        assert D(Ss(ses(30000)))[0] == {} and K1 in D(Ss(ses(30000)), [K1])[0]
+        assert "s1" not in "".join(D(Ss(ses(3000)))[0]), "a session id never appears in an episode key"
+        assert D(Ss(ses(3000, stalled=False)))[0] == {} and "client secret" not in json.dumps(D(Ss(ses(3000, title="client secret")))[0]), "a session title never reaches a message"
+        assert "sessions-waiting:jean-luc:" in D(Ss(ses(3000), error="ssh down"))[1]
+        rows = lambda n, ram=800: [{"node": "jean-luc", "kind": "session", "session_idle_s": 90000, "ram_mb": ram} for _ in range(n)]
+        assert "idle-sessions:jean-luc" in D(W(containers={"containers": rows(5), "errors": {}}))[0] and D(W(containers={"containers": rows(4), "errors": {}}))[0] == {}
+
+        eps = {"web-down:a.example": {"spec": spec, "since": 0, "open": True, "gone": None, "sent": 0, "reminders": 0},
+               "web-down:b.example": {"spec": spec, "since": 0, "open": True, "gone": None, "sent": 0, "reminders": 0}}
+        kept = ev_filter({"web-down:a.example": spec, "web-down:b.example": spec, "node-down:x": spec}, eps, ["web-down:a.example"])
+        assert sorted(kept) == ["node-down:x", "web-down:b.example"] and sorted(eps) == ["web-down:b.example"], "a muted rule is dropped silently"
+
+        assert D(W(pins=["x-starfleet"], running={"y-starfleet"}))[0] == {}, "pushed out by another two-node model: the user's own choice"
+        assert "model-lost:x-starfleet" in D(W(pins=["x-starfleet"], running={"a"}))[0]
+        c = D(W(pins=["gone"], models={"a"}))[0]
+        assert list(c) == ["pin-unknown:gone"] and c["pin-unknown:gone"]["level"] == "notice"
+        assert "model-lost:b" in D(W(pins=["b"], models={"a", "b"}))[0]
+        assert "10.0.0.1" not in D(A(status="error", last=None, errors=["ssh: connect to host 10.0.0.1"]))[0]["backup"]["push"], "no raw error through Apple"
+        assert "link-slow:jean-luc" in D(W(nodes={"jean-luc": {"mem_avail_kb": 20 * 1048576}, "kathryn": {"mem_avail_kb": 20 * 1048576, "link_mbps": 1000}}))[1]
+        assert "web-down:" in D(Df(sites=[]))[1], "an empty site list is unknown"
+        assert ev_detect(A(last={"end": now - 31 * 3600}), set())[0]["backup"]["clear_s"] == 300
+        w = {"now": time.time(), "nodes": {"kathryn": {"boot": "new"}}, "alpha": None}
+        _EV["boots"], _EV["items"] = {"kathryn": "old"}, []
+        ev_audit("Auto Destruct ran", "x")
+        ev_points(w)
+        assert not any(e["kind"] == "node-rebooted" for e in _EV["items"]), "a planned reboot is not news"
+        _EV["boots"], _EV["items"] = {"kathryn": "old"}, []
+        ev_points(w)
+        assert _EV["items"][-1]["kind"] == "node-rebooted"
+        _EV.update(last=0, items=[], lines=0, boots={}, ma=None, blob="")
+        _EP.clear()
+        try:
+            os.remove(EV_FILE)
+        except OSError:
+            pass
+
+        # ---- store: write, restart, no repeat, trim
+        eps = {}
+        ev_step(eps, {"k": spec}, [], 0)
+        with _EV_LOCK:
+            _EP.update(eps)
+            pairs = ev_apply(ev_step(_EP, {"k": spec}, [], 200))
+        assert len(pairs) == 1 and pairs[0][0]["id"] == 1 and pairs[0][0]["state"] == "open" and pairs[0][1] == "T", "an act entry without a push text pushes only its title"
+        ev_save_state()
+        saved_state = dict(_EV)
+        _EV.update(last=0, items=[], lines=0, boots={}, blob="")
+        _EP.clear()
+        ev_load()
+        assert _EV["last"] == 1 and len(_EV["items"]) == 1 and _EP["k"]["open"], "an open episode survives a restart"
+        assert ev_step(_EP, {"k": spec}, [], 300) == [], "and is not announced again"
+        j = events_json()
+        assert j["latest"] == 1 and j["open"] == ["k"] and j["events"][0]["title"] == "T"
+        for i in range(EV_KEEP + 150):
+            ev_append("info", "audit", "t", "x" * 600)
+        with open(EV_FILE, encoding="utf-8") as f:
+            lines = f.readlines()
+        assert len(lines) <= EV_KEEP + 100 and json.loads(lines[-1])["id"] == _EV["last"] and len(events_json()["events"]) == 200
+        assert len(json.loads(lines[-1])["text"]) == 400
+
+        # ---- push: registration, key check, signature, the curl call, dead tokens, limits
+        assert push_status()["sender"] == "off" and "key" in push_status()["reason"]
+        for bad in ("", "xyz", "A" * 64, "ab" * 3):
+            try:
+                push_register(bad, "development")
+                raise AssertionError("accepted " + bad)
+            except ValueError:
+                pass
+        try:
+            push_register("ab" * 32, "nowhere")
+            raise AssertionError("accepted env")
+        except ValueError:
+            pass
+        assert push_register("ab" * 32, "development") == 1 and push_register("ab" * 32, "development") == 1 and push_register("cd" * 32, "production") == 2
+        assert oct(os.stat(PUSH_DEV_FILE).st_mode & 0o777) == "0o600"
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import ec, utils
+        keyobj = ec.generate_private_key(ec.SECP256R1())
+        kf = os.path.join(tmp, "AuthKey_TEST.p8")
+        with open(kf, "wb") as f:
+            f.write(keyobj.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
+        os.environ.update(APNS_KEY_FILE=kf, APNS_KEY_ID="KEYID12345", APNS_TEAM_ID="TEAMID6789")
+        assert push_status()["sender"] == "ready" and push_status()["devices"] == 2
+        _APNS.update(jwt=None, iat=0)
+        jwt = _apns_jwt()
+        h64, b64_, s64 = jwt.split(".")
+        pad = lambda x: x + "=" * (-len(x) % 4)
+        assert json.loads(base64.urlsafe_b64decode(pad(h64))) == {"alg": "ES256", "kid": "KEYID12345"} and json.loads(base64.urlsafe_b64decode(pad(b64_)))["iss"] == "TEAMID6789"
+        raw = base64.urlsafe_b64decode(pad(s64))
+        assert len(raw) == 64
+        keyobj.public_key().verify(utils.encode_dss_signature(int.from_bytes(raw[:32], "big"), int.from_bytes(raw[32:], "big")),
+                                   (h64 + "." + b64_).encode(), ec.ECDSA(hashes.SHA256()))
+        calls = []
+
+        class _R:
+            def __init__(self, out): self.stdout = out
+        def fake_run(args, **kw):
+            calls.append((args, kw.get("input", ""), open(args[args.index("--data-binary") + 1][1:]).read()))
+            return _R(calls_out[0])
+        subprocess.run = fake_run
+        calls_out = ['\n200']
+        dev = {"token": "ab" * 32, "env": "development"}
+        assert apns_post(dev, {"aps": {"alert": {"title": "T"}}, "go": "#/models"}, "c1") == (200, "")
+        args, cin, body = calls[-1]
+        assert jwt not in " ".join(args) and "authorization: bearer " + jwt in cin and "api.sandbox.push.apple.com/3/device/" + "ab" * 32 in cin
+        assert "apns-collapse-id: c1" in cin and json.loads(body)["go"] == "#/models" and "--http2" in args
+        apns_post(dev, {}, 'x"\noutput = "/tmp/pwned')
+        assert '\noutput' not in calls[-1][1] and 'apns-collapse-id: x--output---' in calls[-1][1], "no curl option can be smuggled in through an episode key"
+        assert apns_post({"token": "cd" * 32, "env": "production"}, {}, "")[0] == 200 and "https://api.push.apple.com/3/device/" in calls[-1][1]
+        calls_out[0] = '{"reason":"BadDeviceToken"}\n400'
+        assert apns_post(dev, {}, "") == (400, "BadDeviceToken")
+        calls_out[0] = '{"reason":"BadDeviceToken"}\n400'
+        assert push_send("T", "b", "#/models", 1, "c") == 0 and push_devices() == [], "dead tokens are dropped"
+        push_register("ab" * 32, "development")
+        calls_out[0] = '\n200'
+        assert push_send("T", "b", "", 1, "c") == 1
+        subprocess.run = saved[6]
+        sent = []
+        push_send = lambda title, text, go="", badge=0, collapse="": sent.append((title, text, go, collapse)) or 1
+        mk = lambda i: ({"level": "act", "state": "open", "kind": "model-lost", "title": f"T{i}", "go": "#/models", "episode": f"e{i}"}, f"text {i}")
+        push_dispatch([mk(1)])
+        assert sent == [("T1", "text 1", "#/models", _ev_hash("e1", 20))], "the push thread is opaque"
+        sent.clear()
+        push_dispatch([mk(i) for i in range(5)])
+        assert len(sent) == 1 and sent[0][0] == "5 things need you" and "T0" in sent[0][1]
+        sent.clear()
+        push_dispatch([({"level": "notice", "state": "open", "title": "n", "go": "", "episode": "n"}, "n"), ({"level": "act", "state": "resolved", "title": "r", "go": "", "episode": "r"}, "r")])
+        assert sent == [], "only act entries that opened are pushed"
+        for _ in range(8):
+            push_dispatch([mk(1)])
+        assert len(_PUSH_SENT) == EV_PUSH_PER_H, "hourly limit"
+        ses = lambda i: ({"level": "act", "state": "open", "kind": "sessions-waiting", "title": "Session waiting", "go": "#/systems/sessions", "episode": f"s{i}"}, "x")
+        _PUSH_SENT.clear()
+        sent.clear()
+        push_dispatch([ses(1), ses(2), ses(3)])
+        assert len(sent) == 1 and sent[0][0] == "Sessions waiting" and "3 coding sessions" in sent[0][1], "waiting sessions are one push"
+        _PUSH_SENT[:] = [time.time()] * (EV_PUSH_PER_H - 2)
+        sent.clear()
+        push_dispatch([ses(1)])
+        assert sent == [], "the last two slots of the hour are for the other kinds"
+        push_dispatch([mk(1)])
+        assert len(sent) == 1
+        _PUSH_SENT.clear()
+        _PUSH_PENDING.clear()
+        ok = [0]
+        push_send = lambda *a, **k: ok[0]
+        push_dispatch([mk(1)])
+        assert len(_PUSH_PENDING) == 1 and _PUSH_PENDING[0][2] == 1, "a failed send waits for a retry"
+        _PUSH_PENDING[0] = (0,) + _PUSH_PENDING[0][1:]
+        ok[0] = 1
+        push_dispatch([])
+        assert _PUSH_PENDING == [] and len(_PUSH_SENT) == 1, "and goes out on a later tick"
+    finally:
+        (EV_DIR, EV_FILE, EV_STATE, PUSH_DEV_FILE, push_send, apns_post, subprocess.run) = saved[:7]
+        _EV.clear(); _EV.update(saved[7]); _EP.clear(); _EP.update(saved[8]); _PUSH_SENT.clear()
+        for k, v in saved[10].items():
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+        _APNS.clear(); _APNS.update(saved[11])
+        shutil_rmtree = __import__("shutil").rmtree
+        shutil_rmtree(tmp, ignore_errors=True)
+
+
 def selfcheck():
     global _q_current, AUTODESTRUCT_CODE
     _ct_selfcheck()
+    _ev_selfcheck()
     # phone interface: "/" serves it to phones only, and a session request can name nothing but a session
     assert page_for("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Starfleet Command/1.0 (macOS)") == PAGE_FILE
     assert page_for(None) == PAGE_FILE and page_for("Mozilla/5.0 (iPad; CPU OS 18_0 like Mac OS X)") == PAGE_FILE
@@ -3951,7 +4787,7 @@ def main():
         return selfcheck()
 
     host = a.host or default_host()
-    for fn in (poll_nodes, poll_swap, keepalive, ctx_max_worker, load_queue_worker, ct_worker):
+    for fn in (poll_nodes, poll_swap, keepalive, ctx_max_worker, load_queue_worker, ct_worker, events_worker):
         threading.Thread(target=fn, daemon=True).start()
     pins = load_pins()
     print(f"Fleet on http://{host}:{a.port}   (llama-swap {SWAP})", flush=True)

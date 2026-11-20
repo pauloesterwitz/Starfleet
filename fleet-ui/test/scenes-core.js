@@ -80,6 +80,7 @@ exports.fixtures = {state, sessions, alpha, defiant, models, keyOk, denied, POLI
 exports.get = (p, variant, q, h) => {
   if(variant === "offline") return {__status: 502, body: {error: "upstream down"}};
   if(p === "/api/state") return state(variant);
+  if(p === "/api/events" && !(q.get("ev") || /[?&]ev=/.test((h || {}).referer || ""))) return {events: [], latest: 0, open: [], at: now()};   /* the default: no messages. scenes-messages answers a page opened as /padd?ev=<set> */
   if(p === "/api/memoryalpha") return alpha();
   if(p === "/api/defiant") return defiant(variant);
   if(p === "/api/computer/sessions") return keyOk(h) ? sessions(variant) : denied;

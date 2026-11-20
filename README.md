@@ -823,9 +823,11 @@ What works differently from the desktop page:
 
 The app adds what a web page cannot do (`PaddBridge` in
 [`StarfleetApp.swift`](ios/Starfleet/StarfleetApp.swift)): haptics, drawing under the
-status bar and home indicator, links that open in Safari, and pull to refresh that updates
-the data in place. The interface detects the bridge, so it works the same in Safari and in
-an older build of the app.
+status bar and home indicator, links that open in Safari, pull to refresh that updates
+the data in place, and messages (notification permission, the device token, a tap on a
+notification and the icon badge, in [`Push.swift`](ios/Starfleet/Push.swift)). The
+interface detects the bridge, so it works the same in Safari and in an older build of the
+app; an older build has no push, and the Messages screen then says so.
 
 The tests drive the page in WebKit at iPhone size. Everything is answered from generated
 fixtures, every request that is not a GET is blocked and compared with what the scene
@@ -834,6 +836,59 @@ expects, and the pictures above come from them:
 ```bash
 PW=<path to the playwright package> node fleet-ui/test/padd-shots.js [name filter]
 ```
+
+### Messages and push
+
+Fleet watches for what needs you and writes it down, so the phone can show it afterwards and, once push is set up,
+tell you when the app is closed. One background thread in `fleet.py` compares the state Fleet already collects with a
+few rules. Each rule opens an *episode* when it has held for a while, so a flapping probe never opens one. It repeats
+after 6 hours (twice at most) while the problem lasts, and closes with a quiet "recovered" entry. Open episodes are
+saved, so a restart does not announce them again. The list is `~/.local/share/fleet-ui/events.jsonl` (the newest 500)
+and `GET /api/events` (no key: node and model names, counts and generic words, never a session title or a path).
+
+| Level | Rule (opens after) | Reaches you |
+| --- | --- | --- |
+| **Act now** | a pinned model is not running and not loading (2 minutes), llama-swap or a node does not answer (2 and 1.5 minutes), a node has under 3 GB of memory free (30 seconds), the off-site backup failed or its last snapshot is over 30 hours old, a web site on Defiant does not answer (about 3 minutes), a coding session has waited 30 minutes to 6 hours | push, and the "Act now" count and app badge |
+| **Note** | network port under 1000 Mb/s, a certificate under 14 days, the web server needs a reboot, containers of idle sessions hold over 3 GB, a node rebooted by itself, a pinned model is not in the configuration, a backup warning | the list and the unread count |
+| **Info** | a load finished or failed, what Red Alert, Auto Destruct, a container stop, a NAS change or a backup start did, a finished backup | the list only |
+
+A pin that another two-node model pushed out of the exclusive group, or a model unloaded because you changed its
+context or effort, is not reported as lost. A rule you do not want can be muted with a file (key prefixes):
+
+```json
+{"mute": ["web-down:app.example.org", "link-slow:"]}
+```
+
+in `~/.config/fleet-ui/events.json`. A muted rule is dropped without a recovery entry.
+
+**In the app:** a *News* section on Bridge, a Messages screen under Command (All, Unread, Act now), the unread count on
+the Command tab, and a toast with a haptic when something new arrives while the app is open.
+
+**Push.** Apple only allows push for apps signed with the paid Apple Developer Program (99 USD a year; a free Apple ID
+cannot). Until then everything above works and the Messages screen says push is not set up. After joining:
+
+1. On developer.apple.com open Certificates, Identifiers & Profiles, Keys, add a key with *Apple Push Notifications
+   service*, download the `.p8` file once and note its Key ID and your Team ID.
+2. Put the key on the head node, readable by you only (`install -m 600 AuthKey_XXXX.p8 ~/.config/fleet-ui/`), and its
+   ids in a service environment file with the same mode, next to the Auto Destruct code:
+
+   ```
+   # ~/.config/fleet-ui/apns.env  (a systemd drop-in: EnvironmentFile=-%h/.config/fleet-ui/apns.env)
+   APNS_KEY_FILE=/home/<you>/.config/fleet-ui/AuthKey_XXXX.p8
+   APNS_KEY_ID=<key id>
+   APNS_TEAM_ID=<team id>
+   ```
+
+   then `systemctl --user restart fleet-ui`. Nothing is sent without these three variables.
+3. In `ios/Local.xcconfig` set `DEVELOPMENT_TEAM` to the paid team and add the line
+   `CODE_SIGN_ENTITLEMENTS = Starfleet.entitlements`, then build the app once by hand in Xcode (`⌘R`).
+4. In the app open Command, Messages, **Turn on push**, then **Send a test**.
+
+Fleet signs the provider token with `cryptography` and sends through `curl --http2` (the token goes to curl on stdin).
+At most 6 pushes an hour go out; more than three at once become one summary, waiting coding sessions are one push of
+their own, and a send that fails is retried three times. The push text is as generic as the list: node and model names
+and counts, because the payload passes through Apple. Builds installed from Xcode register with Apple's sandbox
+service, which Fleet uses for them automatically.
 
 ### What "pin" actually guarantees
 
@@ -1507,8 +1562,11 @@ directory; set `DEVELOPER_DIR` yourself for an Xcode installed elsewhere.
 
 ### 6. The iPhone app
 
-In [`ios/`](ios): an Xcode project, `ios/Starfleet.xcodeproj`, with one SwiftUI file and
-the app icon. Needs Xcode 16 or later, an iPhone with the Tailscale app on the same
+In [`ios/`](ios): an Xcode project, `ios/Starfleet.xcodeproj`, with the SwiftUI app
+(`ios/Starfleet/StarfleetApp.swift`: the web view and the bridge to the page), its push code
+(`ios/Starfleet/Push.swift` and `ios/Starfleet/PushText.swift`: notification permission, the
+device token, a tap on a notification, the icon badge), the entitlements file
+`ios/Starfleet.entitlements` (see **Push messages** below) and the app icon. Needs Xcode 16 or later, an iPhone with the Tailscale app on the same
 tailnet, and an Apple ID; a free one works, but its "Personal Team" signature expires
 after 7 days, then build and install again.
 
@@ -1528,6 +1586,16 @@ it into the gitignored `ios/Local.xcconfig`, which `ios/Starfleet.xcconfig` incl
 ```bash
 cd ios && grep -m1 -o 'DEVELOPMENT_TEAM = [A-Z0-9]*' Starfleet.xcodeproj/project.pbxproj > Local.xcconfig && git checkout Starfleet.xcodeproj/project.pbxproj
 ```
+
+**Push messages** need the paid Apple Developer Program (99 US dollars a year): a free Apple ID cannot sign an app with the Push capability. Being self-employed makes no difference there. A freelancer or other sole proprietor enrolls as an **individual** and needs no company number; the D-U-N-S number (a company identifier from Dun & Bradstreet) is only asked of organizations. Until then the app builds and runs as above. After a tap on **Turn on push** on the Messages screen (and the answer to the system's question about notifications), the Messages screen says that push needs the paid membership.
+
+`ios/Starfleet.entitlements` asks for push. A free team cannot sign it, so the project file and `ios/Starfleet.xcconfig` do not point to it. Two settings in the gitignored `ios/Local.xcconfig` and one build by hand decide whether a build with push happens:
+
+1. Set `DEVELOPMENT_TEAM` to the ID of the paid team (developer.apple.com, **Membership details**).
+2. **Append** the line `CODE_SIGN_ENTITLEMENTS = Starfleet.entitlements`, for example with `echo 'CODE_SIGN_ENTITLEMENTS = Starfleet.entitlements' >> ios/Local.xcconfig`. Do not overwrite the file: the `>` in the command above replaces everything in it, the team line included.
+3. Build once by hand: choose the iPhone in Xcode and press `⌘R`. Xcode, signed in with the paid team, enables the Push capability for the app by itself. `update.sh` does not do this step for you: it only builds when something under `ios/` changed in git, and `ios/Local.xcconfig` is not in git, so editing it starts no build.
+
+Then tap **Turn on push** on the Messages screen. To go back to a free team, remove the `CODE_SIGN_ENTITLEMENTS` line and set the free team's ID again.
 
 ### Updates, at every start of the Mac app
 
@@ -1596,7 +1664,9 @@ Sources/OpencodeMonitor/   the app (the directory keeps the project's original n
   FleetView.swift           the Fleet window (WKWebView), its Dock-icon-on-demand logic, the ⌃⌥C hotkey
   DesktopWidget*.swift      floating panel
   Panel*.swift, GPUStream.swift   the optional USB panel: driver, controller, streamed GPU figures
-ios/                       the iPhone app: Starfleet.xcodeproj, Starfleet/StarfleetApp.swift (the web view and PaddBridge), the icon
+ios/                       the iPhone app: Starfleet.xcodeproj, Starfleet/StarfleetApp.swift (the web view and PaddBridge),
+                            Starfleet/Push.swift and PushText.swift (notifications), Starfleet.entitlements (push, not
+                            used by the build until Local.xcconfig points to it), the icon
 package.sh, update.sh      build the Mac app; the self-update both apps get at every start of the Mac app
                             and from Check for Updates
 cluster/                   the cluster's configuration and tooling: the llama-swap config and

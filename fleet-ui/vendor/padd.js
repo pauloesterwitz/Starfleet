@@ -11,7 +11,8 @@
          stage   true = fixed-height screen (chat, map): it gets #p-stage instead of the scrolling #p-view
          needs   { source: milliseconds } polled while the screen is open; render() runs after every answer
      P.data.<source>, P.at.<source> (ms), P.err.<source> ("key" = Starfleet key missing or refused)
-         sources: state, containers, nas, nasstats, alpha, defiant, sessions; add one with P.sources.x = {url, key}
+         sources: state, containers, nas, nasstats, alpha, defiant, sessions, events; add one with P.sources.x = {url, key}
+     P.events               Fleet's message list (see "messages" below); the app calls PADD.pushState, PADD.pushToken, PADD.open
      P.api.get(url, opt), P.api.post(url, body, opt)   JSON in, JSON out, throws Error with .status
          a 403 that means "key" opens the key sheet and retries once; opt.prompt:false turns that off
      P.put(el, html)        replace only when changed, never under a finger or a focused field
@@ -84,8 +85,8 @@ P.run = async fn => { try{ return await fn(); }catch(e){ if(!(e && e.quiet)){ P.
    off; a keyed source without an accepted key waits for a new key instead of asking for one. */
 P.sources = { state: {url: "/api/state", timeout: 8000}, containers: {url: "/api/containers"}, nas: {url: "/api/nas"},
   nasstats: {url: "/api/nas/stats"}, alpha: {url: "/api/memoryalpha"}, defiant: {url: "/api/defiant"},
-  sessions: {url: "/api/computer/sessions", key: true} };
-const BASE = {state: 6000, sessions: 30000, alpha: 120000, defiant: 120000};   /* every screen: the header's status and the tab figures */
+  sessions: {url: "/api/computer/sessions", key: true}, events: {url: "/api/events", timeout: 8000} };
+const BASE = {state: 6000, sessions: 30000, alpha: 120000, defiant: 120000, events: 15000};   /* every screen: the header's status and the tab figures */
 let needs = Object.assign({}, BASE);
 const inflight = {}, next = {}, fails = {};
 async function pull(k){
@@ -93,7 +94,7 @@ async function pull(k){
   if(s.key && !P.key.get()){ P.err[k] = "key"; return; }
   inflight[k] = true;
   try{ P.data[k] = await call("GET", s.url, undefined, {prompt: false, timeout: s.timeout || 30000, key: !!s.key});
-       P.at[k] = Date.now(); P.err[k] = null; fails[k] = 0; }
+       P.at[k] = Date.now(); P.err[k] = null; fails[k] = 0; if(k === "events") gotEvents(); }
   catch(e){ P.err[k] = e.status === 403 && s.key && wantsKey(e.message) ? "key" : (e.message || "failed"); fails[k] = (fails[k] || 0) + 1; }
   inflight[k] = false;
   const base = needs[k] || 6000;
@@ -126,10 +127,12 @@ const H = P.h;
 H.chev = CHEV;
 H.sec = (t, small) => `<div class="p-sec"><i></i><h2>${esc(t)}</h2><u></u>${small != null && small !== "" ? `<small>${esc(small)}</small>` : ""}</div>`;
 H.tag = (t, cls) => `<span class="p-tag ${cls || ""}">${esc(t)}</span>`;
-H.row = o => `<button class="p-row${o.tall ? " tall" : ""}" type="button" data-act="${o.act || ""}" data-arg="${esc(o.arg ?? "")}" style="${col(o.c)}">
-  <span class="p-m"><span class="p-t${o.big ? " big" : ""}">${esc(o.t)}${o.badge ? `<span class="p-badge">${esc(o.badge)}</span>` : ""}</span>${
-    o.s ? `<span class="p-s">${esc(o.s)}</span>` : ""}${o.s2 ? `<span class="p-s">${esc(o.s2)}</span>` : ""}${
-    o.e ? `<span class="p-s" style="color:var(--red)">${esc(o.e)}</span>` : ""}</span>${o.tag ? H.tag(o.tag, o.tagc) : ""}${o.chev ? CHEV : ""}</button>`;
+/* o.wrap: title and lines wrap, s reads as a sentence and can be selected; a wrap row without an action is a plain div (a message) */
+H.row = o => { const div = o.wrap && !o.act, el = div ? "div" : "button";
+  return `<${el} class="p-row${o.tall ? " tall" : ""}${o.wrap ? " wrap" : ""}"${div ? "" : ` type="button" data-act="${o.act || ""}" data-arg="${esc(o.arg ?? "")}"`} style="${col(o.c)}">
+  <span class="p-m"><span class="p-t${o.big ? " big" : ""}${o.wrap ? " wrap" : ""}">${esc(o.t)}${o.badge ? `<span class="p-badge">${esc(o.badge)}</span>` : ""}</span>${
+    o.s ? `<span class="p-s${o.wrap ? " wrap txt" : ""}">${esc(o.s)}</span>` : ""}${o.s2 ? `<span class="p-s${o.wrap ? " wrap" : ""}">${esc(o.s2)}</span>` : ""}${
+    o.e ? `<span class="p-s" style="color:var(--red)">${esc(o.e)}</span>` : ""}</span>${o.tag ? H.tag(o.tag, o.tagc) : ""}${o.chev ? CHEV : ""}</${el}>`; };
 H.chip = o => `<button class="p-chip${o.on ? " on" : ""}${o.cls ? " " + o.cls : ""}" type="button" data-act="${o.act}" data-arg="${esc(o.arg ?? "")}" aria-pressed="${!!(o.on || o.cls === "set")}"${o.off ? " disabled" : ""}><span>${esc(o.label)}${o.n != null ? `<b>${o.n}</b>` : ""}</span></button>`;
 H.gauge = (pct, n) => { n = n || 16; const on = Math.max(0, Math.min(n, Math.round(pct / 100 * n)));
   return `<div class="p-gauge" role="img" aria-label="${Math.round(pct)} percent">${Array.from({length: n}, (_, i) => `<i${i < on ? ' class="on"' : ""}></i>`).join("")}</div>`; };
@@ -139,6 +142,8 @@ H.keygate = what => `<div class="p-card" style="--c:var(--orange)"><h3>Starfleet
   <div class="p-pair" style="margin-top:11px"><button class="p-btn sm" type="button" data-act="key">Enter key</button></div></div>`;
 
 P.css = text => { const s = document.createElement("style"); s.textContent = text; document.head.appendChild(s); };
+P.css(`.p-row.wrap .p-t,.p-row.wrap .p-s{overflow-wrap:anywhere;-webkit-user-select:text;user-select:text}
+.p-row.wrap .p-s.txt{font:400 14px/1.35 var(--body);letter-spacing:0;text-transform:none;color:var(--text)}`);
 const loaded = {};
 P.load = url => loaded[url] || (loaded[url] = new Promise((ok, bad) => {
   const css = /\.css$/.test(url), el = document.createElement(css ? "link" : "script");
@@ -344,13 +349,88 @@ P.on("status", () => {
     body: `<div class="p-list" style="margin:12px 0 4px">${st.items.length ? st.items.map(itemRow).join("") : `<div class="p-empty">All systems nominal</div>`}</div>`});
 });
 
+/* ---------------------------------------------------------------- messages
+   Fleet's list of what happened (GET /api/events, no key). Unread: an act or notice line, opened or one-off, newer than
+   the id in paddMsgSeen; a resolved or info line never counts. An episode is open while Fleet lists it AND its newest
+   line is still "open". Act now = the open act episodes; that number is also the app icon's badge. */
+const SEEN = "paddMsgSeen";
+const EV = P.events = {list: [], latest: 0, open: new Set(), newest: {}, ended: {}, keys: new Set(), seen: 0, unread: 0, act: 0, base: null};
+const upish = e => (e.level === "act" || e.level === "notice") && (e.state === "open" || e.state === "point");
+const epOpen = e => !!e.episode && EV.open.has(e.episode) && (EV.newest[e.episode] || e).state === "open";
+EV.isNew = e => e.id > EV.seen && upish(e);
+EV.live = e => e.state === "open" && epOpen(e) && EV.newest[e.episode] === e;
+/* An episode key is used again when a problem comes back, so "open" also needs the line to be newer than the last
+   "resolved" line of its episode (EV.ended). An opening line the episode has ended since reads as recovered. */
+const lineOpen = e => epOpen(e) && e.id > (EV.ended[e.episode] || 0);
+EV.edge = e => e.state === "resolved" ? "blue" : e.state === "open" ? (!lineOpen(e) ? "blue" : e.level === "act" ? "red" : "amber") : e.level === "act" ? "red" : e.level === "notice" ? "amber" : "";
+EV.tag = e => { const c = e.level === "act" ? "fault" : "warn";
+  return e.state === "resolved" ? ["Recovered", "ready"] : e.state === "open" ? (!lineOpen(e) ? ["Was open", ""] : [e.reminder ? "Reminder " + e.reminder : "Open", c])
+    : e.level === "info" ? null : ["Note", c]; };
+function derive(){
+  const d = P.data.events; if(!d || !Array.isArray(d.events)) return false;
+  EV.list = d.events; EV.open = new Set(d.open || []); EV.newest = {}; EV.ended = {}; EV.keys = new Set(); EV.unread = EV.act = 0;
+  EV.latest = EV.list.reduce((m, e) => Math.max(m, e.id), d.latest || 0);
+  for(const e of EV.list) if(e.episode){ EV.newest[e.episode] = e; if(e.state === "resolved") EV.ended[e.episode] = Math.max(e.id, EV.ended[e.episode] || 0); }
+  EV.seen = Number(LS.get(SEEN)) || 0;
+  if(EV.seen > EV.latest){ EV.seen = 0; LS.set(SEEN, "0"); }      /* Fleet's list started over */
+  for(const e of EV.list){ if(EV.isNew(e)){ EV.unread++; EV.keys.add(e.episode || "#" + e.id); } if(EV.live(e) && e.level === "act") EV.act++; }
+  return true;
+}
+EV.read = () => { LS.set(SEEN, String(EV.latest)); derive(); P.paint(); };
+let badge = null;
+const short = t => { t = String(t || ""); return t.length > 110 ? t.slice(0, 107).trimEnd() + "..." : t; };
+/* The first answer of a session is history: it only sets the baseline. Later, a new act or notice line shows a toast and a
+   haptic. A page that was hidden toasts when it comes back and the next answer is the first one it sees. */
+function gotEvents(){
+  try{
+    if(!derive()) return;
+    if(EV.base == null) EV.base = EV.latest;
+    else if(!document.hidden){
+      const fresh = EV.list.filter(e => e.id > EV.base && upish(e)), n = fresh[fresh.length - 1], act = fresh.some(e => e.level === "act");
+      EV.base = Math.max(EV.base, EV.latest);
+      if(n){ P.toast(fresh.length > 1 ? `${fresh.length} new messages. Newest: ${n.title}` : `${n.title}: ${short(n.text)}`, act ? "err" : ""); P.haptic(act ? "warning" : "light"); }
+    }
+    if(EV.act !== badge){ badge = EV.act; P.native("badge", {n: EV.act}); }
+  }catch(e){ console.error(e); }
+}
+
+/* ---------------------------------------------------------------- push: the page's side of the app bridge
+   The app calls these three through evaluateJavaScript. The device token is registered with Fleet once per page
+   load (PU.done); Fleet's register route is idempotent, and a stored copy would hide a device Fleet has dropped since
+   (Apple answered 410), so paddPushToken is only written, never read to skip a registration. A registration the user
+   did not just ask for never opens the key sheet. PU.old: the app has not answered "push-status" in 3 seconds. */
+const PUSHKEY = "paddPushToken";
+const PU = P.push = {state: null, token: "", done: "", env: "development", user: 0, err: "", old: false};
+let askT = 0;
+PU.ask = () => {
+  if(!P.native("push-status")) return false;
+  if(!PU.state && !PU.old && !askT) askT = setTimeout(() => { askT = 0; if(!PU.state){ PU.old = true; P.paint(); } }, 3000);
+  return true;
+};
+P.pushState = s => { s = s || {}; clearTimeout(askT); askT = 0; PU.old = false;
+  PU.state = {permission: s.permission, registered: !!s.registered, error: String(s.error || "")}; if(s.registered) PU.off = false; P.paint(); };
+let regging = "";
+PU.sync = async () => {
+  const t = PU.token; if(!t || PU.done === t || regging === t) return;
+  regging = t;
+  try{ await P.api.post("/api/computer/push/register", {token: t, env: PU.env}, {prompt: Date.now() - PU.user < 120000}); PU.done = t; LS.set(PUSHKEY, t); PU.err = ""; }
+  catch(e){ PU.err = e.status === 403 ? "Fleet needs the Starfleet key to register this iPhone." : e.message; }
+  regging = ""; P.paint();
+};
+P.pushToken = (token, env) => {
+  token = String(token || "").toLowerCase(); if(!/^[0-9a-f]{8,}$/.test(token)) return;
+  PU.token = token; PU.env = env === "production" ? "production" : "development"; return PU.sync();
+};
+/* a tapped notification: only a route of this page */
+P.open = hash => { if(typeof hash !== "string" || !/^#\/[\w./%-]*$/.test(hash)) return false; P.go(hash); P.refresh(["events"]); return true; };
+
 /* ---------------------------------------------------------------- frame: header, tabs, routes */
 const TABS = [
   {id: "bridge", label: "Bridge", color: "peach", fig(){ const n = Object.values((P.data.state || {}).nodes || {}); return n.length ? n.filter(v => v && !v.error).length + "/" + n.length : ""; }},
   {id: "models", label: "Models", color: "blue", fig(){ const s = P.data.state; return s ? String((s.running || []).length) : ""; }},
   {id: "computer", label: "Computer", color: "magenta", fig: () => ""},
   {id: "systems", label: "Systems", color: "amber", fig(){ const n = P.status().items.filter(i => i.sys).length; return n ? String(n) : ""; }},
-  {id: "command", label: "Command", color: "mauve", fig: () => ""},
+  {id: "command", label: "Command", color: "mauve", fig: () => EV.unread ? (EV.unread > 9 ? "9+" : String(EV.unread)) : ""},
 ];
 P.tabs = TABS;
 let cur = null, curId = "", curArg = "", curEl = null;
@@ -443,6 +523,7 @@ P.boot = () => {
   setInterval(tick, 1000);
   route();
   P.native("ready", {edgeToEdge: true});
+  PU.ask();
 };
 
 /* ================================================================ Bridge */
@@ -503,6 +584,20 @@ function nodeCard(name, n){
     <div class="p-kv"><div><b>${esc(v(n.gpu_util))}%</b><span>GPU</span></div><div><b>${esc(v(n.gpu_temp))}°</b><span>Temp</span></div><div><b>${esc(v(n.gpu_power != null && n.gpu_power !== "" ? Math.round(n.gpu_power) : null))} W</b><span>Power</span></div></div>
     <div class="p-of">Load ${esc(String(v(n.load)).split(" ")[0])} · ${(n.containers || []).length} containers</div></button>`;
 }
+/* News: the newest three messages that are unread or still open (one row per episode), then the way into the list.
+   Nothing at all while Fleet has no messages. */
+function newsHtml(){
+  if(!EV.list.length) return "";
+  const rows = [], used = new Set();
+  for(let i = EV.list.length - 1; i >= 0 && rows.length < 3; i--){
+    const e = EV.list[i], k = e.episode || "#" + e.id;
+    if(used.has(k)) continue;
+    used.add(k);
+    if(EV.live(e) || EV.keys.has(k)) rows.push(H.row({wrap: true, act: "go", arg: e.go && e.go !== "#/bridge" ? e.go : "#/command/messages", c: EV.edge(e), t: e.title, s: e.text, s2: ago(e.at), chev: true}));
+  }
+  rows.push(H.row({act: "go", arg: "#/command/messages", c: "mauve", t: "All messages", tag: EV.unread ? EV.unread + " unread" : "", tagc: "warn", chev: true}));
+  return `${H.sec("News")}<div class="p-list">${rows.join("")}</div>`;
+}
 P.screens.bridge = { tab: "bridge", title: "Bridge", color: "peach", needs: {state: 3000, sessions: 15000, alpha: 120000, defiant: 120000},
   render(el){
     P.hx(`<span class="p-sync">${esc(P.syncText())}</span>`);
@@ -523,6 +618,7 @@ P.screens.bridge = { tab: "bridge", title: "Bridge", color: "peach", needs: {sta
       ${(s.queued || []).length ? `<div class="p-s wrap" style="margin-top:8px;color:var(--amber)">${(s.llm_loading || []).length ? `LLM loading (${s.llm_loading.map(modelName).map(esc).join(", ")}) · ` : ""}Queue, one at a time: ${s.queued.map((id, i) => `${i + 1}. ${esc(modelName(id))}`).join(" · ")}</div>` : ""}
       ${H.sec("Resident", res.length)}
       <div class="p-list">${res.length ? res.map(m => modelRow(m, w)).join("") : `<div class="p-empty">No model loaded</div>`}</div>
+      ${newsHtml()}
       ${H.sec("Needs attention", st.items.length || "")}
       <div class="p-list">${st.items.length ? st.items.map(itemRow).join("") : `<div class="p-empty">All systems nominal</div>`}</div>`);
   } };

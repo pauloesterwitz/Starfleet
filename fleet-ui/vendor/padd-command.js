@@ -325,7 +325,7 @@ const panel = (name, c, title, text, label, top) => `<section class="p-card" sty
   <div class="p-slide"><button class="p-knob" type="button" data-act="cmd-slide" data-arg="${name}" aria-label="${label} ${title}">${ARROWS}</button><span>${label}</span></div></section>`;
 P.screens.command = { tab: "command", title: "Command", color: "mauve",
   mount(el){
-    el.innerHTML = `${H.sec("Access")}<div id="p-ckey"></div>${H.sec("Emergency")}
+    el.innerHTML = `${H.sec("Access")}<div id="p-ckey"></div><div id="p-cmsg" style="margin-top:6px"></div>${H.sec("Emergency")}
       ${panel("red", "var(--red)", "Red Alert", "Unloads every model and stops the GPU containers on both Sparks. You get 5 seconds to cancel.", "Slide to arm")}
       ${panel("destruct", "#d06a6a", "Auto Destruct", "Red Alert, then both Sparks reboot. Asks for the authorization code first.", "Slide to begin", 1)}
       <div class="p-pair" style="margin-top:16px"><button class="p-btn sm ghost" type="button" data-act="cmd-help">Help</button>
@@ -341,6 +341,10 @@ P.screens.command = { tab: "command", title: "Command", color: "mauve",
       <div class="p-pair" style="margin-top:11px">${has
         ? `<button class="p-btn sm ghost" type="button" data-act="key">Change</button><button class="p-btn sm ghost" type="button" data-act="cmd-keyrm">Remove</button>`
         : `<button class="p-btn sm" type="button" data-act="key">Enter key</button>`}</div></section>`);
+    const EV = P.events;
+    P.put(el.querySelector("#p-cmsg"), H.row({tall: true, big: true, act: "go", arg: "#/command/messages", c: "mauve", t: "Messages", chev: true,
+      s: P.data.events ? (EV.act ? `${EV.act} need${EV.act === 1 ? "s" : ""} you now` : "Nothing needs you now") : P.err.events ? "Cannot read the list" : "Reading the list...",
+      tag: EV.unread ? EV.unread + " unread" : "", tagc: "warn"}));
   } };
 P.on("cmd-keyrm", async () => {
   if(!await P.confirm({title: "Remove the Starfleet key?", danger: true, yes: "Remove",
@@ -348,16 +352,102 @@ P.on("cmd-keyrm", async () => {
   P.key.set(""); P.haptic("success"); P.toast("Starfleet key removed from this device."); P.paint();
 });
 
+/* ---------------------------------------------------------------- Messages
+   Fleet's list of what happened (P.events, kept by padd.js) and this phone's push switch. Opening the screen marks
+   nothing as read: only "Mark all read" moves the cursor. */
+P.css(`.p-mbar{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:2px 0 0;min-height:44px}
+.p-mbar span{font-size:12px;color:var(--dim);text-transform:uppercase;letter-spacing:.1em}`);
+const FILT = [["all", "All"], ["unread", "Unread"], ["act", "Act now"]];
+const SHOW = {all: () => true, unread: e => P.events.isNew(e), act: e => P.events.live(e) && e.level === "act"};
+const NONE = {all: "No messages yet. Fleet writes one here when something needs you.", unread: "Nothing unread.", act: "Nothing needs you right now."};
+let mf = "all", app = false, pinfo = null, perr = "", pkey = "", pbusy = false;
+
+/* what Fleet can do about push (a keyed GET); asked once when the screen opens, and again when a key arrives */
+function loadPush(){
+  pkey = P.key.get(); pinfo = null; perr = "";
+  if(!pkey){ perr = "key"; return; }
+  P.api.get("/api/computer/push", {prompt: false, timeout: 8000}).then(j => { pinfo = j; }, e => { perr = e.status === 403 ? "key" : e.message; }).then(() => P.paint());
+}
+function pushHtml(){
+  const s = P.push.state, off = !!(pinfo && pinfo.sender === "off"), btn = (act, label, cls, dis) => `<button class="p-btn sm ${cls || ""}" type="button" data-act="${act}"${dis ? " disabled" : ""}>${label}</button>`;
+  let text, btns = "";
+  if(!app) text = "Push works in the Starfleet app. Open this page there.";
+  else if(!s && P.push.old) text = "This app build does not know push yet. Install the new build from the Mac.";
+  else if(s && s.error === "entitlement") text = "Push needs the paid Apple membership. It is not set up on this build yet.";
+  else if(s && s.permission === "denied") text = "Notifications are off for Starfleet. Turn them on in the iPhone Settings.";
+  else if(perr === "key") return H.keygate("Push");
+  else if(!s) text = "Asking the app...";
+  else if(s.permission === "undetermined"){ text = "Get a message on this iPhone when something needs you, even while the app is closed."; btns = btn("msg-pushon", "Turn on push"); }
+  else if(P.push.off){ text = "Push is off for this iPhone."; btns = btn("msg-pushon", "Turn on push"); }
+  else if(s.registered){ text = "Push is on for this iPhone."; btns = btn("msg-pushtest", "Send a test", "blue", off || pbusy) + btn("msg-pushoff", "Turn off", "ghost", pbusy); }
+  else { text = "Push is off or not registered yet."; btns = btn("msg-pushon", "Turn on push"); }
+  return `<section class="p-card" style="--c:var(--mauve)"><h3>Push</h3><p>${esc(text)}</p>${btns ? `<div class="p-pair" style="margin-top:11px">${btns}</div>` : ""}</section>${
+    off ? H.msg("Fleet cannot send push yet: " + (pinfo.reason || "no reason given."), true) : ""}${
+    app && perr && perr !== "key" ? H.msg("Fleet could not say if it can send push: " + perr, true) : ""}${
+    app && P.push.err ? H.msg("Fleet has not registered this iPhone yet: " + P.push.err, true) : ""}${
+    s && s.error && s.error !== "entitlement" ? H.msg("The app reports a push error: " + s.error, true) : ""}`;
+}
+const dayOf = t => { const d = new Date(t * 1000); d.setHours(0, 0, 0, 0); return d.getTime(); };
+function dayName(ms){
+  const t = new Date(dayOf(Date.now() / 1000)), y = new Date(t); y.setDate(t.getDate() - 1);
+  return ms === t.getTime() ? "Today" : ms === y.getTime() ? "Yesterday" : new Date(ms).toLocaleDateString([], {weekday: "short", day: "numeric", month: "short"});
+}
+function messageRow(e){
+  const EV = P.events, [tag, tagc] = EV.tag(e) || [];
+  return H.row({wrap: true, act: e.go ? "go" : "", arg: e.go, c: EV.edge(e), t: e.title, badge: EV.isNew(e) ? "New" : "", s: e.text, s2: ago(e.at), tag, tagc, chev: !!e.go});
+}
+function listHtml(){
+  const EV = P.events, bad = P.err.events ? H.msg(`${P.data.events ? "Showing the last list. " : ""}Messages cannot be read: ${P.err.events}`, true) : "";
+  if(!P.data.events) return bad || `<div class="p-empty" style="margin-top:6px">Reading messages...</div>`;
+  if(!EV.list.length) return bad + `<div class="p-empty" style="margin-top:6px">${NONE.all}</div>`;
+  const shown = EV.list.filter(SHOW[mf]).reverse(), groups = [];
+  for(const e of shown){ const d = dayOf(e.at), g = groups[groups.length - 1]; if(g && g.d === d) g.rows.push(e); else groups.push({d, rows: [e]}); }
+  return `${bad}${H.sec("Messages", EV.list.length)}
+    <div class="p-chips">${FILT.map(([f, l]) => H.chip({act: "msg-filter", arg: f, label: l, on: f === mf, n: f === "all" ? EV.list.length : f === "unread" ? EV.unread : EV.act})).join("")}</div>
+    <div class="p-mbar"><span>${EV.unread ? EV.unread + " unread" : "All read"}</span><button class="p-btn sm ghost" type="button" data-act="msg-read"${EV.unread ? "" : " disabled"}>Mark all read</button></div>
+    ${groups.length ? groups.map(g => `<div class="p-grp">${dayName(g.d)}</div><div class="p-list">${g.rows.map(messageRow).join("")}</div>`).join("") : `<div class="p-empty" style="margin-top:6px">${NONE[mf]}</div>`}`;
+}
+P.screens["command/messages"] = { tab: "command", title: "Messages", color: "mauve", parent: "#/command", needs: {events: 10000},
+  mount(el){
+    mf = "all"; pbusy = false; app = P.push.ask(); loadPush(); P.push.sync();
+    el.innerHTML = `<div id="p-mpush" style="margin-top:6px"></div><div id="p-mlist"></div>`;
+  },
+  render(el){
+    P.hx(`<span class="p-sync">${esc(P.syncText())}</span>`);
+    if(perr === "key" && P.key.get() && P.key.get() !== pkey) loadPush();
+    P.put(el.querySelector("#p-mpush"), pushHtml());
+    P.put(el.querySelector("#p-mlist"), listHtml());
+  } };
+P.on("msg-filter", f => { mf = f; P.haptic("select"); P.paint(); });
+P.on("msg-read", () => { P.events.read(); P.haptic("success"); });
+P.on("msg-pushon", () => { P.push.user = Date.now(); P.push.off = false; P.haptic("select"); P.native("push-enable"); P.push.sync(); P.paint(); });
+P.on("msg-pushtest", async () => {
+  if(pbusy) return;
+  pbusy = true; P.paint();
+  /* Fleet answers 409 "No iPhone has registered yet." or 502 "Apple did not accept the test..."; P.run toasts that text */
+  await P.run(async () => { await P.api.post("/api/computer/push/test", {}); P.toast("Test sent."); P.haptic("success"); });
+  pbusy = false; P.paint();
+});
+/* the app stops listening, Fleet forgets this token; a token Fleet cannot forget now is dead soon enough */
+P.on("msg-pushoff", async () => {
+  if(pbusy) return;
+  pbusy = true; P.push.off = true; P.push.err = ""; P.paint(); P.native("push-disable");
+  const t = P.ls.get("paddPushToken") || P.push.token; P.push.token = ""; P.push.done = ""; P.ls.set("paddPushToken", null);
+  await P.run(async () => { if(t) await P.api.post("/api/computer/push/unregister", {token: t}); P.toast("Push is off for this iPhone."); });
+  pbusy = false; P.paint();
+});
+
 /* ---------------------------------------------------------------- Help, About, Desktop page */
 const TABHELP = { bridge: "Both Sparks at a glance, loads in progress and what needs attention.",
   models: "Load, pin and unload models. Set context and thinking effort.",
   computer: "Ask a resident model by text or voice, with the wiki and web search.",
   systems: "Sessions, Main Engineering, Deep Space NAS, Memory Alpha, Defiant and Memory Core.",
-  command: "The Starfleet key, Red Alert and Auto Destruct." };
+  command: "The Starfleet key, messages, Red Alert and Auto Destruct." };
 P.on("cmd-help", () => P.sheet({title: "Help", color: "mauve", body: `<div class="p-help p-sel">
   <b>The five tabs</b>${P.tabs.map(t => `<p><i style="--c:var(--${t.color})">${t.label}</i> ${TABHELP[t.id] || ""}</p>`).join("")}
   <b>Status</b><p>The word at the top right is Nominal, Attention, Fault or Sync lost. Tap it to list the reasons.</p>
   <b>Starfleet key</b><p>Asked for when an action needs it. It is kept on this device and never sent anywhere but Fleet.</p>
+  <b>Messages</b><p>Fleet writes a message when something needs you, and keeps a list. The number on the Command tab counts the unread ones. In the app, push can tell you with the app closed.</p>
   <b>Refresh</b><p>Pull down to refresh.</p>
   <b>Red Alert</b><p>Unloads every model and stops the GPU containers on both Sparks, after 5 seconds to cancel.</p>
   <b>Auto Destruct</b><p>Red Alert, then both Sparks reboot. It asks for the authorization code and gives 10 seconds to cancel.</p>
