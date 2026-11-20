@@ -716,6 +716,9 @@ chat has used the wiki, the side panels and the replay bar stay hidden.
   hits. The bar under the map replays it step by step with the camera following, and
   counts searches, hits, reads and cited pages. A web search refused after a wiki read
   shows as **Locked**.
+  The newest chat is shown by default. **Clear** in the session list, or a second tap
+  on the shown chat, takes it off the map; the map then shows only the wiki, also after
+  a reload, until you pick a chat again.
 
 It is read-only. [`wikicore.py`](fleet-ui) exports the graph with the wiki MCP server's
 own link scanner, run with that server's Python (`FLEET_MEMORY_CORE`, default

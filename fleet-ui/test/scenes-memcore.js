@@ -194,6 +194,21 @@ exports.scenes = [
     await expect(page, "the second session selected", () => document.querySelectorAll("#mcsegs i").length === 5);
     await t.tap("#mcsegs i >> nth=1"); await t.wait(1400); await check(page);
     await expect(page, "the step caption on the map", () => /02 Search/i.test(document.getElementById("mccap").textContent)); }},
+  /* Clear takes the session off the map (wiki pages only); tapping the shown session again does the same. The choice survives a reload. */
+  {name: "mc-session-clear", hash: H, settle: S, run: async (page, t) => {
+    const none = () => !document.querySelector("#mcchats .mci.on") && !document.getElementById("mctl").offsetHeight;
+    await t.tap(seg("sessions")); await t.shot("before"); await t.tap("#mcnosel"); await viewIs(page, "map"); await t.wait(600);
+    await expect(page, "no session selected and no replay bar after Clear", none);
+    await expect(page, "Clear hidden while no session is shown", () => document.getElementById("mcnosel").hidden);
+    await check(page);
+    await t.tap(seg("sessions")); await t.tap("#mcchats .mci >> nth=1"); await viewIs(page, "map"); await t.wait(600);
+    await expect(page, "the tapped session shown again", () => !!document.querySelector("#mcchats .mci.on") && document.getElementById("mctl").offsetHeight > 0);
+    await t.tap(seg("sessions")); await t.tap("#mcchats .mci >> nth=1"); await viewIs(page, "map"); await t.wait(600);
+    await expect(page, "tapping the shown session again takes it off the map", none); }},
+  {name: "mc-session-clear-kept", hash: H, settle: S, run: async (page, t) => {
+    await page.evaluate(() => { localStorage.setItem("mcNoChat", "true"); location.reload(); }); await t.wait(S + 1500);
+    await expect(page, "no session after a reload once cleared", () => !document.querySelector("#mcchats .mci.on") && !document.getElementById("mctl").offsetHeight);
+    await check(page); }},
   {name: "mc-replay-playing", hash: H, settle: S, run: async (page, t) => { await t.tap("#mcplay"); await t.wait(4200); await check(page);
     await expect(page, "the replay to be running", () => document.getElementById("mcplay").textContent === "Pause" && document.querySelectorAll("#mcsegs i.fut").length > 0); }},
   {name: "mc-term", hash: H, settle: S, run: async (page, t) => { await t.tap(seg("sessions")); await t.tap("#mcterms .mcterm"); await t.wait(900); await viewIs(page, "map");

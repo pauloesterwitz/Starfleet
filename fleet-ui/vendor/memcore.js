@@ -33,7 +33,8 @@ const LS={get(k,d){ try{ const v=localStorage.getItem(k); return v==null?d:JSON.
 const termsOf=q=>[...new Set(String(q||"").toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(t=>t.length>1&&!STOP.has(t)))].slice(0,6);
 const has=(n,t)=>n.lt.includes(t)||n.ls.includes(t);
 
-let G=null, gSig="", gAt=0, byPath={}, byName={}, trails=[], chatSel=null, stepHot=null, stepMax=Infinity, sel=null, hov=null;
+let G=null, gSig="", gAt=0, byPath={}, byName={}, trails=[], chatSel=LS.get("mcNoChat",false)?"":null,   /* "": no session on the map, chosen by the user */
+    stepHot=null, stepMax=Infinity, sel=null, hov=null;
 let mode=LS.get("mcMode","net")==="core"?"core":"net", coreAmt=mode==="core"?1:0, showLinks=LS.get("mcLinks",true)!==false, showHeat=false;
 let heat={}, sectors=[], focus=null, probe=[], pathSel=null, pathMode=false, play=null, speed=1, follow=true, stepAt={};
 let cam={x:0,y:0,k:.5}, camTo=null, userCam=false, kfit=.5, W=0, H=0, dpr=1, O={x:0,y:0}, sim=null;
@@ -45,7 +46,7 @@ function build(){
     <div class="top"><div class="title">Memory <span>Core</span></div><div class="bar"><span id="mcmeta">--</span></div></div>
     <div class="vmsg" id="mcmsg"></div>
     <div id="mc">
-      <div id="mcl"><div class="mch">Computer sessions</div><div id="mcchats"></div>
+      <div id="mcl"><div class="mch">Computer sessions<button type="button" id="mcnosel" title="Take the session off the map: wiki pages only">Clear</button></div><div id="mcchats"></div>
         <div class="mch">Search terms</div><div id="mcterms"></div>
         <div class="mch">Most consulted</div><div id="mctop"></div></div>
       <div id="mcc">
@@ -73,6 +74,7 @@ function build(){
   $("mcnet").onclick=()=>setMode("net"); $("mccore").onclick=()=>setMode("core");
   $("mclinks").title="Related links always show; plain links appear as you zoom in";
   $("mclinks").onclick=()=>{ showLinks=!showLinks; LS.set("mcLinks",showLinks); pills(); touch(); };
+  $("mcnosel").onclick=()=>pickChat("");
   $("mcheat").onclick=()=>{ showHeat=!showHeat; pills(); touch(); };
   pills();
   $("mczi").onclick=()=>zoomBy(1.5); $("mczo").onclick=()=>zoomBy(1/1.5);
@@ -98,6 +100,7 @@ function shape(){
   if(!built) return;
   const none=!trails.length, m=$("mc");
   m.classList.toggle("nol",none); m.classList.toggle("nor",none&&!sel&&!probe.length);
+  m.classList.toggle("nos",!none&&!trailOf()); $("mcnosel").hidden=!trailOf();   /* nos: sessions exist, none shown */
   $("mcnos").style.display=none?"inline-block":"none";
   touch();
 }
@@ -134,7 +137,7 @@ async function loadTrails(){
     const sig=a=>JSON.stringify(a.map(t=>[t.id,t.steps.length])), next=j.trails||[];
     if(sig(next)===sig(trails)) return;      /* unchanged: keep the prepared copy */
     trails=next;
-    if(!trails.find(t=>t.id===chatSel)) chatSel=trails[0]?trails[0].id:null;   /* newest session by default: a live answer grows */
+    if(chatSel!==""&&!trails.find(t=>t.id===chatSel)) chatSel=trails[0]?trails[0].id:null;   /* newest session by default: a live answer grows */
     prep(); paintLists(); refocus();
   }catch(e){ msg(e.message,true); }
 }
@@ -661,13 +664,16 @@ function funnel(t){
     related:S.filter(s=>s.tool==="related").length, read:u(S.filter(s=>s.tool==="read").map(s=>s._n)), cited:u(S.flatMap(s=>s._cites)),
     lock:S.filter(s=>s.blocked).length};
 }
+/* the session drawn on the map; "" = none (Clear, or tapping the shown session again). Kept across reloads. */
+function pickChat(id){ chatSel=id; LS.set("mcNoChat",id===""); stepHot=null; if(play) stopPlay(); showAll(); paintLists();
+  if(id===""&&G){ userCam=false; camTo=fitAll(); touch(); } }   /* off: back to the whole map */
 function paintLists(){
   if(!built) return;
   $("mcchats").innerHTML=trails.length?trails.map(t=>{ const f=funnel(t);
       return `<div class="mci ${t.id===chatSel?"on":""}" data-id="${esc(t.id)}">${esc(t.title)}
         <small>${f.search} search · ${f.hits} hits · ${f.read} read · ${f.cited} cited · ${ago(t.updated)}</small></div>`; }).join("")
     :`<div class="mcempty">No Computer session has used the wiki yet. Ask Computer about your notes; its search shows here.</div>`;
-  $("mcchats").querySelectorAll(".mci").forEach(el=>el.onclick=()=>{ chatSel=el.dataset.id; stepHot=null; showAll(); paintLists(); });
+  $("mcchats").querySelectorAll(".mci").forEach(el=>el.onclick=()=>pickChat(el.dataset.id===chatSel?"":el.dataset.id));   /* tap the shown session again: off */
   const tc={}; trails.forEach(t=>t.steps.forEach(s=>(s._terms||[]).forEach(x=>tc[x]=(tc[x]||0)+1)));
   const terms=Object.entries(tc).sort((a,b)=>b[1]-a[1]).slice(0,18);
   $("mcterms").innerHTML=terms.length?terms.map(([x,c])=>`<button type="button" class="mcterm" data-t="${esc(x)}" title="Probe this term on the map">${esc(x)}<b>${c}</b></button>`).join("")
@@ -683,7 +689,7 @@ function hotStep(k){ if(stepHot===k) return; stepHot=k; refocus();
   document.querySelectorAll("#mcsegs i,#mclog .mcs").forEach(el=>el.classList.toggle("hot",k!=null&&+el.dataset.k===k)); }
 function paintLog(){
   const t=trailOf(), el=$("mclog");
-  if(!t){ el.innerHTML=`<div class="mcempty">Select a session.</div>`; return; }
+  if(!t){ el.innerHTML=`<div class="mcempty">No session on the map. Select one to see its search.</div>`; return; }
   const t0=(t.steps.find(s=>s.at)||{}).at||0;
   el.innerHTML=t.steps.map((s,k)=>{ const x=stepText(s);
     const pills=s.tool==="search"?s._terms.map((q,i)=>`<u style="background:${TERMC[i%6]}">${esc(q)}</u>`).join(""):"";

@@ -9,6 +9,9 @@ body.wiki #wikiview{display:flex;flex-direction:column;height:calc(100vh - 12px)
 /* nothing to show yet: the empty side panels and the replay bar make room for the map */
 #mc.nol{grid-template-columns:minmax(0,1fr) 320px} #mc.nol.nor{grid-template-columns:minmax(0,1fr)}
 #mc.nol #mcl,#mc.nor #mcr,#mc.nol #mctl,#mc.nol #mclogh,#mc.nol #mclog{display:none}
+#mc.nos #mctl{display:none}   /* no session on the map: no replay bar */
+#mcnosel{order:1;font:inherit;font-size:11px;font-weight:700;background:var(--grid);color:var(--text);border:0;border-radius:9px;
+  padding:2px 9px;cursor:pointer;letter-spacing:.08em;text-transform:uppercase} #mcnosel:hover{background:var(--orange);color:#000} #mcnosel[hidden]{display:none}
 .mch{display:flex;align-items:center;gap:8px;font-size:14px;font-weight:600;letter-spacing:.1em;text-transform:uppercase;
   color:var(--amber);margin:4px 0 2px;flex:none}
 .mch::before{content:"";width:30px;height:16px;background:var(--mauve);border-radius:0 8px 8px 0;flex:none}

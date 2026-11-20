@@ -66,7 +66,7 @@ function wire(){                                 /* once, after the component bu
   if(matchMedia("(hover: none)").matches) for(const ev of ["mouseenter", "mouseleave"]) wv.addEventListener(ev, e => e.stopPropagation(), true);
   wv.addEventListener("pointerup", e => { if(e.target === ov){ const b = ov.getBoundingClientRect(); tap = {y: e.clientY, mid: b.top + b.height / 2, t: performance.now()}; } }, true);
   /* a session or a search term is shown on the map: go there first, so the component fits it to the full map */
-  wv.addEventListener("click", e => { if(e.target.closest("#mcchats .mci,#mcterms .mcterm")) setView("map"); }, true);
+  wv.addEventListener("click", e => { if(e.target.closest("#mcchats .mci,#mcterms .mcterm,#mcnosel")) setView("map"); }, true);
   sync();
 }
 async function open(){
@@ -179,6 +179,7 @@ html.kb .p-mcbar{display:none}
 
 /* the two panels */
 #wikiview .mch{font-size:15px;margin:12px 0 4px}
+#wikiview #mcnosel{min-height:44px;min-width:64px;padding:0 16px;font-size:14px;border-radius:22px}
 #wikiview #p-mcnone{margin-top:10px}
 #wikiview .mcempty{flex:1 1 100%;padding:14px 12px;background:var(--card);border-left:8px solid var(--grid);font-size:14px;letter-spacing:.1em}
 #wikiview #mcchats,#wikiview #mctop{gap:4px}
