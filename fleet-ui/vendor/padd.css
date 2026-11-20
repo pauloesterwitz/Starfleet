@@ -44,8 +44,8 @@ html.p-locked{overflow:hidden}
 .p-stat.warn{background:var(--amber)} .p-stat.fault{background:var(--red)} .p-stat.wait{background:var(--grid);color:var(--dim)}
 .p-titlerow{grid-row:2;grid-column:1/-1;z-index:1;display:flex;align-items:center;justify-content:space-between;
   gap:10px;padding-left:28px;min-width:0}
-.p-title{flex:1;min-width:0;margin:0;font-size:28px;font-weight:700;line-height:1;text-transform:uppercase;color:var(--c);
-  letter-spacing:.05em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.p-title{flex:1;min-width:0;margin:0;font-size:28px;font-weight:700;line-height:1.2;padding:3px 0;text-transform:uppercase;color:var(--c);
+  letter-spacing:.05em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}   /* room below the baseline: round capitals overshoot it and overflow:hidden would cut them */
 .p-back{flex:none;display:flex;align-items:center;justify-content:center;width:44px;height:44px;border:0;background:none;padding:0;
   margin:-2px -8px -2px -14px}
 .p-back svg{flex:none;width:11px;height:20px}
@@ -181,12 +181,12 @@ html.kb #p-tabs{display:none}
 #p-tabs{position:fixed;left:0;right:0;bottom:0;z-index:20;display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:4px;
   padding:6px calc(10px + var(--sar)) calc(var(--sab) + 2px) calc(10px + var(--sal));background:var(--ink)}
 .p-tab{display:flex;flex-direction:column;justify-content:flex-end;align-items:flex-end;height:54px;border:0;
-  padding:0 9px 6px;line-height:1;text-transform:uppercase;min-width:0;
+  padding:0 9px 8px;line-height:1;text-transform:uppercase;min-width:0;
   background:color-mix(in srgb,var(--c) 20%,#000);color:var(--c)}
 .p-tab b{font-size:19px;font-weight:700;min-height:19px;white-space:nowrap}
-.p-tab span{margin-top:4px;font-size:11px;font-weight:600;letter-spacing:.1em}
+.p-tab span{margin-top:4px;font-size:11px;font-weight:600;line-height:1.2;letter-spacing:.1em}
 .p-tab[aria-current=page]{background:var(--c);color:#000}
-.p-tab:first-child{border-radius:27px 0 0 27px} .p-tab:last-child{border-radius:0 27px 27px 0}
+.p-tab:first-child{border-radius:27px 0 0 27px} .p-tab:last-child{border-radius:0 27px 27px 0;padding-right:20px}   /* the label clears the rounded end */
 
 /* ---- sheet: an LCARS frame, the top bar and the left rail in one border ---- */
 .p-scrim{position:fixed;inset:0;z-index:40;background:rgba(0,0,0,.74);opacity:0;transition:opacity .2s;touch-action:none}
