@@ -813,6 +813,12 @@ What works differently from the desktop page:
 - **Red Alert and Auto Destruct arm by sliding.** The countdowns run from the clock, and
   cancel themselves when the page is hidden or a tick arrives late, so a phone that was
   locked in the middle cannot carry one out minutes later.
+- **Cleansing.** Main Engineering lists the agent sessions (Claude Code and opencode) and has a
+  *Cleanse idle sessions* card: the same rule and the same request as the desktop's Cleansing. After a
+  review sheet (idle for more than 24 hours, 3 days or 7 days; the number of sessions, containers and the memory
+  it frees), one `POST /api/engineering/stop` ends the sessions and stops their idle containers. Sessions whose idle
+  time is unknown and Fleet's own process are never touched, and a session's saved conversation stays on disk. A
+  session can also be ended on its own from its row. Needs the Starfleet key.
 - **Context and effort** are set when a model starts. On a loaded model the sheet says so,
   asks, and the model unloads and applies the value at its next load.
 - **Sessions.** What the Mac app reads over ssh, the coding agents on both nodes with

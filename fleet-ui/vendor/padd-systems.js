@@ -234,7 +234,7 @@ let cnode = "all", ckind = "", csheet = null, ckey = "";
 const cbusy = new Set(), cid = c => c.node + "/" + c.name;
 P.screens["systems/engineering"] = { tab: "systems", title: "Main Engineering", color: "amber", parent: "#/systems", needs: {containers: 10000},
   mount(el, arg){ cnode = arg || "all";
-    el.innerHTML = `<div id="p-sy-ch"></div><div class="p-chips" id="p-sy-cn" style="margin-top:6px"></div><div class="p-chips" id="p-sy-ck"></div><div id="p-sy-cl" style="margin-top:2px"></div>`; },
+    el.innerHTML = `<div id="p-sy-ch"></div><div class="p-chips" id="p-sy-cn" style="margin-top:6px"></div><div class="p-chips" id="p-sy-ck"></div><div id="p-sy-cl" style="margin-top:2px"></div><div id="p-sy-ss"></div>`; },
   render(el){
     synced("containers", true);                                /* the long title leaves room for the time only */
     const list = el.querySelector("#p-sy-cl");
@@ -245,7 +245,7 @@ P.screens["systems/engineering"] = { tab: "systems", title: "Main Engineering", 
     P.put(el.querySelector("#p-sy-ch"), `${lost("containers")}${Object.entries(errs).map(([n, e]) => H.msg(`${nn(n)} is not answering. Showing its last list. ${e}`, true)).join("")}
       ${H.sec("Running containers", cs.length)}<div class="p-nodes">${names.map(n => { const rows = cs.filter(c => c.node === n);
         return `<div class="p-node" style="--c:var(--${errs[n] ? "red" : "amber"})"><h3>${esc(nn(n))}</h3><div class="p-free">${rows.length}<small>running</small></div>
-          <div class="p-of" style="margin-top:3px">${mb(sum(rows, "ram_mb"))} RAM · ${mb(sum(rows, "gpu_mb"))} GPU</div></div>`; }).join("")}</div>`);
+          <div class="p-of" style="margin-top:3px">${mb(sum(rows, "ram_mb"))} RAM · ${mb(sum(rows, "gpu_mb"))} GPU</div></div>`; }).join("")}</div>${cleanCard()}`);
     const inNode = cs.filter(c => cnode === "all" || c.node === cnode);
     P.put(el.querySelector("#p-sy-cn"), [["all", "All", cs.length], ...names.map(n => [n, nn(n), cs.filter(c => c.node === n).length])]
       .map(([f, label, n]) => H.chip({act: "sys.cnode", arg: f, label, n, on: f === cnode})).join(""));
@@ -259,8 +259,105 @@ P.screens["systems/engineering"] = { tab: "systems", title: "Main Engineering", 
         <span class="p-m"><span class="p-t">${esc(c.name)}</span><span class="p-s">${bits}</span><span class="p-s">${esc(c.owner || "")}</span></span>
         <span class="p-sy-fig">${fig(mb(c.ram_mb))}${H.tag(busy ? "Stopping" : kl, busy ? "load" : kc)}</span></button>`; }).join("")
       : `<div class="p-empty">${cs.length ? "No containers match" : "No running containers"}</div>`}</div>`);
+    P.put(el.querySelector("#p-sy-ss"), sessionList());
     if(csheet && csheet.open) drawCtr();
+    if(cleanSheet && cleanSheet.open) drawClean();
+    if(ssheet1 && ssheet1.open) drawSes1();
   } };
+
+/* ---------------------------------------------------------------- Cleansing: end idle agent sessions
+   The desktop's Cleansing (fleet.html L1678-1740) on a phone, same rule and same route: every agent session and every
+   stoppable container idle for more than the chosen time (never one whose idle time is unknown, never Fleet's own
+   process) goes in ONE request to POST /api/engineering/stop {containers:[{node,name}], sessions:[{node,pid}]}, which
+   needs the Starfleet key, ends the sessions (SIGTERM) and stops the containers. A session's own containers exit with it.
+   fleet.py lists the sessions in /api/containers as `sessions`; a Fleet without that list shows none of this. */
+const DAY = 86400, CLEAN_AFTER = [[1, "24 hours"], [3, "3 days"], [7, "7 days"]];
+let cleanDays = 1, cleanSheet = null, cleanBusy = false, cleanAt = 0, ssheet1 = null, skey = "";
+const sessOf = () => (P.data.containers || {}).sessions;
+const idleOf = c => c.session_idle_s ?? c.cpu_idle_s;
+const skeyOf = s => s.node + "/" + s.pid;
+const sName = s => (s.tool || "Agent") + (s.session ? " · " + s.session : "");
+const homeless = p => p ? p.replace(/^\/home\/[^/]+/, "~") : "";
+function sIdle(s){                                           /* as [text, over 24 h] */
+  if(s.idle_s == null) return ["idle time unknown", false];
+  return s.idle_s < 60 ? ["active", false] : [`idle ${dur(s.idle_s)}`, s.idle_s > DAY];
+}
+function cleanPlan(days){
+  const d = P.data.containers || {}, lim = days * DAY;
+  const ss = (d.sessions || []).filter(s => !s.fleet && s.idle_s != null && s.idle_s > lim).sort((a, b) => (b.rss_mb + b.ct_ram_mb) - (a.rss_mb + a.ct_ram_mb));
+  const cs = (d.containers || []).filter(c => c.stoppable && idleOf(c) != null && idleOf(c) > lim);
+  const ended = new Set(ss.map(s => s.pid));
+  const freed = ss.reduce((a, s) => a + s.rss_mb + s.ct_ram_mb, 0) + cs.filter(c => !ended.has(c.session_pid)).reduce((a, c) => a + (c.ram_mb || 0), 0);
+  return {ss, cs, mb: freed, n: ss.length + cs.length};
+}
+const plural = (n, w) => `${n} ${w}${n === 1 ? "" : "s"}`;
+function cleanCard(){
+  if(!Array.isArray(sessOf())) return "";
+  const p = cleanPlan(1);
+  return `<div class="p-card" style="--c:var(--amber);margin-top:8px"><h3>Cleanse idle sessions</h3>
+    <p>${p.n ? `${plural(p.ss.length, "agent session")} and ${plural(p.cs.length, "container")} have been idle for over 24 hours. Ending them frees about ${esc(mb(p.mb))}.`
+      : "Nothing has been idle for over 24 hours."}</p>
+    <div class="p-pair" style="margin-top:11px"><button class="p-btn red" type="button" data-act="sys.copen"${p.n ? "" : " disabled"}>Review and cleanse</button></div></div>`;
+}
+function sessionList(){
+  const ss = sessOf(); if(!Array.isArray(ss)) return "";
+  const tot = ss.reduce((a, s) => a + s.rss_mb + s.ct_ram_mb, 0);
+  return `${H.sec("Agent sessions", ss.length ? `${ss.length} · ${mb(tot)}` : "")}<div class="p-list">${ss.length ? ss.slice().sort((a, b) => (b.rss_mb + b.ct_ram_mb) - (a.rss_mb + a.ct_ram_mb)).map(s => {
+    const [idle, long] = sIdle(s);
+    return `<button class="p-row" type="button" data-act="sys.ses1" data-arg="${esc(skeyOf(s))}" style="--c:var(--${s.fleet ? "grid" : long ? "amber" : s.idle_s != null && s.idle_s < 60 ? "blue" : "grid"})">
+      <span class="p-m"><span class="p-t">${esc(sName(s))}</span><span class="p-s">${[long ? `<span class="p-sy-amb">${esc(idle)}</span>` : esc(idle), s.containers ? plural(s.containers, "container") : ""].filter(Boolean).join(" · ")}</span>
+        <span class="p-s p-sy-path">${esc(homeless(s.cwd))}</span></span>
+      <span class="p-sy-fig">${fig(mb(s.rss_mb + s.ct_ram_mb))}</span></button>`; }).join("") : `<div class="p-empty">No agent sessions</div>`}</div>`;
+}
+function drawClean(){
+  const p = cleanPlan(cleanDays);
+  cleanSheet.set(`<p class="p-text">Ends the agent sessions and stops the containers that have been idle for longer than the time below. The containers of an ended session stop with it. A session whose idle time is not known is never touched.</p>
+    <div class="p-lab">Idle for more than</div><div class="p-wrap">${CLEAN_AFTER.map(([d, l]) => H.chip({act: "sys.cdays", arg: String(d), label: l, cls: d === cleanDays ? "set" : ""})).join("")}</div>
+    <div class="p-read"><div><b>${p.ss.length}</b><span>Sessions</span></div><div><b>${p.cs.length}</b><span>Containers</span></div><div><b>${esc(mb(p.mb))}</b><span>Frees about</span></div></div>
+    ${p.ss.length ? `<div class="p-grp">Largest sessions</div><div class="p-list">${p.ss.slice(0, 4).map(s => info({c: "amber", t: sName(s), lines: [`${esc(sIdle(s)[0])} · ${esc(mb(s.rss_mb + s.ct_ram_mb))}`]})).join("")}</div>${p.ss.length > 4 ? `<p class="p-note">and ${p.ss.length - 4} more</p>` : ""}` : ""}
+    <p class="p-note">An ended session stops running. Its saved conversation stays on disk.</p>
+    <div class="p-pair p-acts"><button class="p-btn red" type="button" data-act="sys.cgo"${p.n && !cleanBusy ? "" : " disabled"}>${cleanBusy ? "Cleansing..." : p.n ? `Cleanse ${plural(p.n, "item")}` : "Nothing to cleanse"}</button></div>`);
+}
+P.on("sys.copen", () => { cleanDays = 1; cleanAt = Date.now();
+  cleanSheet = P.sheet({title: "Cleanse idle sessions", color: "red", onClose: () => { cleanSheet = null; }}); drawClean(); });
+P.on("sys.cdays", d => { cleanDays = Number(d) || 1; P.haptic("select"); if(cleanSheet) drawClean(); });
+/* one request for everything; what the sheet shows is what is sent, and a tap in the first moments is ignored */
+async function stopRequest(ss, cs){
+  const j = await P.api.post("/api/engineering/stop", {containers: cs.map(c => ({node: c.node, name: c.name})), sessions: ss.map(s => ({node: s.node, pid: s.pid}))}, {timeout: 240000});
+  P.haptic("success");
+  P.toast(`Ended ${plural((j.ended || []).length, "session")}, stopped ${plural((j.stopped || []).length, "container")}, freed about ${mb(j.freed_mb || 0)}.`);
+  const bad = [...(j.refused || []), ...(j.errors || [])];
+  if(bad.length) P.toast(`${bad.length} not stopped: ${bad.slice(0, 3).map(b => `${b.name || "pid " + b.pid} (${b.why})`).join(", ")}.`, "err");
+}
+P.on("sys.cgo", () => P.run(async () => {
+  if(cleanBusy || Date.now() - cleanAt < 450) return;
+  const p = cleanPlan(cleanDays); if(!p.n) return;
+  cleanBusy = true; drawClean();
+  try{ await stopRequest(p.ss, p.cs); if(cleanSheet) cleanSheet.close(); }
+  catch(e){ fail("Cleansing did not finish", e); }
+  finally{ cleanBusy = false; if(cleanSheet) drawClean(); P.refresh(["containers"]); P.paint(); }
+}));
+/* one session */
+function drawSes1(){
+  const s = (sessOf() || []).find(x => skeyOf(x) === skey);
+  if(!s){ ssheet1.set(`<div class="p-empty" style="margin-top:12px">This session is no longer running.</div>`); return; }
+  const [idle, long] = sIdle(s);
+  ssheet1.set(`<div class="p-wrap" style="gap:6px;margin-top:8px">${H.tag(s.tool || "Agent", "ready")}${long ? H.tag("Idle over 24 h", "warn") : ""}${s.fleet ? H.tag("Fleet itself") : ""}</div>
+    <div class="p-read"><div><b>${esc(mb(s.rss_mb + s.ct_ram_mb))}</b><span>Memory</span></div><div><b>${s.containers || 0}</b><span>Containers</span></div><div><b>${esc(s.idle_s == null ? "–" : s.idle_s < 60 ? "now" : dur(s.idle_s))}</b><span>Idle</span></div></div>
+    ${dl([["Session", s.session], ["Model", s.model], ["Started", fmtT(s.started)], ["Folder", homeless(s.cwd)], ["Process", "pid " + s.pid], ["Idle", s.idle_s == null ? "Not known: Cleansing never ends this one." : idle]])}
+    ${s.fleet ? `<p class="p-note">This is the process that runs Fleet. It cannot be ended here.</p>`
+      : `<div class="p-pair p-acts"><button class="p-btn red" type="button" data-act="sys.cend">End this session</button></div>`}`);
+}
+P.on("sys.ses1", k => { const s = (sessOf() || []).find(x => skeyOf(x) === k); if(!s) return;
+  skey = k; ssheet1 = P.sheet({title: sName(s), sub: homeless(s.cwd), color: "amber", onClose: () => { ssheet1 = null; }}); keepCase(ssheet1); drawSes1(); });
+P.on("sys.cend", () => P.run(async () => {
+  const s = (sessOf() || []).find(x => skeyOf(x) === skey); if(!s || s.fleet) return;
+  if(!await P.confirm({title: "End this session?", sub: sName(s), danger: true, yes: "End session",
+    text: `The process is asked to stop and its ${s.containers ? plural(s.containers, "container") : "containers"} exit with it. Its saved conversation stays on disk.`})) return;
+  if(ssheet1) ssheet1.close();
+  try{ await stopRequest([s], []); }catch(e){ fail("Could not end the session", e); }
+  finally{ P.refresh(["containers"]); P.paint(); }
+}));
 P.on("sys.cnode", n => { cnode = n; P.haptic("select"); P.paint(); });
 P.on("sys.ckind", k => { ckind = ckind === k ? "" : k; P.haptic("select"); P.paint(); });
 function drawCtr(){
