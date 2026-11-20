@@ -178,6 +178,7 @@
 				CURRENT_PROJECT_VERSION = 1;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = Starfleet;
+				INFOPLIST_KEY_NSCameraUsageDescription = "Take a photo to ask the Computer view about it. The photo goes to your own cluster.";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Voice input for the Computer view in Fleet: what you say goes to the speech-to-text on your own cluster.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
@@ -206,6 +207,7 @@
 				CURRENT_PROJECT_VERSION = 1;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = Starfleet;
+				INFOPLIST_KEY_NSCameraUsageDescription = "Take a photo to ask the Computer view about it. The photo goes to your own cluster.";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Voice input for the Computer view in Fleet: what you say goes to the speech-to-text on your own cluster.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;

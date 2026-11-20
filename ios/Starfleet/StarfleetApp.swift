@@ -4,6 +4,9 @@ import WebKit
 /// Starfleet Command on the iPhone: Fleet's page in a web view, nothing more.
 /// A thin client on purpose -- no keys in the app. The Starfleet key is typed into
 /// the page and kept in the page's localStorage (the web view's persistent store).
+/// Fleet serves a phone its phone interface (padd.html); that page talks to the app
+/// through `PaddBridge` for what a web page cannot do: haptics, drawing under the
+/// status bar, opening a link in Safari.
 @main
 struct StarfleetApp: App {
     var body: some Scene {
@@ -20,7 +23,12 @@ struct FleetScreen: View {
     @State private var draft = UserDefaults.standard.string(forKey: "fleetURL") ?? ""
     @State private var loadError: String?
     @State private var webView = FleetScreen.makeWebView()
+    /// Set by the page (PaddBridge "ready"): the phone interface lays itself out around the
+    /// notch and the home indicator, the desktop page knows nothing about them.
+    @State private var edgeToEdge = false
     @Environment(\.scenePhase) private var scenePhase
+
+    static let bridge = PaddBridge()
 
     private var fleetURL: URL? {
         URL(string: address).flatMap { $0.scheme == "https" && $0.host != nil ? $0 : nil }
@@ -29,11 +37,14 @@ struct FleetScreen: View {
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
-            // Inside the safe area: the LCARS page knows nothing about notches.
-            FleetWebView(webView: webView, url: fleetURL, loadError: $loadError)
+            // Inside the safe area unless the page asked for the whole screen. Edge to edge also
+            // leaves the keyboard to the page: it sizes itself from the visual viewport.
+            FleetWebView(webView: webView, url: fleetURL, loadError: $loadError, edgeToEdge: $edgeToEdge)
+                .ignoresSafeArea(edgeToEdge ? .all : [], edges: edgeToEdge ? .all : [])
             if fleetURL == nil || loadError != nil { card }
         }
         .preferredColorScheme(.dark)
+        .onAppear { FleetScreen.bridge.onReady = { edgeToEdge = $0 } }
         // Typical fix for "Can't reach Fleet": switch to the Tailscale app, connect,
         // come back. Coming back retries by itself.
         .onChange(of: scenePhase) { _, phase in
@@ -92,8 +103,12 @@ struct FleetScreen: View {
         config.allowsInlineMediaPlayback = true
         config.mediaTypesRequiringUserActionForPlayback = []
         config.preferences.isElementFullscreenEnabled = true    // iPad; the iPhone has no element full screen
-        config.applicationNameForUserAgent = "StarfleetCommand/1.0"
+        config.applicationNameForUserAgent = "StarfleetCommand/1.1"
+        config.userContentController.add(bridge, name: "padd")
         let view = WKWebView(frame: .zero, configuration: config)
+        view.allowsBackForwardNavigationGestures = true         // swipe back through the page's own screens
+        view.allowsLinkPreview = false
+        view.scrollView.contentInsetAdjustmentBehavior = .never // the page reads env(safe-area-inset-*) itself
         // Black, not white, before the first paint.
         view.isOpaque = false
         view.backgroundColor = .clear
@@ -103,10 +118,49 @@ struct FleetScreen: View {
     }
 }
 
+/// What the phone interface asks of the app, as `webkit.messageHandlers.padd.postMessage({type, ...})`.
+/// Only Fleet's own page, in the main frame, is listened to.
+final class PaddBridge: NSObject, WKScriptMessageHandler {
+    var onReady: ((Bool) -> Void)?
+    private(set) var readyCount = 0
+
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        let fleetHost = URL(string: UserDefaults.standard.string(forKey: "fleetURL") ?? "")?.host
+        guard message.frameInfo.isMainFrame, fleetHost != nil, message.frameInfo.securityOrigin.host == fleetHost,
+              let body = message.body as? [String: Any], let type = body["type"] as? String else { return }
+        switch type {
+        case "ready":
+            readyCount += 1
+            onReady?(body["edgeToEdge"] as? Bool ?? false)
+        case "haptic":
+            haptic(body["style"] as? String ?? "light")
+        case "open":
+            if let text = body["url"] as? String, let url = URL(string: text), url.scheme == "https" || url.scheme == "http" {
+                UIApplication.shared.open(url)
+            }
+        default:
+            break
+        }
+    }
+
+    private func haptic(_ style: String) {
+        switch style {
+        case "success": UINotificationFeedbackGenerator().notificationOccurred(.success)
+        case "warning": UINotificationFeedbackGenerator().notificationOccurred(.warning)
+        case "error": UINotificationFeedbackGenerator().notificationOccurred(.error)
+        case "select": UISelectionFeedbackGenerator().selectionChanged()
+        case "medium": UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        case "heavy": UIImpactFeedbackGenerator(style: .heavy).impactOccurred()
+        default: UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        }
+    }
+}
+
 private struct FleetWebView: UIViewRepresentable {
     let webView: WKWebView
     let url: URL?
     @Binding var loadError: String?
+    @Binding var edgeToEdge: Bool
 
     func makeUIView(context: Context) -> WKWebView {
         webView.navigationDelegate = context.coordinator
@@ -127,13 +181,22 @@ private struct FleetWebView: UIViewRepresentable {
 
     final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate {
         var parent: FleetWebView
+        private var readyAtCommit = 0
         init(_ parent: FleetWebView) { self.parent = parent }
 
-        /// Reloads Fleet's address, not `webView.reload()`: after a failed first load
-        /// there is no page to reload.
+        /// Pull to refresh. The phone interface refreshes its data in place (`PADD.refresh()`);
+        /// any other page, or none, gets Fleet's address loaded again -- not `webView.reload()`:
+        /// after a failed first load there is no page to reload.
         func reload(_ webView: WKWebView) {
             guard let url = parent.url else { return done(webView) }
-            webView.load(URLRequest(url: url))
+            let script = "(window.PADD && typeof PADD.refresh === 'function') ? (PADD.refresh(), true) : false"
+            webView.evaluateJavaScript(script) { result, _ in
+                if (result as? Bool) == true {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) { self.done(webView) }
+                } else {
+                    webView.load(URLRequest(url: url))
+                }
+            }
         }
 
         private func done(_ webView: WKWebView) {
@@ -144,8 +207,33 @@ private struct FleetWebView: UIViewRepresentable {
             parent.loadError = nil
         }
 
+        func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+            readyAtCommit = FleetScreen.bridge.readyCount
+        }
+
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
             done(webView)
+            // A page that did not announce itself (the desktop page) goes back inside the safe area.
+            if FleetScreen.bridge.readyCount == readyAtCommit { parent.edgeToEdge = false }
+        }
+
+        /// iOS can end the page's process while the app is in the background: bring the page back.
+        func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+            if let url = parent.url { webView.load(URLRequest(url: url)) }
+        }
+
+        /// A tapped link that leaves Fleet (another host or port, or one meant for a new window,
+        /// like every link in a chat answer) opens in Safari instead of replacing the interface.
+        func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction,
+                     decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+            if navigationAction.navigationType == .linkActivated, let link = navigationAction.request.url,
+               link.scheme == "https" || link.scheme == "http",
+               navigationAction.targetFrame == nil || link.host != parent.url?.host || link.port != parent.url?.port {
+                UIApplication.shared.open(link)
+                decisionHandler(.cancel)
+                return
+            }
+            decisionHandler(.allow)
         }
 
         func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
