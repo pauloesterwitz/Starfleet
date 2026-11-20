@@ -18,6 +18,21 @@
 # ---- Fleet UI (served by fleet-ui.service)
 fleet-ui/fleet.py                               ~/fleet-ui/fleet.py                            jean-luc
 fleet-ui/fleet.html                             ~/fleet-ui/fleet.html                          jean-luc
+fleet-ui/wikicore.py                            ~/fleet-ui/wikicore.py                         jean-luc
+fleet-ui/vendor/marked.min.js                   ~/fleet-ui/vendor/marked.min.js                jean-luc
+fleet-ui/vendor/purify.min.js                   ~/fleet-ui/vendor/purify.min.js                jean-luc
+fleet-ui/vendor/highlight.min.js                ~/fleet-ui/vendor/highlight.min.js             jean-luc
+fleet-ui/vendor/atom-one-dark.min.css           ~/fleet-ui/vendor/atom-one-dark.min.css        jean-luc
+fleet-ui/vendor/memcore.js                      ~/fleet-ui/vendor/memcore.js                   jean-luc
+fleet-ui/vendor/memcore.css                     ~/fleet-ui/vendor/memcore.css                  jean-luc
+# the phone interface: fleet.py serves padd.html at /padd, and at / to phones
+fleet-ui/padd.html                              ~/fleet-ui/padd.html                           jean-luc
+fleet-ui/vendor/padd.css                        ~/fleet-ui/vendor/padd.css                     jean-luc
+fleet-ui/vendor/padd.js                         ~/fleet-ui/vendor/padd.js                      jean-luc
+fleet-ui/vendor/padd-systems.js                 ~/fleet-ui/vendor/padd-systems.js              jean-luc
+fleet-ui/vendor/padd-computer.js                ~/fleet-ui/vendor/padd-computer.js             jean-luc
+fleet-ui/vendor/padd-memcore.js                 ~/fleet-ui/vendor/padd-memcore.js              jean-luc
+fleet-ui/vendor/padd-command.js                 ~/fleet-ui/vendor/padd-command.js              jean-luc
 
 # ---- status tools the Mac app runs on each node over ssh
 cluster/opencode-status.py                      ~/bin/opencode-status.py                       jean-luc kathryn

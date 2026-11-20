@@ -3068,6 +3068,70 @@ def computer_transcribe(wav):
     raise OSError("transcription failed: " + "; ".join(errors))
 
 
+# ---------------------------------------------------------------- agent sessions (phone interface)
+# What the Mac app reads over ssh, for a client that has no ssh: ~/bin/opencode-status.py and
+# ~/bin/opencode-export-tail.py on each node (cluster/, deployed by sync-hosts.sh). Session titles and
+# transcripts can hold confidential work, so both routes sit behind the Starfleet key (/api/computer/).
+
+SESS_TTL = 5
+SESS_TOOLS = ("opencode", "claude-code")
+_SESS = {"at": 0.0, "data": {"nodes": {}, "errors": {}}}
+_SESS_LOCK = threading.Lock()
+_SESS_ID = re.compile(r"[A-Za-z0-9_-]{8,64}")
+
+
+def _sess_script(host, name, args, timeout):
+    """Run one of the status tools on a node and return its JSON. args must already be validated: over ssh
+    they pass through the remote shell (quoted here), and the script path keeps its ~ for that shell."""
+    cmd = [os.path.expanduser("~/bin/" + name), *args] if host is None else [
+        "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host,
+        " ".join(["~/bin/" + name] + [shlex.quote(a) for a in args])]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return json.loads(r.stdout)
+    except subprocess.SubprocessError as e:
+        raise OSError(str(e)[:200])
+    except ValueError:
+        raise OSError((r.stderr.strip() or r.stdout.strip() or f"exit {r.returncode}")[-200:])
+
+
+def sessions_state():
+    """Coding-agent sessions on every node, cached SESS_TTL seconds. A node that fails keeps its last good
+    list and reports the error next to it."""
+    with _SESS_LOCK:
+        if time.time() - _SESS["at"] > SESS_TTL:
+            got = {}
+
+            def one(node, host):
+                try:
+                    got[node] = _sess_script(host, "opencode-status.py", [], 20)
+                except OSError as e:
+                    got[node] = {"__err": str(e)}
+            threads = [threading.Thread(target=one, args=nh) for nh in NODES.items()]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            nodes, errors = {}, {}
+            for node in NODES:
+                d = got.get(node)
+                if not isinstance(d, dict) or "__err" in d:
+                    errors[node] = (d or {}).get("__err", "no answer") if isinstance(d, dict) else "no answer"
+                    nodes[node] = dict(_SESS["data"]["nodes"].get(node) or {"host": None, "sessions": []}, error=errors[node])
+                else:
+                    nodes[node] = {"host": d.get("host"), "sessions": d.get("sessions") or [], "error": d.get("error")}
+            _SESS["data"], _SESS["at"] = {"nodes": nodes, "errors": errors}, time.time()
+        return dict(_SESS["data"], at=_SESS["at"])
+
+
+def session_tail(node, sid, tool):
+    """The last messages of one session. The export tool globs on the id, so the pattern is what keeps a
+    request from naming anything but a session."""
+    if node not in NODES or tool not in SESS_TOOLS or not _SESS_ID.fullmatch(sid or ""):
+        raise ValueError("unknown session")
+    return _sess_script(NODES[node], "opencode-export-tail.py", [sid, "5", tool], 45)
+
+
 # ---------------------------------------------------------------- http
 
 CSP = ("default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' "
@@ -3186,11 +3250,22 @@ class Handler(BaseHTTPRequestHandler):
                     p = (q.get("p") or [""])[0]
                     return self._send(200, json.dumps({"p": p, "md": wikicore.page_md(p)}, ensure_ascii=False),
                                       "application/json; charset=utf-8")
+                if u.path == "/api/computer/sessions":         # coding-agent sessions, for the phone interface
+                    return self._send(200, json.dumps(sessions_state()), "application/json")
+                if u.path == "/api/computer/sessions/tail":
+                    return self._send(200, json.dumps(session_tail(*((q.get(k) or [""])[0] for k in ("node", "id", "tool")))),
+                                      "application/json")
             except (OSError, ValueError) as e:
                 return self._send(404, json.dumps({"error": str(e)[:200]}), "application/json")
             return self._send(404, '{"error":"unknown"}', "application/json")
-        if self.path == "/":
+        if self.path == "/":                                   # a phone gets the phone interface
+            return self._send(200, page(page_for(self.headers.get("User-Agent"))), "text/html; charset=utf-8")
+        if self.path == "/desktop":
             return self._send(200, page(), "text/html; charset=utf-8")
+        if self.path == "/padd":
+            if not os.path.isfile(PADD_FILE):
+                return self._send(404, "not found", "text/plain")
+            return self._send(200, page(PADD_FILE), "text/html; charset=utf-8")
         if self.path == "/sounds/tng_red_alert1.mp3":
             with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "sounds",
                                   "tng_red_alert1.mp3"), "rb") as f:
@@ -3538,12 +3613,24 @@ class Handler(BaseHTTPRequestHandler):
 # ---------------------------------------------------------------- page
 
 PAGE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fleet.html")
+# The phone interface (padd.html with vendor/padd*.js): "/" serves it to a phone, /padd to anyone, and
+# /desktop is always the desktop page. Touch padd.off next to this file and phones get the desktop page
+# at "/" again, without a restart.
+PADD_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "padd.html")
+PADD_OFF = os.path.join(os.path.dirname(os.path.abspath(__file__)), "padd.off")
+_PHONE_UA = re.compile(r"iPhone|iPod|Android.+Mobile")
 
 
-def page():
+def page(path=PAGE_FILE):
     """Read the page off disk each request so design edits need only a browser refresh."""
-    with open(PAGE_FILE, encoding="utf-8") as f:
+    with open(path, encoding="utf-8") as f:
         return f.read()
+
+
+def page_for(user_agent):
+    """The page "/" serves to this client. An iPad and the Mac app keep the desktop page."""
+    phone = bool(user_agent and _PHONE_UA.search(user_agent))
+    return PADD_FILE if phone and os.path.isfile(PADD_FILE) and not os.path.exists(PADD_OFF) else PAGE_FILE
 
 
 # ---------------------------------------------------------------- entry
@@ -3563,6 +3650,20 @@ def _ct_selfcheck():
 def selfcheck():
     global _q_current, AUTODESTRUCT_CODE
     _ct_selfcheck()
+    # phone interface: "/" serves it to phones only, and a session request can name nothing but a session
+    assert page_for("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Starfleet Command/1.0 (macOS)") == PAGE_FILE
+    assert page_for(None) == PAGE_FILE and page_for("Mozilla/5.0 (iPad; CPU OS 18_0 like Mac OS X)") == PAGE_FILE
+    assert _PHONE_UA.search("Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) Mobile/15E148 StarfleetCommand/1.0")
+    assert _PHONE_UA.search("Mozilla/5.0 (Linux; Android 15; Pixel 9) Chrome/130 Mobile Safari/537.36")
+    for _bad in (("jean-luc", "../../etc/passwd", "opencode"), ("jean-luc", "a*", "opencode"), ("jean-luc", "a b c d e f", "opencode"),
+                 ("jean-luc", "", "opencode"), ("jean-luc", "x" * 65, "opencode"), ("jean-luc", "short", "opencode"),
+                 ("nowhere", "ses_0123456789", "opencode"), ("jean-luc", "ses_0123456789", "sh"),
+                 ("jean-luc", "ses_0123456789;id", "claude-code")):
+        try:
+            session_tail(*_bad)
+            raise AssertionError(f"session_tail accepted {_bad}")
+        except ValueError:
+            pass
     # web guard: public tech passes; customer names, people, secrets, personal data and pasted text do not.
     # Runs on a fixed test list (customer term "acme corp"/"acme"), not this host's real one.
     _wg_saved = dict(_WG)

@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en" style="background:#000">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#000000">
+<meta name="color-scheme" content="dark">
+<title>Starfleet PADD</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Antonio:wght@400;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/vendor/padd.css">
+</head>
+<body>
+<!-- Starfleet PADD: Fleet for a phone. fleet.py serves this page at /padd, and at / to phones; the
+     desktop page stays at /desktop. The frame is here, everything else is drawn by /vendor/padd.js (data
+     layer, Bridge, Models) and one script per screen group. -->
+<header id="p-hd">
+  <div class="p-hdg">
+    <div class="p-elbow"></div>
+    <div class="p-hbar"></div>
+    <div class="p-hseg"></div>
+    <button class="p-stat wait" id="p-stat" type="button" data-act="status">Standby</button>
+    <div class="p-titlerow">
+      <button class="p-back" id="p-back" type="button" data-act="back" aria-label="Back" hidden>
+        <svg viewBox="0 0 11 20" aria-hidden="true"><path d="M9 2L2 10l7 8" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button>
+      <h1 class="p-title" id="p-title">Starfleet</h1>
+      <div class="p-hx" id="p-hx"></div>
+    </div>
+  </div>
+</header>
+<main id="p-view"></main>
+<div id="p-stage" hidden></div>
+<nav id="p-tabs" aria-label="Sections"></nav>
+<div id="p-sheets"></div>
+<div id="p-alert" hidden></div>
+<div id="p-toast" role="status" aria-live="polite"></div>
+<script src="/vendor/padd.js"></script>
+<script src="/vendor/padd-systems.js"></script>
+<script src="/vendor/padd-computer.js"></script>
+<script src="/vendor/padd-memcore.js"></script>
+<script src="/vendor/padd-command.js"></script>
+<script>PADD.boot();</script>
+</body>
+</html>

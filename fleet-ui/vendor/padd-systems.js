@@ -1,0 +1,445 @@
+/* ================= Starfleet PADD: Systems =================
+   The Systems tab and five of its screens: Sessions, Main Engineering, Deep Space NAS, Memory Alpha and
+   Defiant (Memory Core is padd-memcore.js). The rules are the desktop page's, so a row means the same on
+   both: when fleet.html changes one, change it here too. Source lines as of 2026-11-19: nasKind L1442,
+   NAS actions L1456-1465 and L1567, hardware L1537, containers L1597-1631, formats L1659, Memory Alpha
+   L1678, Defiant L1734. Sessions follow the Mac app (Sources/OpencodeMonitor/Models.swift, ContentView.swift).
+   Payloads: containers_state, nas_state, nas_stats, memory_alpha_state, defiant_state, sessions_state and
+   session_tail in fleet.py. */
+(() => {
+"use strict";
+const P = window.PADD, H = P.h, TAG = P.model.TAG;
+const nn = n => TAG[n] || n;
+const now = () => Date.now() / 1000;
+const clock = t => new Date(t).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false});
+const mb = m => m == null ? "–" : m >= 1024 ? (m / 1024).toFixed(1) + " GB" : m + " MB";
+const fmtB = b => b == null ? "–" : b >= 1e12 ? (b / 1e12).toFixed(2) + " TB" : b >= 1e9 ? (b / 1e9).toFixed(1) + " GB" : b >= 1e6 ? (b / 1e6).toFixed(0) + " MB" : Math.round(b / 1e3) + " kB";
+const fmtN = n => n == null ? "–" : n.toLocaleString("en-US");
+const fmtT = t => t ? new Date(t * 1000).toLocaleString([], {weekday: "short", day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit", hour12: false}) : "–";
+const until = t => !t ? "–" : t < now() ? "due" : "in " + dur(t - now());
+const rate = b => b == null ? "–" : b >= 1e6 ? (b / 1e6).toFixed(1) + " MB/s" : (b / 1e3).toFixed(0) + " kB/s";
+const STATE = {ok: ["Nominal", "ready"], warn: ["Attention", "warn"], error: ["Fault", "fault"], off: ["Not configured", ""]};
+const stateTag = st => STATE[st] || [st || "Unknown", "warn"];
+const order = names => [...new Set(["jean-luc", "kathryn"].filter(n => names.includes(n)).concat(names))];
+const sent = t => String(t).replace(/[.\s]+$/, "") + ".";
+const empty = t => `<div class="p-empty" style="margin-top:14px">${esc(t)}</div>`;
+const synced = (k, short) => P.hx(P.err[k] === "key" ? "" : `<span class="p-sync">${P.err[k] ? "Sync lost" : P.at[k] ? (short ? "" : "Synced ") + clock(P.at[k]) : "Checking"}</span>`);
+/* the last poll failed but an older answer is on screen */
+const lost = k => P.data[k] && P.err[k] && P.err[k] !== "key" ? H.msg(`${sent(P.err[k])} Showing the last answer, from ${clock(P.at[k])}.`, true) : "";
+function wait(el, k){ if(P.data[k]) return false; P.put(el, P.err[k] ? H.msg(P.err[k], true) : empty("Checking...")); return true; }
+const say = e => sent(/^[a-z]+ /.test(e) ? e[0].toUpperCase() + e.slice(1) : e);   /* fleet.py writes them lower case; a domain keeps its case */
+const notes = d => [[d.errors, " err"], [d.problems, ""]].map(([l, c]) => (l || []).length ? `<div class="p-msg${c} p-sel">${l.map(e => esc(say(e))).join("<br>")}</div>` : "").join("");
+const fail = (what, e) => { if(e && e.quiet) throw e; throw new Error(`${what}: ${(e && e.message) || e}`); };
+const fig = v => { const [n, u] = String(v).split(" "); return `<b>${esc(n)}${u ? `<small>${esc(u)}</small>` : ""}</b>`; };
+/* a row that only shows something; lines are HTML */
+const info = o => `<div class="p-row p-sy-flat" style="--c:var(--${o.c || "grid"})"><span class="p-m"><span class="p-t p-sel">${esc(o.t)}</span>${
+  (o.lines || []).filter(Boolean).map(l => `<span class="p-s">${l}</span>`).join("")}${o.e ? `<span class="p-s wrap p-sel" style="color:var(--red)">${esc(o.e)}</span>` : ""}</span>${o.tag ? H.tag(o.tag, o.tagc) : ""}</div>`;
+const dl = rows => `<div class="p-sy-dl">${rows.map(([k, v]) => `<div><span>${esc(k)}</span><b class="p-sel">${esc(v == null || v === "" ? "–" : v)}</b></div>`).join("")}</div>`;
+const pan = (c, title, big, sub, kv, mid) => `<div class="p-card" style="--c:var(--${c})"><h3>${esc(title)}</h3>${big ? `<div class="p-free">${big}</div>` : ""}${mid || ""}${
+  sub ? `<div class="p-s wrap p-sel">${esc(sub)}</div>` : ""}${kv ? `<div class="p-kv">${kv.map(([l, v]) => `<div><b>${esc(v ?? "–")}</b><span>${esc(l)}</span></div>`).join("")}</div>` : ""}</div>`;
+const gauge = (pct, c) => `<div${c ? ` style="--g:var(--${c})"` : ""}>${H.gauge(pct || 0, 20)}</div>`;
+/* P.sheet upper-cases and cuts its sub-line: a path or an image name keeps its case and wraps */
+const keepCase = s => { const el = s.el.querySelector(".p-shd .p-s"); if(el) el.classList.add("p-sy-path"); };
+
+P.css(`
+.p-sy-fig{flex:none;display:flex;flex-direction:column;align-items:flex-end;gap:6px}
+.p-sy-fig b{font-size:20px;font-weight:700;line-height:1;color:var(--peach);white-space:nowrap}
+.p-sy-fig small{margin-left:4px;font-size:12px;font-weight:600;color:var(--dim);letter-spacing:.1em;text-transform:uppercase}
+.p-sy-amb{color:var(--amber)}
+.p-sy-flat:active{background:var(--card)}
+.p-sy-state{display:flex;align-items:center;gap:10px;margin:8px 0 2px}
+.p-sy-pans{display:flex;flex-direction:column;gap:6px}
+.p-sy-pans .p-kv{margin-bottom:0}
+.p-sy-pans .p-free{margin-bottom:2px}
+.p-sy-pans .p-gauge{margin:8px 0 6px}
+.p-sy-hw{display:grid;grid-template-columns:40px minmax(0,1fr) 124px;align-items:center;column-gap:10px;min-height:30px}
+.p-sy-hw span{font-size:12px;color:var(--dim);text-transform:uppercase;letter-spacing:.1em}
+.p-sy-hw .p-gauge{margin:0}
+.p-sy-hw b{text-align:right;font-size:15px;font-weight:600;color:var(--g,var(--text));white-space:nowrap}
+.p-sy-dl{display:flex;flex-direction:column;gap:2px;margin-top:12px}
+.p-sy-dl div{display:flex;align-items:baseline;gap:12px;background:var(--card);padding:9px 10px}
+.p-sy-dl span{flex:none;width:92px;font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.1em}
+.p-sy-dl b{flex:1;min-width:0;font:400 14px/1.35 var(--body);letter-spacing:0;color:var(--text);overflow-wrap:anywhere}
+.p-sy-path{text-transform:none;white-space:normal;overflow-wrap:anywhere;letter-spacing:.04em}
+.p-sy-tail .p-shb{margin-top:8px;border-top:2px solid var(--track)}   /* a transcript always scrolls: a line where it goes under the header */
+.p-sy-tr{display:flex;flex-direction:column;gap:14px;margin:4px 0 8px}
+.p-sy-msg{--c:var(--blue);border-left:4px solid var(--c);padding:1px 0 1px 12px;min-width:0}
+.p-sy-msg.me{--c:var(--orange)}
+.p-sy-who{display:flex;align-items:baseline;gap:8px;font-size:12px;font-weight:700;color:var(--c);text-transform:uppercase;letter-spacing:.12em}
+.p-sy-who small{font-size:11px;font-weight:400;color:var(--dim)}
+.p-sy-txt{margin-top:4px;font:400 15px/1.45 var(--body);letter-spacing:0;color:#f3e6d8;white-space:pre-wrap;overflow-wrap:anywhere}
+.p-sy-txt.clamp{display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:8;overflow:hidden}
+.p-sy-more{display:block;height:44px;min-width:44px;margin-bottom:-8px;padding:0;border:0;background:none;color:var(--blue);
+  font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.12em}
+.p-sy-part{display:flex;align-items:center;gap:8px;margin-top:6px;min-width:0;font-size:13px;line-height:1.3;color:var(--dim);letter-spacing:.05em}
+.p-sy-part i{flex:none;width:8px;height:8px;border-radius:4px;background:var(--d,var(--amber))}
+.p-sy-part span{min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+`);
+
+/* ================================================================ Systems: one row per screen
+   Each line fills in when its own source answers; a source that is still on its way says so. */
+const pend = k => P.err[k] && P.err[k] !== "key" ? {e: P.err[k]} : {s: "Checking"};
+const SUM = {
+  sessions(){
+    if(P.err.sessions === "key") return {s: "Starfleet key needed"};
+    if(!P.data.sessions) return pend("sessions");
+    const all = P.sessionsOf(), st = all.filter(x => x.stalled).length;
+    return {s: `${all.length} active · ${all.filter(x => x.generating).length} generating`, tag: st ? `${st} stalled` : "", tagc: "warn"};
+  },
+  engineering(){
+    const d = P.data.containers; if(!d) return pend("containers");
+    const cs = d.containers || [], sum = k => Math.round(cs.reduce((a, c) => a + (c[k] || 0), 0) / 1024), stale = Object.keys(d.errors || {});
+    return {s: `${sum("ram_mb")} GB RAM · ${sum("gpu_mb")} GB GPU`, s2: stale.length ? `${stale.map(nn).join(" and ")} not answering` : "", tag: `${cs.length} running`, tagc: stale.length ? "warn" : ""};
+  },
+  nas(){
+    const d = P.data.nas, h = P.data.nasstats, s = h && h.stats, out = {};
+    if(s){ const hot = Math.max(...(s.temps || []).map(t => t.c));
+      out.s = [`CPU ${s.cpu_pct.toFixed(0)}%`, `RAM ${(100 * s.mem_used_mb / s.mem_total_mb).toFixed(0)}%`, isFinite(hot) ? hot.toFixed(0) + "°" : ""].filter(Boolean).join(" · "); }
+    else if(h) out.s = "No hardware figures";
+    else Object.assign(out, pend("nasstats"));
+    if(d){ const cs = d.containers || [], kinds = cs.map(c => nasKind(c)[0]);
+      out.tag = d.error ? "Stale" : `${cs.filter(c => c.State === "running").length} of ${cs.length} up`;
+      out.tagc = d.error ? "warn" : kinds.includes("bad") ? "fault" : kinds.includes("warn") ? "warn" : ""; }
+    else if(P.err.nas && !out.e){ out.e = P.err.nas; if(out.s === "Checking") out.s = ""; }
+    return out;
+  },
+  alpha(){
+    const d = P.data.alpha; if(!d) return pend("alpha");
+    const L = d.last, [tag, tagc] = stateTag(d.status);
+    return {s: L && L.end ? `Last snapshot ${ago(L.end)} · ${fmtB(L.size)}` : "No snapshot reported", s2: `Off-site backup · next ${until(d.next_snapshot)}`, tag, tagc};
+  },
+  defiant(){
+    const d = P.data.defiant; if(!d) return pend("defiant");
+    if(d.configured === false) return {s: "Not set up", tag: "Not configured"};
+    const sites = d.sites || [], up = sites.filter(x => !siteBad(x)).length, cert = Math.min(...sites.map(x => x.cert_days).filter(x => x != null));
+    const [tag, tagc] = d.status === "ok" && d.reboot_required ? ["Reboot", "warn"] : stateTag(d.status);
+    return {s: `${up === sites.length ? up : up + " of " + sites.length} site${sites.length === 1 ? "" : "s"} up${isFinite(cert) ? ` · certificates ${cert} days` : ""}`,
+      s2: `Web server${d.updates ? ` · ${d.updates} updates pending` : ""}`, tag, tagc};
+  },
+  core: () => ({}),
+};
+const ROWS = [["sessions", "Sessions", "magenta", "Claude Code and OpenCode on both Sparks"], ["engineering", "Main Engineering", "amber", "Every container on both Sparks"],
+  ["nas", "Deep Space NAS", "blue", "Containers and hardware of the NAS"], ["alpha", "Memory Alpha", "mauve", "Off-site backup"],
+  ["defiant", "Defiant", "peach", "Web server"], ["core", "Memory Core", "blue", "The wiki as a map"]];
+P.screens.systems = { tab: "systems", title: "Systems", color: "amber",
+  needs: {sessions: 15000, containers: 60000, nas: 60000, nasstats: 60000, alpha: 120000, defiant: 120000},
+  render(el){
+    P.hx(`<span class="p-sync">${esc(P.syncText())}</span>`);
+    P.put(el, `<div class="p-list" style="margin-top:6px">${ROWS.map(([id, t, c, line]) => { let x; try{ x = SUM[id](); }catch(e){ x = {e: "This answer could not be read"}; }   /* one odd payload never takes the list down */
+      return H.row({tall: true, big: true, act: "go", arg: "#/systems/" + id, c, t, s: x.s, s2: x.s2 || line, e: x.e, tag: x.tag, tagc: x.tagc, chev: true}); }).join("")}</div>`);
+  } };
+
+/* ================================================================ Sessions: what the Mac menu-bar app shows */
+const toolName = t => t === "claude-code" ? "Claude Code" : "OpenCode";
+const toolOf = s => s.tool || "opencode";                      /* a host with the older status script sends no tool */
+const sKey = s => [s.node, toolOf(s), s.id].join("|");
+const sEdge = s => s.stalled ? "red" : s.generating ? "magenta" : s.updated_secs_ago < 1800 ? "blue" : s.updated_secs_ago < 28800 ? "amber" : "";
+const sTag = s => s.stalled ? ["Stalled", "fault"] : s.generating ? ["Generating", "pinned"] : [s.status || "idle", ""];
+const sAge = s => s.stalled ? "waiting for " + dur(s.updated_secs_ago) : s.generating ? "now" : dur(s.updated_secs_ago) + " ago";
+const sTodo = s => { const t = s.todos || {}; return [t.completed || 0, (t.pending || 0) + (t.in_progress || 0) + (t.completed || 0), t.in_progress || 0]; };
+let sf = "all", ssheet = null, scur = null, tail = null, tailBusy = false, tailTimer = 0;
+const more = new Set();
+const sKeep = s => sf === "all" || (sf === "stalled" ? s.stalled : sf === "generating" ? s.generating : s.node === sf);
+P.screens["systems/sessions"] = { tab: "systems", title: "Sessions", color: "magenta", parent: "#/systems", needs: {sessions: 5000},
+  mount(el){ el.innerHTML = `<div class="p-chips" id="p-sy-sf" style="margin-top:4px"></div><div id="p-sy-sl"></div>`; },
+  render(el){
+    synced("sessions");
+    const chips = el.querySelector("#p-sy-sf"), list = el.querySelector("#p-sy-sl");
+    if(P.err.sessions === "key"){ P.put(chips, ""); P.put(list, `<div style="margin-top:10px">${H.keygate("The session list")}</div>`); return; }
+    if(wait(list, "sessions")) return;
+    const d = P.data.sessions, all = P.sessionsOf(), names = order(Object.keys(d.nodes || {}));
+    if(!["all", "stalled", "generating", ...names].includes(sf)) sf = "all";
+    P.put(chips, [["all", "All", all.length], ["stalled", "Stalled", all.filter(s => s.stalled).length], ["generating", "Generating", all.filter(s => s.generating).length],
+      ...names.map(n => [n, nn(n), all.filter(s => s.node === n).length])].map(([f, label, n]) => H.chip({act: "sys.sf", arg: f, label, n, on: f === sf})).join(""));
+    let html = lost("sessions"), shown = 0;
+    for(const n of names){
+      /* fleet.py sessions_state: a node that did not answer is in errors and keeps its last list; a node
+         that answered may still report a problem of its own (no opencode database, say) */
+      const v = d.nodes[n] || {}, down = (d.errors || {})[n];
+      if((down || v.error) && (sf === n || !names.includes(sf)))
+        html += `<div class="p-grp">${esc(nn(n))}</div>${down ? H.msg(`Not answering. Showing its last list. ${down}`, true) : H.msg(v.error)}`;
+      for(const tool of ["claude-code", "opencode"]){
+        const rows = all.filter(s => s.node === n && toolOf(s) === tool && sKeep(s)).sort((a, b) => (b.generating - a.generating) || (a.updated_secs_ago - b.updated_secs_ago));
+        if(!rows.length) continue;
+        shown += rows.length;
+        html += `<div class="p-grp">${esc(nn(n))} · ${toolName(tool)}</div><div class="p-list">${rows.map(s => { const [tag, tagc] = sTag(s), [done, total] = sTodo(s);
+          return H.row({act: "sys.ses", arg: sKey(s), c: sEdge(s), t: s.title || "Untitled session", s: `${total ? `Todos ${done} of ${total}` : "No todos"} · ${sAge(s)}`, tag, tagc}); }).join("")}</div>`;
+      }
+    }
+    if(!shown) html += empty(all.length ? "No sessions match" : "No sessions active in the last 24 h");
+    P.put(list, html);
+    if(ssheet && ssheet.open) drawSession();
+  } };
+P.on("sys.sf", f => { sf = f; P.haptic("select"); P.paint(); });
+
+/* the transcript tail in a sheet */
+const findS = () => scur && (P.sessionsOf().find(s => sKey(s) === scur.key) || scur.s);
+function partHtml(p, k){
+  if(p.type === "text"){
+    const t = String(p.text || "").trim(); if(!t) return "";
+    const long = t.length > 480 || t.split("\n").length > 8, open = more.has(k);
+    return `<div class="p-sy-txt p-sel${long && !open ? " clamp" : ""}">${esc(t)}</div>${long ? `<button class="p-sy-more" type="button" data-act="sys.more" data-arg="${esc(k)}">${open ? "Show less" : "Show more"}</button>` : ""}`;
+  }
+  if(p.type === "tool") return `<div class="p-sy-part p-sel" style="--d:var(--${/err|fail/i.test(p.status || "") ? "red" : /complet|done|success/i.test(p.status || "") ? "blue" : "amber"})"><i></i><span>${
+    esc([p.tool || "tool", p.status || "?", p.title].filter(Boolean).join(" · "))}</span></div>`;
+  if(p.type === "file") return `<div class="p-sy-part p-sel" style="--d:var(--mauve)"><i></i><span>${esc(p.filename || "File")}</span></div>`;
+  return "";
+}
+function drawSession(toEnd){
+  const s = findS(); if(!s || !ssheet) return;
+  const [tag, tagc] = sTag(s), [done, total, doing] = sTodo(s), msgs = tail && tail.messages;
+  const who = m => m.role === "user" ? "You" : toolName(toolOf(s));
+  const at = m => { const c = m.created; if(!c) return ""; const ms = c > 1e11 ? c : c * 1000;       /* seconds from Claude Code, milliseconds from opencode */
+    return new Date(ms).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", hour12: false}); };
+  const b = ssheet.body, near = b.scrollHeight - b.scrollTop - b.clientHeight < 80;
+  ssheet.set(`<div class="p-wrap" style="gap:6px;margin-top:8px">${H.tag(tag, tagc)}${H.tag(toolName(toolOf(s)))}</div>
+    <div class="p-read"><div><b>${total ? `${done} of ${total}` : "–"}</b><span>Todos done</span></div><div><b>${doing}</b><span>In progress</span></div>
+      <div><b>${esc(dur(s.updated_secs_ago))}</b><span>${s.stalled ? "Waiting" : "Last update"}</span></div></div>
+    <div class="p-lab">Transcript${msgs && msgs.length ? `, last ${msgs.length} message${msgs.length > 1 ? "s" : ""}` : ""}</div>
+    ${!tail ? `<div class="p-empty">Reading the transcript...</div>` : tail.error ? H.msg(tail.error, true) : !(msgs || []).length ? `<div class="p-empty">No messages yet</div>`
+      : `<div class="p-sy-tr">${msgs.map((m, i) => `<div class="p-sy-msg${m.role === "user" ? " me" : ""}"><div class="p-sy-who">${who(m)}<small>${at(m)}</small></div>${
+          (m.parts || []).map((p, j) => partHtml(p, `${m.created || i}:${j}`)).join("")}</div>`).join("")}</div>`}`);
+  if(toEnd || (near && msgs)) b.scrollTop = b.scrollHeight;       /* a tail is read from its end */
+}
+async function loadTail(user){
+  if(!scur || tailBusy === scur.key) return;       /* one request per session: a late answer of a closed sheet must not block the next */
+  tailBusy = scur.key;
+  const key = scur.key, s = scur.s, q = encodeURIComponent, first = !tail;
+  try{ const j = await P.api.get(`/api/computer/sessions/tail?node=${q(s.node)}&id=${q(s.id)}&tool=${q(toolOf(s))}`, {prompt: user});   /* only a tap may ask for the key */
+       if(scur && scur.key === key) tail = j || {error: "Fleet sent no transcript. Try again."}; }
+  catch(e){ if(scur && scur.key === key && (user || !tail)) tail = {error: e.message}; }      /* a refresh that fails keeps the last transcript */
+  if(tailBusy === key) tailBusy = false;
+  if(ssheet && ssheet.open && scur && scur.key === key) drawSession(first);
+}
+P.on("sys.ses", key => {
+  const s = P.sessionsOf().find(x => sKey(x) === key); if(!s) return;
+  scur = {key, s}; tail = null; more.clear();
+  ssheet = P.sheet({title: s.title || "Untitled session", sub: `${nn(s.node)} · ${s.directory || "no directory"}`, color: sEdge(s) || "mauve",
+    onClose: () => { clearInterval(tailTimer); ssheet = null; scur = null; }});
+  ssheet.el.classList.add("p-sy-tail"); keepCase(ssheet); drawSession(); loadTail(true);
+  tailTimer = setInterval(() => { const x = findS(); if(x && x.generating && !document.hidden) loadTail(false); }, 10000);
+});
+P.on("sys.more", k => { if(!more.delete(k)) more.add(k); drawSession(); });
+
+/* ================================================================ Main Engineering: containers on both Sparks */
+const CKIND = {gpu: ["Model", "pinned", "magenta"], session: ["Session", "ready", "blue"], service: ["Service", "", "mauve"]};   /* L1599 */
+function cIdle(c){                                           /* L1600 as [text, over 24 h, what it means] */
+  if(c.session_idle_s != null) return [`session idle ${dur(c.session_idle_s)}`, c.session_idle_s > 86400, `The session that owns it was last active ${dur(c.session_idle_s)} ago.`];
+  if(c.cpu_idle_s == null) return ["", false, "Not measured yet."];
+  if(c.cpu_idle_s < 60 && !c.cpu_idle_ge) return ["active", false, "Used CPU in the last minute."];
+  return [`idle ${c.cpu_idle_ge ? "≥ " : ""}${dur(c.cpu_idle_s)}`, c.cpu_idle_s > 86400,
+    `No CPU use for ${c.cpu_idle_ge ? "at least " : ""}${dur(c.cpu_idle_s)}${c.cpu_idle_ge ? ", counted since Fleet started watching" : ""}.`];
+}
+let cnode = "all", ckind = "", csheet = null, ckey = "";
+const cbusy = new Set(), cid = c => c.node + "/" + c.name;
+P.screens["systems/engineering"] = { tab: "systems", title: "Main Engineering", color: "amber", parent: "#/systems", needs: {containers: 10000},
+  mount(el, arg){ cnode = arg || "all";
+    el.innerHTML = `<div id="p-sy-ch"></div><div class="p-chips" id="p-sy-cn" style="margin-top:6px"></div><div class="p-chips" id="p-sy-ck"></div><div id="p-sy-cl" style="margin-top:2px"></div>`; },
+  render(el){
+    synced("containers", true);                                /* the long title leaves room for the time only */
+    const list = el.querySelector("#p-sy-cl");
+    if(wait(list, "containers")) return;
+    const d = P.data.containers, cs = d.containers || [], errs = d.errors || {}, names = order([...new Set(["jean-luc", "kathryn", ...cs.map(c => c.node)])]);
+    if(cnode !== "all" && !names.includes(cnode)) cnode = "all";
+    const sum = (rows, k) => rows.reduce((a, c) => a + (c[k] || 0), 0);
+    P.put(el.querySelector("#p-sy-ch"), `${lost("containers")}${Object.entries(errs).map(([n, e]) => H.msg(`${nn(n)} is not answering. Showing its last list. ${e}`, true)).join("")}
+      ${H.sec("Running containers", cs.length)}<div class="p-nodes">${names.map(n => { const rows = cs.filter(c => c.node === n);
+        return `<div class="p-node" style="--c:var(--${errs[n] ? "red" : "amber"})"><h3>${esc(nn(n))}</h3><div class="p-free">${rows.length}<small>running</small></div>
+          <div class="p-of" style="margin-top:3px">${mb(sum(rows, "ram_mb"))} RAM · ${mb(sum(rows, "gpu_mb"))} GPU</div></div>`; }).join("")}</div>`);
+    const inNode = cs.filter(c => cnode === "all" || c.node === cnode);
+    P.put(el.querySelector("#p-sy-cn"), [["all", "All", cs.length], ...names.map(n => [n, nn(n), cs.filter(c => c.node === n).length])]
+      .map(([f, label, n]) => H.chip({act: "sys.cnode", arg: f, label, n, on: f === cnode})).join(""));
+    P.put(el.querySelector("#p-sy-ck"), Object.entries(CKIND).map(([k, [label]]) => H.chip({act: "sys.ckind", arg: k, label, n: inNode.filter(c => c.kind === k).length, on: k === ckind})).join(""));
+    const shown = inNode.filter(c => !ckind || c.kind === ckind).sort((a, b) => ((b.ram_mb || 0) + (b.gpu_mb || 0)) - ((a.ram_mb || 0) + (a.gpu_mb || 0)));
+    P.put(list, `<div class="p-list">${shown.length ? shown.map(c => {
+      const [kl, kc, edge] = CKIND[c.kind] || [c.kind, "", ""], [idle, long] = cIdle(c), busy = cbusy.has(cid(c));
+      const bits = [cnode === "all" ? esc(nn(c.node)) : "", c.gpu_mb ? "GPU " + mb(c.gpu_mb) : "", c.started ? "up " + dur(now() - c.started) : "",
+        idle ? (long ? `<span class="p-sy-amb">${esc(idle)}</span>` : esc(idle)) : ""].filter(Boolean).join(" · ");
+      return `<button class="p-row" type="button" data-act="sys.ctr" data-arg="${esc(cid(c))}" style="--c:var(--${long ? "amber" : edge || "grid"})">
+        <span class="p-m"><span class="p-t">${esc(c.name)}</span><span class="p-s">${bits}</span><span class="p-s">${esc(c.owner || "")}</span></span>
+        <span class="p-sy-fig">${fig(mb(c.ram_mb))}${H.tag(busy ? "Stopping" : kl, busy ? "load" : kc)}</span></button>`; }).join("")
+      : `<div class="p-empty">${cs.length ? "No containers match" : "No running containers"}</div>`}</div>`);
+    if(csheet && csheet.open) drawCtr();
+  } };
+P.on("sys.cnode", n => { cnode = n; P.haptic("select"); P.paint(); });
+P.on("sys.ckind", k => { ckind = ckind === k ? "" : k; P.haptic("select"); P.paint(); });
+function drawCtr(){
+  const c = ((P.data.containers || {}).containers || []).find(x => cid(x) === ckey);
+  if(!c){ csheet.set(`<div class="p-empty" style="margin-top:12px">This container is no longer running.</div>`); return; }
+  const [kl, kc] = CKIND[c.kind] || [c.kind, ""], [, long, why] = cIdle(c), busy = cbusy.has(ckey);
+  csheet.set(`<div class="p-wrap" style="gap:6px;margin-top:8px">${H.tag(kl, kc)}${H.tag(nn(c.node))}${long ? H.tag("Idle over 24 h", "warn") : ""}</div>
+    <div class="p-read"><div><b>${mb(c.ram_mb)}</b><span>RAM</span></div><div><b>${mb(c.gpu_mb)}</b><span>GPU memory</span></div>
+      <div><b>${c.started ? esc(dur(now() - c.started)) : "–"}</b><span>Running for</span></div></div>
+    ${dl([["Launched by", c.owner], ["Started", fmtT(c.started)], ["Idle", why], ["Project", c.project || "none"]])}
+    ${c.stoppable ? `<div class="p-pair p-acts"><button class="p-btn red" type="button" data-act="sys.cstop"${busy ? " disabled" : ""}>${busy ? "Stopping" : "Stop"}</button></div>`
+      : c.kind !== "gpu" ? `<p class="p-note">Fleet does not stop this container.</p>`
+      : `<p class="p-note">This is a model server. Unload it on the Models screen, not here.</p>
+         <div class="p-pair p-acts"><button class="p-btn ghost" type="button" data-act="go" data-arg="#/models">Open Models</button></div>`}`);
+}
+P.on("sys.ctr", k => { const c = ((P.data.containers || {}).containers || []).find(x => cid(x) === k); if(!c) return;
+  ckey = k; csheet = P.sheet({title: c.name, sub: c.image, color: (CKIND[c.kind] || [])[2] || "amber", onClose: () => { csheet = null; }});
+  keepCase(csheet); drawCtr(); });
+P.on("sys.cstop", () => P.run(async () => {
+  const k = ckey, i = k.indexOf("/"), node = k.slice(0, i), name = k.slice(i + 1);
+  if(cbusy.has(k)) return;
+  if(!await P.confirm({title: "Stop this container?", sub: `${name} on ${nn(node)}`, danger: true, yes: "Stop",
+    text: "Docker gives it 10 seconds to shut down. It stays down until whatever launched it starts it again."})) return;
+  if(csheet) csheet.close();
+  cbusy.add(k); P.paint();
+  try{ const j = await P.api.post("/api/containers/stop", {node, name}, {timeout: 120000}); P.haptic("success");
+       P.toast(`${name} stopped${j && j.freed_mb != null ? `: ${j.freed_mb} MB freed` : ""}.`); }
+  catch(e){ fail(`Could not stop ${name}`, e); }
+  finally{ cbusy.delete(k); P.refresh(["containers"]); P.paint(); }
+}));
+
+/* ================================================================ Deep Space NAS: hardware and containers, without the station */
+const NAS_FROZEN = ["kopia"];                                 /* L1567: same list as FROZEN in nas_gate.py */
+function nasKind(c){                                           /* L1442: [level, label] from Container Manager's State and Status */
+  const st = c.Status || "";
+  if(c.State === "running") return /unhealthy/.test(st) ? ["bad", "unhealthy"] : /starting/.test(st) ? ["warn", "starting"] : ["ok", /healthy/.test(st) ? "healthy" : "running"];
+  if(c.State === "restarting" || c.State === "paused") return ["warn", c.State];
+  if(c.State === "exited" && /Exited \(0\)/.test(st)) return ["idle", "finished"];   /* one-shot jobs (migrate, init) */
+  return ["bad", c.State || "stopped"];
+}
+const NK = {ok: ["blue", "ready"], warn: ["amber", "warn"], bad: ["red", "fault"], idle: ["", ""]};
+const proj = c => c.Names.split(/[-_]/)[0];
+const nbusy = {};
+let nsheet = null, nname = "";
+function hwPanel(){                                            /* L1537 */
+  const d = P.data.nasstats, s = d && d.stats;
+  if(!s) return `<div class="p-card" style="--c:var(--blue)"><p style="margin:0" class="p-sel">${esc(d && d.error ? "No hardware figures: " + d.error : !d && P.err.nasstats ? P.err.nasstats : "Waiting for the NAS")}</p></div>`;
+  const ramP = 100 * s.mem_used_mb / s.mem_total_mb, hot = (s.temps || []).reduce((m, t) => t.c > m ? t.c : m, -Infinity);
+  const big = Math.max(s.net_rx_bps, s.net_tx_bps) >= 1e6, nf = b => big ? (b / 1e6).toFixed(1) : (b / 1e3).toFixed(0);
+  const lvl = (p, w, c) => p >= c ? "red" : p >= w ? "amber" : "";
+  const row = (l, p, v, c) => `<div class="p-sy-hw"${c ? ` style="--g:var(--${c})"` : ""}><span>${l}</span>${H.gauge(p, 20)}<b>${v}</b></div>`;
+  const up = s.uptime_s, ut = up >= 86400 ? `${Math.floor(up / 86400)} d ${Math.floor(up % 86400 / 3600)} h` : `${Math.floor(up / 3600)} h ${Math.floor(up % 3600 / 60)} min`;
+  return `<div class="p-card" style="--c:var(--blue)">
+    ${row("CPU", s.cpu_pct, s.cpu_pct.toFixed(0) + " %", lvl(s.cpu_pct, 70, 90))}
+    ${row("RAM", ramP, `${(s.mem_used_mb / 1024).toFixed(1)} / ${(s.mem_total_mb / 1024).toFixed(1)} GB`, lvl(ramP, 80, 92))}
+    ${isFinite(hot) ? row("Temp", hot, hot.toFixed(0) + " °C", lvl(hot, 65, 80)) : row("Temp", 0, "No sensor", "")}
+    ${row("Net", 100 * Math.max(s.net_rx_bps, s.net_tx_bps) / 125e6, `↓${nf(s.net_rx_bps)} ↑${nf(s.net_tx_bps)} ${big ? "MB/s" : "kB/s"}`, "")}
+    <div class="p-of" style="margin-top:8px">Load ${esc(s.load[0])} · up ${ut} · ${esc(s.disk.free_gb)} of ${esc(s.disk.total_gb)} GB free</div></div>`;
+}
+P.screens["systems/nas"] = { tab: "systems", title: "Deep Space NAS", color: "blue", parent: "#/systems", needs: {nas: 10000, nasstats: 10000},
+  render(el){
+    synced("nas");
+    const d = P.data.nas, h = P.data.nasstats;
+    let html = H.sec("Hardware", h && h.error ? "Stale" : ""), hw;
+    try{ hw = hwPanel(); }catch(e){ hw = `<div class="p-card" style="--c:var(--blue)"><p style="margin:0">The hardware figures could not be read.</p></div>`; }
+    html += hw;
+    if(!d) html += P.err.nas ? H.msg(P.err.nas, true) : empty("Checking...");
+    else {
+      const cs = d.containers || [], g = {};
+      cs.forEach(c => (g[proj(c)] = g[proj(c)] || []).push(c));
+      html += lost("nas") + (d.error ? H.msg(`The NAS is not answering. Showing the last list. ${d.error}`, true) : "");
+      html += Object.keys(g).sort((a, b) => g[b].length - g[a].length || a.localeCompare(b)).map(k =>   /* biggest project first, ties by name */
+        H.sec(k, `${g[k].filter(c => c.State === "running").length} of ${g[k].length} up`) + `<div class="p-list">${g[k].map(c => { const [lv, label] = nasKind(c), b = nbusy[c.Names];
+          return H.row({act: "sys.nas", arg: c.Names, c: NK[lv][0], t: c.Names, s: c.Status || c.State, tag: b || label, tagc: b ? "load" : NK[lv][1]}); }).join("")}</div>`).join("");
+      if(!cs.length) html += empty("No containers on the NAS");
+    }
+    P.put(el, html);
+    if(nsheet && nsheet.open) drawNas();
+  } };
+function drawNas(){
+  const c = ((P.data.nas || {}).containers || []).find(x => x.Names === nname);
+  if(!c){ nsheet.set(`<div class="p-empty" style="margin-top:12px">This container is no longer on the NAS.</div>`); return; }
+  const [lv, label] = nasKind(c), b = nbusy[c.Names], on = c.State === "running" || c.State === "restarting";
+  const gone = ["exited", "created", "dead"].includes(c.State), frozen = NAS_FROZEN.includes(proj(c));
+  const btn = (a, t, cls, off) => `<button class="p-btn${cls}" type="button" data-act="sys.nact" data-arg="${a}"${b || off ? " disabled" : ""}>${t}</button>`;
+  nsheet.set(`<div class="p-wrap" style="gap:6px;margin-top:8px">${H.tag(b || label, b ? "load" : NK[lv][1])}${H.tag(proj(c))}</div>
+    ${dl([["State", c.State], ["Status", c.Status], ["Project", proj(c)]])}
+    <div class="p-pair p-acts">${on ? btn("stop", "Stop", " red") + btn("restart", "Restart", "") : (gone ? btn("rm", "Delete", " red", frozen) : "") + btn("start", "Start", "")}</div>
+    ${on || !gone ? "" : `<p class="p-note">${frozen ? "Delete is off: this project is frozen and the NAS gate never deletes it. Delete it in DSM Container Manager."
+      : "Delete removes the stopped container. Its volumes stay."}</p>`}`);
+}
+P.on("sys.nas", name => { const c = ((P.data.nas || {}).containers || []).find(x => x.Names === name); if(!c) return;
+  nname = name; nsheet = P.sheet({title: name, sub: c.Image, color: NK[nasKind(c)[0]][0] || "mauve", onClose: () => { nsheet = null; }});
+  keepCase(nsheet); drawNas(); });
+const NACT = {start: ["Starting", "started"], stop: ["Stopping", "stopped"], restart: ["Restarting", "restarted"], rm: ["Deleting", "deleted"]};
+const NASK = {
+  stop: {title: "Stop this container?", yes: "Stop", danger: true, text: "It stays down until it is started again, here or in DSM Container Manager."},
+  restart: {title: "Restart this container?", yes: "Restart", text: "The NAS stops it and starts it again. What it serves is away for a moment."},
+  rm: {title: "Delete this container?", yes: "Delete", danger: true, text: "The stopped container is removed from the NAS. Its volumes stay."} };
+P.on("sys.nact", action => P.run(async () => {
+  const name = nname;
+  if(!NACT[action] || nbusy[name]) return;
+  /* this route takes no Starfleet key: the sheet is the only guard, and only Start goes without it */
+  if(action !== "start" && !await P.confirm(Object.assign({sub: name}, NASK[action]))) return;
+  if(nsheet) nsheet.close();
+  nbusy[name] = NACT[action][0]; P.paint();
+  try{ await P.api.post("/api/nas/control", {target: name, action}, {key: false, timeout: 340000});   /* the gate may take 330 s */
+       P.haptic("success"); P.toast(`${name} ${NACT[action][1]}.`); }
+  catch(e){ fail(`${NACT[action][0]} ${name} failed`, e); }
+  finally{ delete nbusy[name]; P.refresh(["nas"]); P.paint(); }
+}));
+
+/* ================================================================ Memory Alpha: the off-site backup */
+let mabusy = false;
+P.screens["systems/alpha"] = { tab: "systems", title: "Memory Alpha", color: "mauve", parent: "#/systems", needs: {alpha: 15000},
+  render(el){
+    synced("alpha");
+    if(wait(el, "alpha")) return;
+    const d = P.data.alpha, L = d.last || {}, mt = d.maintenance || {}, pol = d.policy || {}, k = pol.keep || {}, man = d.manual || {};
+    const [tag, tagc] = stateTag(d.status), running = man.state === "running", edge = d.status === "ok" ? "mauve" : d.status === "warn" ? "amber" : "red";
+    const note = !d.trigger_ready ? "Needs the kopia-snapshot container: rebuild the kopia project once in DSM Container Manager."
+      : running ? `Started ${ago(man.started)}. Snapshots take 2 to 6 minutes.`
+      : man.started ? `Last manual run ${ago(man.started)}: ${man.exit === 0 ? "completed" : man.exit != null ? `failed (exit ${man.exit})` : "no result"}${man.error ? " · " + man.error : ""}` : "No manual run yet.";
+    P.put(el, `<div class="p-sy-state">${H.tag(tag, tagc)}<span class="p-s">Checked ${esc(fmtT(d.checked))}</span></div>
+      ${lost("alpha")}${notes(d)}
+      ${H.sec("Off-site backup")}<div class="p-sy-pans">
+      ${pan(edge, "Last snapshot", L.end ? `${esc(dur(now() - L.end))}<small>ago</small>` : "–",
+        (L.end ? `${fmtT(L.end)} · took ${dur(L.end - L.start)}` : "No snapshot reported") + (L.description ? " · " + L.description : ""),
+        [["Protected", fmtB(L.size)], ["Files", fmtN(L.files)], ["Folders", fmtN(L.dirs)], ["Errors", L.errors ?? "–"]])}
+      ${pan("mauve", "Stored in Memory Alpha", d.stored ? esc(fmtB(d.stored.bytes)) : "–", d.stored ? `${fmtN(d.stored.count)} blobs, deduplicated and compressed` : "Reported by kopia-check after the DSM rebuild",
+        [["Object lock", !d.maintenance ? "–" : mt.locks ? "Renewed" : "Off"], ["Full maintenance", until(mt.next_full)], ["Quick maintenance", "hourly"]])}
+      ${pan("mauve", "Schedule", d.next_snapshot ? esc(until(d.next_snapshot)) : "–", `${(pol.times || []).length ? "Daily at " + pol.times.join(", ") : "No snapshot time set"} · next ${fmtT(d.next_snapshot)}`,
+        [["Keep latest", k.latest], ["Daily", k.daily], ["Monthly", k.monthly], ["Annual", k.annual]])}
+      <div class="p-card" style="--c:var(--mauve)"><h3>Back up now</h3>
+        <div class="p-pair" style="margin-top:11px"><button class="p-btn" type="button" data-act="sys.backup"${!d.trigger_ready || running || mabusy ? " disabled" : ""}>${running ? "Snapshot running" : mabusy ? "Starting" : "Back up now"}</button></div>
+        <p class="p-note p-sel">${esc(note)}</p></div></div>
+      ${H.sec("Backup containers on the NAS", (d.containers || []).length || "")}
+      <div class="p-list">${(d.containers || []).map(c => info({c: c.state === "running" ? "blue" : "", t: c.name, lines: [esc(c.status)], tag: c.state, tagc: c.state === "running" ? "ready" : ""})).join("")
+        || `<div class="p-empty">No containers reported</div>`}</div>`);
+  } };
+P.on("sys.backup", () => P.run(async () => {
+  if(mabusy) return;
+  if(!await P.confirm({title: "Back up now?", sub: "Memory Alpha", yes: "Start snapshot",
+    text: "Kopia on the NAS snapshots the whole volume into Memory Alpha. Snapshots take 2 to 6 minutes."})) return;
+  mabusy = true; P.paint();
+  try{ await P.api.post("/api/memoryalpha/backup", {}, {timeout: 120000}); P.haptic("success"); P.toast("Snapshot started."); }
+  catch(e){ fail("Back up now failed", e); }
+  finally{ mabusy = false; P.refresh(["alpha"]); P.paint(); }
+}));
+
+/* ================================================================ Defiant: the web server, read only */
+const siteBad = s => !!(s.error || !s.status || (s.status >= 400 && s.status !== 401));    /* 401 = password-protected on purpose */
+P.screens["systems/defiant"] = { tab: "systems", title: "Defiant", color: "peach", parent: "#/systems", needs: {defiant: 15000},
+  render(el){
+    synced("defiant");
+    if(wait(el, "defiant")) return;
+    const d = P.data.defiant;
+    if(d.configured === false){ P.put(el, `<div class="p-sy-state">${H.tag("Not configured")}</div><div class="p-card" style="--c:var(--peach)"><h3>Defiant is not set up</h3>
+      <p class="p-sel">Set FLEET_DEFIANT_HOST, the ssh target of the web server, in the Fleet service environment to enable this view.</p></div>`); return; }
+    const [tag, tagc] = stateTag(d.status), memU = d.mem_total_kb ? (1 - d.mem_avail_kb / d.mem_total_kb) * 100 : null, diskU = d.disk_total ? d.disk_used / d.disk_total * 100 : null;
+    const sc = p => p == null ? "" : p > 90 ? "red" : p > 80 ? "amber" : "", gbi = kb => kb ? (kb / 1048576).toFixed(1) : "–";
+    const hostC = d.status === "ok" ? "peach" : d.status === "warn" ? "amber" : "red", cpuC = sc(Math.max(d.cpu_pct || 0, memU || 0)), diskC = sc(diskU);
+    const sites = d.sites || [], ctrs = d.containers || [];
+    if(d.host == null){ P.put(el, `<div class="p-sy-state">${H.tag(tag, tagc)}</div>${lost("defiant")}${notes(d) || empty("The web server sent no figures")}`); return; }   /* the probe failed: only its error */
+    P.put(el, `<div class="p-sy-state">${H.tag(tag, tagc)}<span class="p-s">${esc(d.os || "")}${d.kernel ? " · kernel " + esc(d.kernel) : ""}</span></div>
+      ${lost("defiant")}${notes(d)}
+      ${d.reboot_required ? H.msg(`Reboot required.${d.updates ? ` ${d.updates} updates are pending.` : ""}`) : ""}
+      ${H.sec("Server")}<div class="p-sy-pans">
+      ${pan(hostC, d.host || "Defiant", d.uptime_s ? `${esc(dur(d.uptime_s))}<small>up</small>` : "–", "",
+        [["Cores", d.cpus || "–"], ["Load", String(d.load || "–").split(" ")[0]], ["Updates", d.updates ?? "–"], ["Reboot", d.reboot_required ? "Required" : "No"]])}
+      <div class="p-card" style="--c:var(--${cpuC || "peach"})"><h3>CPU and memory</h3><div class="p-free">${esc(d.cpu_pct ?? "–")}<small>% CPU</small></div>${gauge(d.cpu_pct, sc(d.cpu_pct))}
+        <div class="p-s wrap">Memory ${memU == null ? "–" : memU.toFixed(0) + " % used"} · ${gbi(d.mem_avail_kb)} of ${gbi(d.mem_total_kb)} GiB free</div>${gauge(memU, sc(memU))}</div>
+      ${pan(diskC || "peach", "Disk and network", `${esc(fmtB(d.disk_used))}<small>of ${esc(fmtB(d.disk_total))}</small>`, "",
+        [["Free", fmtB(d.disk_avail)], ["In", rate(d.rx_bps)], ["Out", rate(d.tx_bps)]], gauge(diskU, diskC))}</div>
+      ${H.sec("Sites", sites.length || "")}<div class="p-list">${sites.map(s => { const bad = siteBad(s), soon = s.cert_days != null && s.cert_days < 14;
+        return info({c: bad ? "red" : soon ? "amber" : "blue", t: s.domain, e: s.error, tag: s.status ? s.status + (s.status === 401 ? " protected" : "") : "down", tagc: bad ? "fault" : "ready",
+          lines: [[s.ms == null ? "" : s.ms + " ms", s.cert_days == null ? "" : `<span${soon ? ' class="p-sy-amb"' : ""}>certificate ${esc(s.cert_days)} days</span>`].filter(Boolean).join(" · "),
+            s.deployed ? "Last deploy " + esc(ago(s.deployed)) : ""]}); }).join("") || `<div class="p-empty">No sites found</div>`}</div>
+      ${H.sec("Containers", ctrs.length || "")}<div class="p-list">${ctrs.map(c => info({c: c.state === "running" ? "blue" : "red", t: c.name, lines: [esc(c.status)], tag: c.state, tagc: c.state === "running" ? "ready" : "fault"})).join("")
+        || `<div class="p-empty">No containers</div>`}</div>`);
+  } };
+})();

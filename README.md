@@ -136,9 +136,11 @@ about placement.
   Core* draws the wiki as one map with the course Computer took through it.
   → [Computer](#computer-a-chat-with-the-resident-model) ·
   [Memory Core](#memory-core-the-wiki-as-a-map)
-- **Goes with you.** The Mac app and an iPhone app open the same page over HTTPS on the
-  tailnet; on the Mac, `⌃⌥C` opens Computer and starts voice input from any app.
-  → [On the Mac and on the iPhone](#on-the-mac-and-on-the-iphone)
+- **Goes with you.** The Mac app and an iPhone app open Fleet over HTTPS on the tailnet;
+  a phone gets an interface of its own, and on the Mac `⌃⌥C` opens Computer and starts
+  voice input from any app.
+  → [On the Mac and on the iPhone](#on-the-mac-and-on-the-iphone) ·
+  [The phone interface](#the-phone-interface)
 - **Stops everything on request.** Red Alert frees both Sparks; Auto Destruct does that
   and then reboots them. → [Red Alert and Auto Destruct](#red-alert-and-auto-destruct)
 - **Keeps the configuration honest.** The cluster's llama-swap config, launchers and
@@ -767,9 +769,71 @@ page's own `localStorage`, as in a browser.
   window is open) opens a short guide: the menu bar icon, the shortcuts, Fleet's
   address, updates and what to do when something is wrong. **About** shows the build's
   commit and the credits.
-- **iPhone:** pull down to reload; when Fleet can't be reached (Tailscale off, head node
+- **iPhone:** pull down to refresh; when Fleet can't be reached (Tailscale off, head node
   down) an error card with Retry, and coming back from the Tailscale app retries by
-  itself. Layout stays inside the safe area.
+  itself. A phone is served [its own interface](#the-phone-interface), not the desktop
+  page.
+
+### The phone interface
+
+<p align="center">
+  <img src="docs/images/phone-interface.png" width="820" alt="The phone interface: Bridge, Models, a model's sheet, Systems, Computer, Memory Core, Command and the Red Alert countdown, as generated test data">
+  <br><sub>Bridge, Models, a model's sheet, Systems, Computer, Memory Core, Command and an armed Red Alert (generated test data).</sub>
+</p>
+
+The desktop page does not shrink well to a phone, so a phone gets an interface of its own:
+[`fleet-ui/padd.html`](fleet-ui/padd.html) with `vendor/padd.css` and `vendor/padd*.js`
+(PADD, after the handheld). Same LCARS colours and type as the desktop page, different
+shapes: a header with an elbow, a tab bar in the rail's colours, bottom sheets where the
+desktop has dialogs, and every touch target at least 44 pixels.
+
+`fleet.py` serves it at `/` to an iPhone or an Android phone and at `/padd` to anyone.
+The desktop page stays at `/desktop`; an iPad and the Mac app keep getting it at `/`.
+`touch fleet-ui/padd.off` hands phones the desktop page again without a restart. Because
+Fleet serves the interface, an update reaches the phone with a pull down to refresh, not
+an app update.
+
+| Tab | What it is for |
+| --- | --- |
+| **Bridge** | The status word in the header (Nominal, Attention, Fault, Sync lost; tap it for the reasons), both nodes with free memory first, loads in progress with Cancel, the queue, the resident models and what needs attention |
+| **Models** | Search and filter chips over every model; a tap opens a sheet with Load and pin, Unload, Cancel, machine, context and thinking effort, and for image and video models machine, Load and Unload |
+| **Computer** | The chat with the resident model, voice first: a large microphone button, tool switches and image attachments, with the chat list and the model choice in sheets |
+| **Systems** | Sessions, [Main Engineering](#main-engineering-every-container-on-both-nodes), [Deep Space NAS](#deep-space-nas-the-nas-containers), [Memory Alpha](#memory-alpha-the-off-site-backup), [Defiant](#defiant-the-web-server) and [Memory Core](#memory-core-the-wiki-as-a-map) |
+| **Command** | The Starfleet key, Red Alert, Auto Destruct, Help and About |
+
+What works differently from the desktop page:
+
+- **Sheets, not dialogs.** Every confirmation is a sheet whose confirming button sits at
+  the bottom, in thumb reach. A confirmation ignores taps in its first moments, so a double
+  tap cannot confirm it.
+- **The key is asked for when an action needs it**, in a sheet, and the action goes ahead
+  once it is accepted. It is kept in the page's `localStorage` like on the desktop and sent
+  only to Fleet. Unloading a loaded model and cancelling a load check it first, because
+  Fleet changes state before it checks.
+- **Red Alert and Auto Destruct arm by sliding.** The countdowns run from the clock, and
+  cancel themselves when the page is hidden or a tick arrives late, so a phone that was
+  locked in the middle cannot carry one out minutes later.
+- **Context and effort** are set when a model starts. On a loaded model the sheet says so,
+  asks, and the model unloads and applies the value at its next load.
+- **Sessions.** What the Mac app reads over ssh, the coding agents on both nodes with
+  their stalled and generating state and the tail of a transcript, comes from
+  `GET /api/computer/sessions` and `/api/computer/sessions/tail`. Both need the Starfleet
+  key: a transcript can hold confidential work. `fleet.py` runs the same two scripts the
+  app does, `~/bin/opencode-status.py` and `opencode-export-tail.py`, on each node.
+
+The app adds what a web page cannot do (`PaddBridge` in
+[`StarfleetApp.swift`](ios/Starfleet/StarfleetApp.swift)): haptics, drawing under the
+status bar and home indicator, links that open in Safari, and pull to refresh that updates
+the data in place. The interface detects the bridge, so it works the same in Safari and in
+an older build of the app.
+
+The tests drive the page in WebKit at iPhone size. Everything is answered from generated
+fixtures, every request that is not a GET is blocked and compared with what the scene
+expects, and the pictures above come from them:
+
+```bash
+PW=<path to the playwright package> node fleet-ui/test/padd-shots.js [name filter]
+```
 
 ### What "pin" actually guarantees
 
@@ -929,7 +993,9 @@ the page does not, and the app does not.
 
 ### Setup
 
-1. Copy `fleet-ui/fleet.py` and `fleet-ui/fleet.html` to the head node and run
+1. Copy `fleet-ui/fleet.py`, `fleet-ui/fleet.html`, `fleet-ui/padd.html`,
+   `fleet-ui/wikicore.py` and `fleet-ui/vendor/` to the head node (`cluster/MANIFEST`
+   lists them for `sync-hosts.sh`) and run
    `python3 fleet.py`. It binds the Tailscale IP by default, so it is reachable from
    your Mac but not the LAN (see `default_host()`); without a tailnet address it falls
    back to loopback, and then `ssh -L 8090:127.0.0.1:8090 <head node>` reaches it. To
@@ -1530,7 +1596,7 @@ Sources/OpencodeMonitor/   the app (the directory keeps the project's original n
   FleetView.swift           the Fleet window (WKWebView), its Dock-icon-on-demand logic, the ⌃⌥C hotkey
   DesktopWidget*.swift      floating panel
   Panel*.swift, GPUStream.swift   the optional USB panel: driver, controller, streamed GPU figures
-ios/                       the iPhone app: Starfleet.xcodeproj, Starfleet/StarfleetApp.swift, the icon
+ios/                       the iPhone app: Starfleet.xcodeproj, Starfleet/StarfleetApp.swift (the web view and PaddBridge), the icon
 package.sh, update.sh      build the Mac app; the self-update both apps get at every start of the Mac app
                             and from Check for Updates
 cluster/                   the cluster's configuration and tooling: the llama-swap config and
@@ -1542,8 +1608,9 @@ cluster/                   the cluster's configuration and tooling: the llama-sw
   systemd/                  the user units and timers
   opencode/                 the opencode plugin
   ds4/                      the single-node ds4 launcher
-fleet-ui/                  Fleet's backend: fleet.py, wikicore.py and fleet.html (vendor/ holds
-                            the page's scripts and styles), copied to the head node
+fleet-ui/                  Fleet's backend: fleet.py, wikicore.py, fleet.html and the phone interface
+                            padd.html (vendor/ holds the pages' scripts and styles, test/ the phone
+                            interface's WebKit tests), copied to the head node
                             (fleet-ui/sounds/ holds your own Red Alert clip and fleet-ui/ds9.jpg an
                             optional NAS backdrop; both stay out of git)
 docs/images/               screenshots of the Fleet views and the USB panel
