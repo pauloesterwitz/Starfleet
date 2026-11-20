@@ -41,6 +41,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import wikicore      # Memory Core view: wiki graph + Computer's wiki trails (read-only)
+import clusterupdate  # "Install updates on Starfleet Cluster": NVIDIA Sync's Update, on both Sparks (clusterupdate.py)
 
 # All llama-swap traffic goes through ctxproxy (:28081). Loads/unloads need the Starfleet key, which this
 # process only passes through from the browser (X-Starfleet-Key) and never stores.
@@ -595,10 +596,10 @@ def red_alert(key):
             "orphans": orphans, "dormant": dormant, "errors": errors, "freed_mb": freed}
 
 
-def _sudo_reboot(host, delay):
+def _sudo_reboot(host, delay, unit="starfleet-autodestruct"):
     """Schedule a graceful reboot (systemd stops units and containers first) `delay` seconds
     out, so this call returns before the machine goes down."""
-    script = f"sudo -n systemd-run --on-active={delay} --unit=starfleet-autodestruct systemctl reboot"
+    script = f"sudo -n systemd-run --on-active={delay} --unit={shlex.quote(unit)} systemctl reboot"
     cmd = ["bash", "-lc", script] if host is None else [
         "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host, script]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
@@ -4001,6 +4002,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, json.dumps(defiant_state()), "application/json")
         if self.path == "/api/containers":
             return self._send(200, json.dumps(containers_state()), "application/json")
+        if self.path == "/api/cluster/update":          # pending updates per Spark + the last/current run
+            return self._send(200, json.dumps(clusterupdate.status()), "application/json")
         if self.path == "/api/nas/stats":
             return self._send(200, json.dumps(nas_stats()), "application/json")
         if self.path == "/ds9.jpg":      # optional real photo; the page falls back to its drawn station
@@ -4161,6 +4164,15 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(502, json.dumps({"error": str(e)[:200]}), "application/json")
             print("MEMORY ALPHA backup started", flush=True)
             ev_audit("Backup started", "A manual off-site backup was started.", go="#/systems/alpha")
+            return self._send(200, json.dumps(res), "application/json")
+        if self.path == "/api/cluster/update":          # Install updates on Starfleet Cluster (needs the key)
+            try:
+                res = clusterupdate.start(key, dry=bool(body.get("dry")))
+            except urllib.error.HTTPError as e:
+                return self._send(403, json.dumps({"error": _err_text(e)}), "application/json")
+            except RuntimeError as e:
+                return self._send(409, json.dumps({"error": str(e)}), "application/json")
+            print(f"CLUSTER UPDATE started: run {res['run']}{' (dry run)' if res['dry'] else ''}", flush=True)
             return self._send(200, json.dumps(res), "application/json")
         if self.path == "/api/engineering/stop":       # multi-select and Cleansing
             try:
@@ -4953,6 +4965,12 @@ def main():
         return selfcheck()
 
     host = a.host or default_host()
+
+    def _cluster_busy():                     # model loads in flight or queued: no cluster update meanwhile
+        with _loading_lock:
+            loading = set(_loading)
+        return sorted(loading | set(_llm_busy) | set(queued_ids()))
+    clusterupdate.init(NODES, key_check, _cluster_busy, _sudo_reboot)
     for fn in (poll_nodes, poll_swap, keepalive, ctx_max_worker, load_queue_worker, ct_worker, events_worker):
         threading.Thread(target=fn, daemon=True).start()
     pins = load_pins()

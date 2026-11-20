@@ -323,11 +323,13 @@ Object.assign(T, { slide: arm,
 const ARROWS = `<svg viewBox="0 0 22 16" aria-hidden="true"><path d="M3 2l6 6-6 6M12 2l6 6-6 6" fill="none" stroke="#000" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
 const panel = (name, c, title, text, label, top) => `<section class="p-card" style="--c:${c}${top ? ";margin-top:6px" : ""}"><h3>${title}</h3><p>${text}</p>
   <div class="p-slide"><button class="p-knob" type="button" data-act="cmd-slide" data-arg="${name}" aria-label="${label} ${title}">${ARROWS}</button><span>${label}</span></div></section>`;
-P.screens.command = { tab: "command", title: "Command", color: "mauve",
+P.sources.cluster = {url: "/api/cluster/update"};     /* pending updates per Spark + the last or current run (clusterupdate.py) */
+P.screens.command = { tab: "command", title: "Command", color: "mauve", needs: {cluster: 10000},
   mount(el){
     el.innerHTML = `${H.sec("Access")}<div id="p-ckey"></div><div id="p-cmsg" style="margin-top:6px"></div>${H.sec("Emergency")}
       ${panel("red", "var(--red)", "Red Alert", "Unloads every model and stops the GPU containers on both Sparks. You get 5 seconds to cancel.", "Slide to arm")}
       ${panel("destruct", "#d06a6a", "Auto Destruct", "Red Alert, then both Sparks reboot. Asks for the authorization code first.", "Slide to begin", 1)}
+      ${H.sec("Maintenance")}<div id="p-cupd"></div>
       <div class="p-pair" style="margin-top:16px"><button class="p-btn sm ghost" type="button" data-act="cmd-help">Help</button>
         <button class="p-btn sm ghost" type="button" data-act="cmd-about">About</button>
         <button class="p-btn sm ghost" type="button" data-act="cmd-desktop">Desktop page</button></div>`;
@@ -345,7 +347,41 @@ P.screens.command = { tab: "command", title: "Command", color: "mauve",
     P.put(el.querySelector("#p-cmsg"), H.row({tall: true, big: true, act: "go", arg: "#/command/messages", c: "mauve", t: "Messages", chev: true,
       s: P.data.events ? (EV.act ? `${EV.act} need${EV.act === 1 ? "s" : ""} you now` : "Nothing needs you now") : P.err.events ? "Cannot read the list" : "Reading the list...",
       tag: EV.unread ? EV.unread + " unread" : "", tagc: "warn"}));
+    P.put(el.querySelector("#p-cupd"), updCard());
   } };
+
+/* ---------------------------------------------------------------- Install updates on Starfleet Cluster
+   NVIDIA Sync's Update for both Sparks: package lists, apt full-upgrade, firmware. A Spark restarts only when it
+   needs to, Kathryn first and Jean-Luc last (Fleet runs there: this page reconnects by itself). Keyed POST. */
+const UPD_NODE = {"jean-luc": "Jean-Luc", "kathryn": "Kathryn"};
+const UPD_STEP = {lists: "Refreshing package lists", packages: "Installing packages", firmware: "Checking firmware"};
+let updBusy = false;
+function updCard(){
+  const d = P.data.cluster, st = (d && d.state) || {phase: "idle"}, pend = (d && d.pending) || {};
+  const run = st.phase === "updating" || st.phase === "rebooting";
+  const rows = Object.keys(UPD_NODE).map(n => {
+    const p = pend[n], x = st.nodes && st.nodes[n];
+    let s = !d ? (P.err.cluster ? "Cannot read" : "Reading...") : !p ? "..." : p.error ? "Not answering"
+      : `${p.pending} update${p.pending === 1 ? "" : "s"} pending${p.reboot_required ? " · restart pending" : ""}`;
+    if(x && run) s = x.state === "running" ? (UPD_STEP[x.step] || "Working") : x.state === "done" ? `Done · ${x.changed ?? 0} packages${x.reboot ? " · restarts" : ""}` : x.state === "failed" ? "Failed" : "Starting";
+    return `<div class="p-facts" style="margin:6px 0 0"><span>${UPD_NODE[n]}</span><b>${esc(s)}</b></div>`;
+  }).join("");
+  const last = st.phase === "updating" ? `Updating since ${new Date(st.started * 1000).toLocaleTimeString()}.`
+    : st.phase === "rebooting" ? (st.note || "Restarting.") : st.finished ? `Last run ${new Date(st.finished * 1000).toLocaleString()}: ${st.note || st.phase}` : "";
+  return `<section class="p-card" style="--c:var(--mauve)"><h3>Software</h3>
+    <p>Installs what NVIDIA Sync's Update installs, on both Sparks. A Spark restarts only if it needs to; models on it stop.</p>
+    ${rows}${last ? `<p style="margin-top:8px">${esc(last)}</p>` : ""}
+    <div class="p-pair" style="margin-top:11px"><button class="p-btn sm" type="button" data-act="cmd-update"${run || updBusy ? " disabled" : ""}>${run ? "Update running" : updBusy ? "Starting..." : "Install updates on Starfleet Cluster"}</button></div></section>`;
+}
+P.on("cmd-update", async () => {
+  if(updBusy) return;
+  if(!await P.confirm({title: "Install updates?", danger: true, yes: "Install",
+    text: "Both Sparks refresh their package lists, install all updates and firmware, like NVIDIA Sync's Update. A Spark that needs it restarts afterwards (Kathryn first, then Jean-Luc), and the models on it stop."})) return;
+  updBusy = true; P.paint();
+  try{ await P.api.post("/api/cluster/update", {}); P.haptic("success"); P.toast("Updates are being installed on both Sparks."); }
+  catch(e){ if(!e.quiet) P.toast("Install updates: " + e.message, "err"); }
+  updBusy = false; P.refresh(["cluster"]);
+});
 P.on("cmd-keyrm", async () => {
   if(!await P.confirm({title: "Remove the Starfleet key?", danger: true, yes: "Remove",
     text: "It is deleted from this device. Fleet asks for it again when an action needs it."})) return;

@@ -126,6 +126,19 @@ td .sub{margin-top:3px;font-size:11px;color:var(--dim);line-height:1.35}
 .st.loading{color:var(--peach)} .st.queued{color:var(--amber)}
 #queuebar{display:none;background:#1a1204;border-left:6px solid var(--amber);color:var(--amber);padding:8px 14px;margin:8px 0;
   font-size:13px;letter-spacing:.08em;text-transform:uppercase}
+/* Software strip under Node Status: pending updates + Install updates on Starfleet Cluster */
+#clup{display:flex;flex-wrap:wrap;align-items:center;gap:6px 12px;background:#0b0803;border-left:8px solid var(--mauve);
+  padding:8px 14px;margin:8px 0 0;font-size:13px;letter-spacing:.06em;text-transform:uppercase;color:var(--dim)}
+#clup b{color:var(--text);font-weight:600} #clup .warn{color:var(--amber)} #clup .ok{color:var(--blue)} #clup .bad{color:var(--red)}
+#clup .grow{flex:1}
+#clup button{font-family:var(--lcars);font-size:13px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;border:0;
+  border-radius:12px;padding:5px 16px;cursor:pointer;background:var(--mauve);color:#000}
+#clup button:hover:not(:disabled){background:var(--peach)}
+#clup button.armed{background:var(--red);animation:adblink 1s steps(2) infinite}
+#clup button:disabled{opacity:.35;cursor:default}
+#clup .run{flex-basis:100%;display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:6px;margin-top:2px}
+#clup .run div{background:#160f06;padding:6px 10px;text-transform:none;letter-spacing:.02em;font-size:12px}
+#clup .run div b{text-transform:uppercase;letter-spacing:.08em}
 .act{text-align:right;white-space:nowrap}
 .act button{font-family:var(--lcars);font-size:12px;font-weight:600;letter-spacing:.08em;
   text-transform:uppercase;border:0;border-radius:11px;padding:4px 14px;margin-left:4px;
@@ -543,6 +556,7 @@ html.fs{scrollbar-width:none} html.fs::-webkit-scrollbar{display:none}
 
     <div class="sec"><div class="cap"></div><h2>Node Status</h2><div class="rule"></div></div>
     <div class="nodes" id="nodes"></div>
+    <div id="clup">Software · reading...</div>
 
     <div class="sec"><div class="cap"></div><h2>Model Registry</h2><div class="rule"></div></div>
     <div class="filter">
@@ -2124,6 +2138,60 @@ if(wantView) setView(wantView);
     if((e.key!=="f"&&e.key!=="F")||e.ctrlKey||e.metaKey||e.altKey||e.repeat) return;
     e.preventDefault(); toggle();
   });
+})();
+
+/* Install updates on Starfleet Cluster: NVIDIA Sync's Update for both Sparks (clusterupdate.py). The strip shows what
+   apt lists as upgradable per Spark and the last or current run; the button needs a second click and the Starfleet
+   key. A Spark restarts only when it needs to (kernel, NVIDIA driver, firmware, or Ubuntu asks for it): Kathryn
+   first, Jean-Luc last, and this page comes back by itself once Fleet is up again. */
+(()=>{
+  const el=document.getElementById("clup"), NODE={"jean-luc":"Jean-Luc","kathryn":"Kathryn"};
+  let d=null, armed=false, armT=null, busy=false, err="", timer=null;
+  const STEP={lists:"refreshing package lists",packages:"installing packages",firmware:"checking firmware"};
+  const when=t=>t?new Date(t*1000).toLocaleString([], {dateStyle:"short",timeStyle:"short"}):"";
+  function paint(){
+    const st=(d&&d.state)||{phase:"idle"}, pend=(d&&d.pending)||{}, run=st.phase==="updating"||st.phase==="rebooting";
+    const pn=Object.keys(NODE).map(n=>{ const p=pend[n];
+      if(!p) return `${NODE[n]} <b>…</b>`;
+      if(p.error) return `${NODE[n]} <span class="bad" title="${esc(p.error)}">not answering</span>`;
+      return `${NODE[n]} <b class="${p.pending?"warn":""}">${p.pending} update${p.pending===1?"":"s"}</b>${p.reboot_required?` <span class="warn">· restart pending</span>`:""}`; }).join(" · ");
+    let last="";
+    if(st.phase==="updating") last=`<span class="warn">Updating since ${when(st.started)}${st.dry?" (dry run)":""}</span>`;
+    else if(st.phase==="rebooting") last=`<span class="warn">${esc(st.note||"Restarting")}</span>`;
+    else if(st.finished) last=`Last run ${when(st.finished)}: <span class="${st.phase==="failed"?"bad":"ok"}">${esc(st.note||st.phase)}</span>`;
+    const label=busy?"Starting...":run?"Update running":armed?"Sure? Update both Sparks":"Install updates on Starfleet Cluster";
+    let html=`<span>Software · ${pn}</span><span class="grow"></span>${last?`<span>${last}</span>`:""}
+      <button type="button" id="clupgo" class="${armed?"armed":""}" ${busy||run?"disabled":""}
+        title="Does what NVIDIA Sync's Update does, on both Sparks: refresh the package lists, apt full-upgrade, firmware. A Spark restarts only if it needs to (Kathryn first, then Jean-Luc); models on it stop. Needs the Starfleet key.">${label}</button>`;
+    if(err) html+=`<div class="run"><div class="bad">${esc(err)}</div></div>`;
+    if(st.nodes&&(run||st.finished&&Date.now()/1000-st.finished<86400)){
+      html+=`<div class="run">`+Object.keys(NODE).map(n=>{ const x=st.nodes[n]; if(!x) return "";
+        const s=x.state==="running"?(STEP[x.step]||"working"):x.state==="done"?`${x.changed??0} package${x.changed===1?"":"s"} updated${x.firmware?" · firmware":""}${x.reboot?" · restart":""}`
+          :x.state==="failed"?`failed${x.exit>0?" (exit "+x.exit+")":""}`:x.state;
+        return `<div><b>${NODE[n]}</b> · <span class="${x.state==="failed"?"bad":x.state==="done"?"ok":"warn"}">${esc(s)}</span>${x.tail&&x.tail.length&&x.state!=="done"?`<br><span title="${esc(x.tail.join("\n"))}">${esc(x.tail[x.tail.length-1])}</span>`:""}${x.packages&&x.state==="done"?`<br><span title="${esc(x.packages)}">${esc(x.packages.slice(0,120))}${x.packages.length>120?"…":""}</span>`:""}</div>`; }).join("")+`</div>`;
+    }
+    el.innerHTML=html;
+    document.getElementById("clupgo").onclick=go;
+  }
+  async function poll(){
+    clearTimeout(timer);
+    try{ d=await (await fetch("/api/cluster/update")).json(); }catch(e){ /* Fleet restarting with Jean-Luc: keep the last view */ }
+    paint();
+    const st=(d&&d.state)||{};
+    timer=setTimeout(poll,st.phase==="updating"||st.phase==="rebooting"?5000:60000);
+  }
+  async function go(){
+    if(!armed){ armed=true; err=""; clearTimeout(armT); armT=setTimeout(()=>{ armed=false; paint(); },8000); paint(); return; }
+    armed=false; busy=true; err=""; paint();
+    try{
+      const r=await fetch("/api/cluster/update",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"});
+      const j=await r.json().catch(()=>({}));
+      if(r.status===403) throw new Error("Starfleet key missing or wrong: enter it above and Save key.");
+      if(!r.ok) throw new Error(j.error||("HTTP "+r.status));
+    }catch(e){ err="Install updates: "+e.message; }
+    busy=false; poll();
+  }
+  poll();
 })();
 </script>
 <script src="/vendor/memcore.js"></script></body></html>
