@@ -1,0 +1,13 @@
+NOTE: This is only a simulation!
+      apt-get needs root privileges for real execution.
+      Keep also in mind that locking is deactivated,
+      so don't depend on the relevance to the real current situation!
+Reading package lists...
+Building dependency tree...
+Reading state information...
+Calculating upgrade...
+The following packages will be upgraded:
+  python3-urllib3
+1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.
+Inst python3-urllib3 [2.4.0-1] (2.4.0-1ubuntu0.1 Ubuntu:26.04/resolute-security [all])
+Conf python3-urllib3 (2.4.0-1ubuntu0.1 Ubuntu:26.04/resolute-security [all])

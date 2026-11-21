@@ -1,0 +1,5 @@
+#!/bin/bash
+# Stands in for passwordless sudo: runs the command as it is.
+echo "$(date +%s.%N) sudo $*" >> "$E2E_HOST/calls.log"
+[ "$1" = -n ] && shift
+exec "$@"

@@ -128,7 +128,9 @@ about placement.
   hardware, with start, stop and restart. → [Deep Space NAS](#deep-space-nas-the-nas-containers)
 - **Watches the off-site backup and the web server.** *Memory Alpha* shows the last
   backup snapshot, its size, the schedule and the object-lock renewal, with a **Back up
-  now** button; *Defiant* shows the web server's health, its sites and certificates.
+  now** button; *Defiant* shows the web server's health, its sites and certificates, and
+  its outstanding system updates (scanned every hour; a critical one goes to Telegram and
+  to the Messages list, with an **Install updates** button).
   → [Memory Alpha](#memory-alpha-the-off-site-backup) · [Defiant](#defiant-the-web-server)
 - **Answers from your own knowledge.** *Computer* chats with the model that is already
   resident (it never loads one), with your wiki, vane and Google search as tools, image
@@ -612,9 +614,83 @@ The ssh target comes from the service environment, `FLEET_DEFIANT_HOST` (for exa
 `user@host` in a systemd drop-in), so no address lives in the code; without it the view
 says it is not configured.
 
+The Defiant view shows the package updates that are waiting on the web server, scans for them every hour, tells you
+when one is critical and has a button that installs them. It works the same on the Mac and on the iPhone, because Fleet
+serves both pages. It is on only when `FLEET_DEFIANT_HOST` is set.
+
+**Scan.** About 45 seconds after Fleet starts (unless the saved scan is younger than 55 minutes), then every hour,
+Fleet runs `apt-get update` and a simulated `apt-get full-upgrade` on Defiant over ssh, and reads whether a reboot is
+waiting. The simulation lists exactly what the install button would do and honours Ubuntu's staged rollout: packages
+that Ubuntu holds back for a while are counted as deferred, not as pending. A scan that fails (usually apt is busy with
+the nightly unattended run) keeps the last good data, shows its error, and is retried after 10 minutes. Scan now asks for
+one at once (no key; refused within a minute of the last one). The result is saved in
+`~/.local/share/fleet-ui/defiant-updates.json` (`FLEET_DEFIANT_UPDATES_FILE` changes the place), so a restart shows data
+at once. A package counts as a security update when one of its suites ends in `-security`; critical means security
+updates are pending or a reboot is waiting.
+
+**Install.** Install updates needs the Starfleet key, which the gate checks (it fails closed). Fleet starts one detached
+systemd unit on Defiant, so a Tailscale or Docker restart in the middle of the upgrade cannot kill it. The unit runs
+`apt-get update` and `apt-get full-upgrade` and keeps the old configuration files. It never removes unused packages
+and never reboots: a reboot stays your decision. Fleet follows the unit every 5 seconds, also after a Fleet restart, and
+treats a lost connection as "retrying" until 30 minutes have passed. When the unit ends, a rescan follows at once. The
+confirm step names the number of updates and any removals, and warns when the list holds Docker, containerd or Tailscale
+(services restart, sites can be unreachable for a few seconds) or the kernel or the C library (a reboot is needed
+afterwards).
+
+**Install guard.** An upgrade can ask apt to remove a package. Fleet decides from its own latest scan, never from the
+request: the unit runs `full-upgrade` with `--no-remove` unless that scan is good (a later scan attempt did not fail),
+recent (under two hours old) and lists removals. With no scan yet, a failed or stale scan, or a scan without removals, apt
+may not remove anything. If apt would have to remove something after all, it stops before it changes anything ("Packages
+need to be removed but remove is disabled", exit 100). The job ends as failed, its last log line says what to do ("Fleet:
+apt would remove packages, nothing was changed. Rescanning now: check the list, then install again."), and a rescan follows
+at once. That line appears only when apt printed its own sentence and dpkg never ran, so a failed upgrade that did change
+packages never claims that nothing was changed. The next scan lists the removal, the confirm step of the next install
+names it, and that install runs without the flag. A refused install also sends the one failure message on Telegram, with
+the same sentence as its last line. Two limits. The guard is all or nothing: when the scan lists removals, the install may
+remove whatever apt plans at that moment (the unit's own `apt-get update` can change the plan, and names are not
+compared), so it protects the case where the scan lists no removals. And it decides when the button is pressed, from the
+latest scan, so a scan that lists new removals between the moment the page was drawn and the click lets that install run
+without the flag.
+
+**Telegram.** One message goes out when a scan is critical and has an entry the last alert did not name (a security
+package with a new version, a new reason for a reboot). Fewer entries than before, or the same scan an hour later, send
+nothing. The first line is the headline (`Defiant: 3 security updates pending`), then up to 25 packages as
+`name from -> to (suite)`, the number of other updates, the packages that want a reboot, and where the Install button is.
+Telegram carries the long text, with the package names, to the phone and the Mac. A failed send is retried at the next
+scan. A failed install sends one message with the last 25 lines of its log; a successful install sends none, the page
+shows it. The sender is `~/telegram-tool/send_progress.py` (`FLEET_TELEGRAM_SEND` changes it).
+
+**Push.** Security updates also open an entry in the Messages list (rule `updates-security`, level act), and when push is
+set up, one push notification: "Security updates waiting", the count (`3 security updates waiting on Defiant.`) and a link
+to the Defiant view. Both texts carry the count only, never a package name. The count can change from scan to scan and
+stays one entry that keeps the count of the moment it opened (the Telegram text, in contrast, is sent again when a new
+security package appears); it opens at the first scan that finds security updates, does not repeat, and resolves when a
+scan finds none (the resolve is a list entry, not a push). Fleet sees a scan up to a few minutes after it ended. The rule waits (it
+neither opens nor closes) while there is no good scan yet or Defiant cannot be reached, and a failed scan, which keeps
+the last good numbers, closes nothing. There is no reminder, because Defiant installs security updates by itself
+overnight and one still waiting after a few hours is normal. Without a push key and a registered phone the entry is
+still written. A waiting reboot stays an in-app message (rule `reboot-needed`) plus the Telegram text, not a push. A
+prefix `updates-security` in the `mute` list of `~/.config/fleet-ui/events.json` turns the rule off.
+
+**Tests.** `python3 test/test_defiant_updates.py` (unit tests of the parser, the alerts, the job, the install guard and
+the push rule; no network, no real command) and the pure self-checks of fleet.py (`_ev_selfcheck` holds the rules of
+the Messages list). `test/e2e-defiant/run.sh` starts the real Fleet against a made-up Defiant (ssh, apt, systemd,
+Docker, Telegram and curl are stand-ins in a sandbox folder) and drives the desktop and phone pages in WebKit. It cannot
+reach a real host, a real Telegram chat or Apple: the events folder, the push device file and the push senders are inside
+or replaced in the sandbox, the shell's push variables are not passed on, and the page stories run WebKit with a dead
+loopback port as proxy, so no connection leaves the machine, not even the font preconnects of the two pages. The stories `security-push` and
+`security-message` shorten the Messages worker's waits in the test wrapper only, and check the push (one, count only, no
+package name), the list entry, that a restart, a Fleet without its saved scan, another count or a failed scan repeat and
+close nothing, and that the install and its rescan resolve the entry without a second push. The page checks are `node test/desktop-defiant.js` and
+`node test/padd-shots.js <scene prefix>` (both need `PW`, the folder of the playwright package, and `OUT`, a folder for
+the pictures).
+
 | Call | Body | Does |
 | --- | --- | --- |
-| `GET /api/defiant` | | host figures, sites with status, response time, certificate and last deploy, containers, problems |
+| `GET /api/defiant` | | host figures, sites with status, response time, certificate and last deploy, containers, problems, a short `upd` summary of the update scan |
+| `GET /api/defiant/updates` | | the last scan (packages, removals, held back, reboot flag, next scan) and the install job (state, log tail) |
+| `POST /api/defiant/updates/scan` | `{}` | asks for a scan now; no key, one a minute |
+| `POST /api/defiant/updates/install` | `{}` | starts the upgrade; 403 without the key, 409 while a scan or an install runs |
 
 ### Computer: a chat with the resident model
 
@@ -1075,6 +1151,8 @@ the page does not, and the app does not.
    | --- | --- |
    | `FLEET_SWAP` | the llama-swap endpoint; default ctxproxy on `:28081` |
    | `FLEET_DEFIANT_HOST` | the ssh target of the [Defiant](#defiant-the-web-server) view; unset, the view says it is not configured |
+   | `FLEET_DEFIANT_UPDATES_FILE` | where Fleet keeps the update scan, the alert it already sent and the install job; default `~/.local/share/fleet-ui/defiant-updates.json` |
+   | `FLEET_TELEGRAM_SEND` | the script that sends an alert (one message, given as its only argument); default `~/telegram-tool/send_progress.py`, which is private and not in this repo |
    | `STARFLEET_AUTODESTRUCT_CODE` | the Auto Destruct code; unset, Auto Destruct answers 503 |
    | `FLEET_IMAGEGEN_REPO` | the image-generation repo whose `presets.py` lists the image and video models; without it there are no image or video rows |
    | `FLEET_COMFYUI_URL` | the ComfyUI the `imagegen` member starts (default: Kathryn, over the fabric) |

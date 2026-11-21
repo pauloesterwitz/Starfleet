@@ -1,0 +1,22 @@
+#!/bin/bash
+# Stands in for ssh. Understands the layout Fleet uses, `ssh -o BatchMode=yes -o ConnectTimeout=N HOST SCRIPT`,
+# and runs SCRIPT with bash inside the sandbox ($E2E_HOST) instead of on a machine. Only the made-up host
+# answers. Every other host is refused the way an unreachable one is (exit 255), so nothing real can be
+# reached through this PATH. The script runs with an empty environment and a PATH of stand-ins.
+H=${E2E_HOST:?}
+while [ $# -gt 0 ]; do case $1 in -o) shift 2 ;; -*) shift ;; *) break ;; esac; done
+host=$1; shift; script="$*"
+log() { printf '%s %s\n' "$(date +%s.%N)" "$*" >> "$H/ssh.log"; }
+if [ "$host" != fake@defiant.example ]; then
+  echo "ssh: Could not resolve hostname ${host##*@}: Name or service not known" >&2; log "refused $host"; exit 255; fi
+if [ "$(date +%s)" -lt "$(cat "$H/ssh-down-until" 2>/dev/null || echo 0)" ]; then      # a dropped Tailscale connection
+  echo "ssh: connect to host defiant.example port 22: Connection timed out" >&2; log "down"; exit 255; fi
+case $script in
+  *"FLEET-SCAN sim"*) kind=scan ;; *systemd-run*) kind=install ;; *ACTIVE:*) kind=poll ;; *'"H:'*) kind=probe ;; *) kind=other ;;
+esac
+shopt -u patsub_replacement 2>/dev/null
+script=${script//\/var\/run\//$H/var/run/}; script=${script//\/var\/log\//$H/var/log/}; script=${script//\/srv\//$H/srv/}      # the host's disk lives in the sandbox
+log "BEGIN $kind"
+env -i PATH="$PATH" HOME="$H" E2E_HOST="$H" bash --noprofile --norc -c "$script"; rc=$?
+log "END $kind $rc"
+exit $rc

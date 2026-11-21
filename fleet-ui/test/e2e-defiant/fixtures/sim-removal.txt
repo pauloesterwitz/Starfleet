@@ -1,0 +1,18 @@
+NOTE: This is only a simulation!
+      apt-get needs root privileges for real execution.
+      Keep also in mind that locking is deactivated,
+      so don't depend on the relevance to the real current situation!
+Reading package lists...
+Building dependency tree...
+Reading state information...
+Calculating upgrade...
+The following packages will be REMOVED:
+  libold-compat1
+The following packages will be upgraded:
+  libssl3t64 openssl
+2 upgraded, 0 newly installed, 1 to remove and 0 not upgraded.
+Remv libold-compat1 [1.4-2]
+Inst libssl3t64 [3.5.1-1ubuntu1] (3.5.1-1ubuntu2 Ubuntu:26.04/resolute-updates, Ubuntu:26.04/resolute-security [arm64]) []
+Inst openssl [3.5.1-1ubuntu1] (3.5.1-1ubuntu2 Ubuntu:26.04/resolute-updates, Ubuntu:26.04/resolute-security [arm64])
+Conf libssl3t64 (3.5.1-1ubuntu2 Ubuntu:26.04/resolute-updates, Ubuntu:26.04/resolute-security [arm64])
+Conf openssl (3.5.1-1ubuntu2 Ubuntu:26.04/resolute-updates, Ubuntu:26.04/resolute-security [arm64])

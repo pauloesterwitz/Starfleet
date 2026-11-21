@@ -1,0 +1,7 @@
+#!/bin/bash
+# Stands in for curl, which Fleet's push sender runs to reach Apple: records the call (never its arguments: they can
+# carry a device token) and fails like a host that cannot be reached. The wrapper already replaces the senders; this
+# is the second wall.
+echo "$(date +%s.%N) curl" >> "$E2E_HOST/calls.log"
+echo "curl: (7) Failed to connect: there is no network in the end to end test" >&2
+exit 7

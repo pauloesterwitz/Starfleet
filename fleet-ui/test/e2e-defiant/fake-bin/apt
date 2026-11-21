@@ -1,0 +1,8 @@
+#!/bin/bash
+# Stands in for `apt list --upgradable` (the probe's count of updates): one line per package in apt-sim.txt,
+# the ones held back by phasing included, as the real one lists them.
+[ "$1 $2" = "list --upgradable" ] || exit 1
+echo "Listing..."
+awk '/^Inst .* \[/ { v = $3; gsub(/[][]/, "", v); print $2 "/resolute-updates 9.9 arm64 [upgradable from: " v "]" }
+     /^The following upgrades have been deferred/ { held = 1; next }  /^[^ ]/ { held = 0 }
+     held { for (i = 1; i <= NF; i++) print $i "/resolute-updates 9.9 arm64 [upgradable from: 1.0]" }' "$E2E_HOST/apt-sim.txt"

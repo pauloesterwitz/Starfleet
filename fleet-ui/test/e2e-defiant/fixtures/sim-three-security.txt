@@ -1,0 +1,23 @@
+NOTE: This is only a simulation!
+      apt-get needs root privileges for real execution.
+      Keep also in mind that locking is deactivated,
+      so don't depend on the relevance to the real current situation!
+Reading package lists...
+Building dependency tree...
+Reading state information...
+Calculating upgrade...
+The following upgrades have been deferred due to phasing:
+  distro-info
+The following packages will be upgraded:
+  curl libcurl4t64 libssl3t64 openssl tzdata
+5 upgraded, 0 newly installed, 0 to remove and 1 not upgraded.
+Inst libssl3t64 [3.5.1-1ubuntu1] (3.5.1-1ubuntu2 Ubuntu:26.04/resolute-updates, Ubuntu:26.04/resolute-security [arm64]) []
+Inst openssl [3.5.1-1ubuntu1] (3.5.1-1ubuntu2 Ubuntu:26.04/resolute-updates, Ubuntu:26.04/resolute-security [arm64])
+Inst curl [8.14.1-2ubuntu1] (8.14.1-2ubuntu2 Ubuntu:26.04/resolute-updates, Ubuntu:26.04/resolute-security [arm64]) []
+Inst libcurl4t64 [8.14.1-2ubuntu1] (8.14.1-2ubuntu2 Ubuntu:26.04/resolute-updates [arm64])
+Inst tzdata [2025b-5ubuntu1] (2025c-0ubuntu1 Ubuntu:26.04/resolute-updates [all])
+Conf libssl3t64 (3.5.1-1ubuntu2 Ubuntu:26.04/resolute-updates, Ubuntu:26.04/resolute-security [arm64])
+Conf openssl (3.5.1-1ubuntu2 Ubuntu:26.04/resolute-updates, Ubuntu:26.04/resolute-security [arm64])
+Conf curl (8.14.1-2ubuntu2 Ubuntu:26.04/resolute-updates, Ubuntu:26.04/resolute-security [arm64])
+Conf libcurl4t64 (8.14.1-2ubuntu2 Ubuntu:26.04/resolute-updates [arm64])
+Conf tzdata (2025c-0ubuntu1 Ubuntu:26.04/resolute-updates [all])

@@ -2546,10 +2546,545 @@ def defiant_state(force=False):
         for c in d["containers"]:
             if c["state"] != "running":
                 problems.append(f"container {c['name']} is {c['state']}")
+        d["upd"] = defiant_updates_summary()          # from memory: the hourly scan below, never ssh
+        if d["upd"] and d["upd"]["security"]:
+            problems.append(f"{d['upd']['security']} security update{'' if d['upd']['security'] == 1 else 's'} pending")
         d["problems"], d["errors"] = problems, errors
         d["status"] = "error" if errors else "warn" if problems else "ok"
         _DEF["data"], _DEF["at"] = d, now
         return dict(d, at=now)
+
+
+# ---------------------------------------------------------------- Defiant updates
+
+# Outstanding package updates on Defiant. An hourly scan over ssh simulates a full-upgrade, so the list is exactly
+# what the install button would do and honours Ubuntu's staged rollout (phasing). A critical state (a security
+# update, or a reboot waiting) goes out once as one Telegram message: its first line is the short headline, the
+# rest is the long detail (the sender puts its own title and a timestamp above the text; Telegram carries it to
+# the phone and the Mac). The install runs as one detached systemd unit on Defiant, so a Tailscale or Docker
+# restart cannot kill it halfway. It never reboots, and it may remove a package only when the last scan (a good,
+# recent one) listed removals.
+# Everything the host prints is untrusted: it is parsed strictly, capped in size and escaped where it is shown.
+# One lock guards the state; it is never held across ssh, Telegram or a sleep, so the 20 second probe above
+# never waits for any of this.
+UPD_FILE = os.path.expanduser(os.environ.get("FLEET_DEFIANT_UPDATES_FILE", "~/.local/share/fleet-ui/defiant-updates.json"))
+TELEGRAM_SEND = os.path.expanduser(os.environ.get("FLEET_TELEGRAM_SEND", "~/telegram-tool/send_progress.py"))
+UPD_EVERY = 3600          # seconds from the last scan attempt to the next
+UPD_RETRY = 10 * 60       # ... after a FAILED scan: the usual cause (apt busy with the nightly run) is gone in minutes
+UPD_FIRST = 45           # the first scan comes this long after start, unless the saved one is younger than UPD_FRESH
+UPD_FRESH = 55 * 60
+UPD_GAP = 60              # a requested scan is refused when the last attempt started less than this ago
+UPD_LOST = 30 * 60        # an install that cannot be polled for this long counts as failed
+UPD_MAX = 500             # packages kept in a scan; its count stays the true number
+UPD_UNIT, UPD_LOG = "fleet-apt-upgrade", "/var/log/fleet-apt-upgrade.log"
+
+# What runs on Defiant (fixed strings, no input goes into them). LC_ALL=C keeps apt's wording the one parsed below.
+UPD_SCAN = r"""export LC_ALL=C
+u=$(timeout 240 sudo -n apt-get -qq update 2>&1); echo "FLEET-SCAN update $?"; echo "$u" | tail -n 8
+echo "FLEET-SCAN sim"; apt-get -s -o Debug::NoLocking=1 full-upgrade 2>&1
+echo "FLEET-SCAN reboot $([ -f /var/run/reboot-required ] && echo yes || echo no)"
+echo "FLEET-SCAN rebootpkgs"; cat /var/run/reboot-required.pkgs 2>/dev/null
+echo FLEET-SCAN end"""
+def upd_start(allow_remove):
+    """The command that starts the install unit, in its two fixed variants (nothing from a request goes into it). The unit's
+    own script has no autoremove (unattended-upgrades handles old kernels) and no reboot. Without allow_remove its
+    full-upgrade gets --no-remove: apt then stops before it changes anything ("Packages need to be removed but remove is
+    disabled", exit 100) instead of removing a package nobody was shown.
+    truncate: opens the log once and empties it, and stderr shares that open file, so the log is this run's alone.
+    file: would not truncate: a shorter run leaves the end of the previous log behind, its exit line included."""
+    run = ('echo "FLEET-APT-START $(date +%s)"; apt-get -o DPkg::Lock::Timeout=600 -qq update; '
+           'apt-get -o DPkg::Lock::Timeout=600 -y -o Dpkg::Options::=--force-confold ' + ("" if allow_remove else "--no-remove ") +
+           'full-upgrade; rc=$?; echo "FLEET-APT-EXIT $rc $(date +%s)"; exit $rc')
+    return f"""if systemctl is-active --quiet {UPD_UNIT}; then echo FLEET-BUSY; exit 0; fi
+sudo -n systemd-run --unit={UPD_UNIT} --collect -p StandardOutput=truncate:{UPD_LOG} -p StandardError=inherit -E DEBIAN_FRONTEND=noninteractive -E NEEDRESTART_MODE=a -E LC_ALL=C /bin/sh -c '{run}' 2>&1
+echo FLEET-RC:$?"""
+# is-active is asked first: a unit that just ended has written its exit line before it reads as inactive.
+UPD_POLL = f"""export LC_ALL=C; l={UPD_LOG}
+echo "ACTIVE:$(systemctl is-active {UPD_UNIT} 2>&1 | head -n 1)"
+echo "SETUP:$(grep -c '^Setting up ' $l 2>/dev/null)"
+echo "SUMMARY:$(grep -m 1 -E '^[0-9]+ upgraded, [0-9]+ newly installed' $l 2>/dev/null)"
+echo "REBOOT:$([ -f /var/run/reboot-required ] && echo yes || echo no)"
+echo LOG:; tail -n 40 $l 2>/dev/null"""
+
+
+def _def_ssh(script, timeout):
+    return subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", DEFIANT_HOST, script],
+                          capture_output=True, text=True, errors="replace", timeout=timeout, stdin=subprocess.DEVNULL)
+
+
+def _clean(s, n):
+    """Text from another host: control characters removed, length capped."""
+    return re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "", str(s))[:n]
+
+
+# ---- parsing what the host printed (pure)
+
+_APT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9+.:_~-]{0,127}")      # a package name or a version
+_APT_INST = re.compile(r"Inst (\S+)(?: \[([^\]]*)\])? \((\S+)(?: (.*))?\)")
+_APT_SUMMARY = re.compile(r"([0-9]{1,6}) upgraded, ([0-9]{1,6}) newly installed, "
+                          r"([0-9]{1,6}) to remove and ([0-9]{1,6}) not upgraded")
+_JOB_EXIT = re.compile(r"FLEET-APT-EXIT (-?[0-9]{1,4})\b(.*)")
+
+
+def _ubuntu_label(label):
+    return label == "Ubuntu" or label.startswith("UbuntuESM")      # the Pro archives (UbuntuESMApps...) are Ubuntu's too
+
+
+def _apt_package(m):
+    """One Inst line -> a package, or None when it is not shaped like one. The release part reads
+    'Ubuntu:26.04/resolute-updates, Ubuntu:26.04/resolute-security [arm64]': per source a label (apt's origin),
+    a version and the archive (the suite), or just a host name for a source without a release file."""
+    name, old, new, rel = m.groups()
+    if not (_APT_NAME.fullmatch(name) and _APT_NAME.fullmatch(new) and (old is None or _APT_NAME.fullmatch(old))):
+        return None
+    labels, suites = [], []
+    for part in re.sub(r"\s*\[[^\]]*\]\s*$", "", rel or "").split(", "):
+        label, sep, rest = part.partition(":")
+        if not sep:
+            label, rest = "", part
+        suite = _clean(rest.rpartition("/")[2], 80).strip()
+        if label.strip():
+            labels.append(_clean(label, 60).strip())
+        if suite and suite not in suites:
+            suites.append(suite)
+    ubuntu = [l for l in labels if _ubuntu_label(l)]
+    return {"name": name, "from": old, "to": new, "suites": suites[:8], "origin": (ubuntu or labels or [None])[0],
+            "security": any(s.endswith("-security") for s in suites), "third_party": bool(labels) and not ubuntu}
+
+
+def parse_apt_sim(text):
+    """`apt-get -s full-upgrade` output (LC_ALL=C) -> {packages, remove, deferred, summary}. Lines it does not know
+    are skipped, nothing is invented. deferred = held back by phasing or kept back; summary = apt's closing line
+    as (upgraded, newly installed, to remove, not upgraded), None when apt never got that far."""
+    out, block = {"packages": [], "remove": [], "deferred": [], "summary": None}, None
+    for line in text.splitlines():
+        if len(line) > 2000:
+            continue
+        if line.startswith((" ", "\t")):                  # the wrapped names under a "The following ...:" header
+            if block is not None and len(block) < 1000:
+                block.extend(n for n in line.split() if _APT_NAME.fullmatch(n))
+            continue
+        block = None
+        if line.startswith("Inst "):
+            m = _APT_INST.match(line)
+            p = m and _apt_package(m)
+            if p:
+                out["packages"].append(p)
+        elif line.startswith(("Remv ", "Purg ")):
+            n = line.split()[1:2]
+            if n and _APT_NAME.fullmatch(n[0]):
+                out["remove"].append(n[0])
+        elif line.startswith("The following") and line.rstrip().endswith(":"):
+            if "deferred due to phasing" in line or "kept back" in line:
+                block = out["deferred"]
+        else:
+            m = _APT_SUMMARY.match(line)
+            if m:
+                out["summary"] = tuple(int(g) for g in m.groups())
+    out["deferred"] = list(dict.fromkeys(out["deferred"]))[:300]
+    out["remove"] = out["remove"][:200]
+    return out
+
+
+def parse_scan_output(text):
+    """The scan script's output -> the scan fields (times are the caller's). ValueError with a short reason when
+    the output cannot be trusted: a scan that cannot be trusted fails and the last good one stays."""
+    sec, cur = {}, None
+    for line in text.splitlines():
+        m = re.fullmatch(r"FLEET-SCAN (update|sim|reboot|rebootpkgs|end)(?: (.*))?", line)
+        if m:
+            cur = m.group(1)
+            sec[cur] = [m.group(2) or ""]                  # the marker's own argument comes first
+        elif cur:
+            sec[cur].append(line)
+    if not {"update", "sim", "end"} <= set(sec):
+        raise ValueError("scan output incomplete")
+    rc = sec["update"][0].strip()
+    if rc != "0":                                         # the lock held by another apt lands here too
+        said = [l.strip() for l in sec["update"][1:] if l.strip()]
+        raise ValueError(_clean("apt-get update failed (exit %s): %s" % (rc, next(
+            (l for l in said if l.startswith(("E:", "sudo:"))), said[0] if said else "")), 200))
+    sim = parse_apt_sim("\n".join(sec["sim"][1:]))
+    if sim["summary"] is None:
+        err = next((l for l in sec["sim"][1:] if l.startswith("E:")), "no result line")
+        raise ValueError(_clean("apt simulation did not finish: " + err, 200))
+    todo = sim["summary"][0] + sim["summary"][1]
+    if todo and not sim["packages"]:                      # apt format drift must fail loudly, never read as "all up to date"
+        raise ValueError("apt output not understood: %d updates reported, none parsed" % todo)
+    pk = sorted(sim["packages"], key=lambda p: (not p["security"], p["name"]))
+    pkgs = [l.strip() for l in sec.get("rebootpkgs", [""])[1:] if _APT_NAME.fullmatch(l.strip())]
+    return {"count": max(len(pk), todo), "security": sum(p["security"] for p in pk), "packages": pk[:UPD_MAX],
+            "remove": sim["remove"], "deferred": sim["deferred"],
+            "reboot_required": sec.get("reboot", [""])[0].strip() == "yes", "reboot_pkgs": list(dict.fromkeys(pkgs))[:50]}
+
+
+def parse_job_probe(text):
+    """The poll script's output -> {active, setup, summary, reboot, log}; None when it never reached its LOG: line
+    (ssh failed, so there was no contact)."""
+    obs, lines = {"active": "", "setup": None, "summary": None, "reboot": None, "log": []}, text.splitlines()
+    for i, line in enumerate(lines):
+        if line == "LOG:":
+            obs["log"] = [_clean(l, 300) for l in lines[i + 1:]][-40:]
+            return obs
+        k, _, v = line.partition(":")
+        v = v.strip()
+        if k == "ACTIVE":
+            obs["active"] = v
+        elif k == "SETUP":
+            obs["setup"] = int(v) if re.fullmatch(r"[0-9]{1,6}", v) else None
+        elif k == "SUMMARY":
+            m = _APT_SUMMARY.match(v)
+            obs["summary"] = (int(m.group(1)), int(m.group(2))) if m else None
+        elif k == "REBOOT":
+            obs["reboot"] = {"yes": True, "no": False}.get(v)
+    return None
+
+
+# ---- the install job, alerts (pure)
+
+def _upd_installed(obs):
+    """Packages the log says were installed: apt's own "N upgraded, M newly installed" line, else the Setting up
+    lines. None when the log says neither (never a guess)."""
+    if obs["summary"]:
+        return obs["summary"][0] + obs["summary"][1]
+    return obs["setup"] or None
+
+
+_UNIT_UP = ("active", "activating", "reloading", "deactivating")      # what `systemctl is-active` prints for a unit that is alive
+_UNIT_GONE = ("inactive", "failed")                                    # ... and for one that ended (collected: usually inactive)
+UPD_NO_REMOVE_HINT = "Fleet: apt would remove packages, nothing was changed. Rescanning now: check the list, then install again."      # 106 characters: under the 110 that upd_fail_text keeps per line
+
+
+def upd_allow_remove(scan, now):
+    """May the install remove packages? Only when the latest scan attempt worked, is less than two scan intervals old
+    and lists removals: the confirm text named them, so the person has seen them. No good scan (none yet, or only the
+    error stub), a scan that a later attempt failed on or that is stale (Fleet cannot tell what apt would do now) and
+    a scan with nothing to remove say no. A yes allows whatever apt then plans: names are not compared."""
+    return bool(scan and scan.get("at") is not None and scan.get("remove") and scan.get("error") is None and now - scan["at"] < 2 * UPD_EVERY)
+
+
+def upd_job_step(job, obs, now):
+    """The install job after one poll. obs comes from parse_job_probe, or is None when Defiant could not be reached:
+    that keeps the job running (a Tailscale restart in the middle of the upgrade lands here) until UPD_LOST passed.
+    A unit state that is none of the words above (an error text from systemd, nothing at all) is no answer either."""
+    job = dict(job)
+    if obs is None or obs["active"] not in _UNIT_UP + _UNIT_GONE:
+        job["lost"] = True
+        if now - (job["contact_at"] or job["started_at"] or now) > UPD_LOST:
+            job.update(state="failed", ended_at=now, log=job["log"][-39:] + ["fleet: lost contact with the host for 30 minutes"])
+        return job
+    job.update(lost=False, contact_at=now, log=obs["log"])
+    t0 = job["started_at"] or now
+    x = next((x for x in map(_JOB_EXIT.match, reversed(obs["log"])) if x), None)
+    at = x and re.fullmatch(r"\s*([0-9]{1,11})\s*", x.group(2))
+    at = float(at.group(1)) if at else None
+    if x and (at is None or at >= t0 - 5):         # an exit line stamped before this install began is an earlier run's, left in the log
+        rc = int(x.group(1))
+        job.update(state="done" if rc == 0 else "failed", exit=rc, ended_at=at if at is not None and at <= now + 5 else now,
+                   reboot_required=obs["reboot"], installed=_upd_installed(obs) if rc == 0 else None)
+        if (rc and any(l.startswith("E: Packages need to be removed but remove is disabled") for l in obs["log"])
+                and not any(l.startswith(("Unpacking ", "Setting up ", "Removing ")) for l in obs["log"])):
+            job["log"] = obs["log"][-39:] + [UPD_NO_REMOVE_HINT]       # apt's own refusal and dpkg never ran, so nothing was changed: say what to do next
+    elif obs["active"] in _UNIT_GONE and now - t0 > 20:
+        job.update(state="failed", ended_at=now, reboot_required=obs["reboot"],
+                   log=obs["log"][-39:] + ["fleet: the unit ended without an exit line"])
+    return job
+
+
+def upd_signature(scan):
+    """What an alert is about, as sorted entries: the security packages with their new versions (name=version) and,
+    when a reboot is due, the packages that want it (reboot:name). "" = not critical."""
+    items = {"%s=%s" % (p["name"], p["to"]) for p in scan["packages"] if p["security"]}
+    if scan["reboot_required"]:
+        items.update("reboot:" + n for n in scan["reboot_pkgs"] or [""])
+    return ",".join(sorted(items))
+
+
+def upd_alert_decision(scan, sent):
+    """'send' when the scan is critical and has an entry the last alert did not name: a package that is new or has
+    a new version, a new reason for a reboot. Fewer entries than before (some got installed) is no news, so a
+    restart or the next hourly scan never repeats an alert. 'clear' when it is not critical any more (so a later
+    one alerts again), else None."""
+    if scan["security"] <= 0 and not scan["reboot_required"]:
+        return "clear" if sent else None
+    return "send" if set(upd_signature(scan).split(",")) - set(sent.split(",") if sent else ()) else None
+
+
+def _upd_line(p):
+    suite = next((s for s in p["suites"] if s.endswith("-security")), p["suites"][0] if p["suites"] else "")
+    return _clean("%s%s -> %s%s" % (p["name"], " " + p["from"] if p["from"] else "", p["to"], " (%s)" % suite if suite else ""), 110)
+
+
+def upd_alert_text(scan):
+    """Line 1 is the headline (at most 100 characters), then the detail. The sender puts its own title and a
+    timestamp above this text, so the headline is the first line of the text, not of the notification."""
+    n, reboot = scan["security"], scan["reboot_required"]
+    head = (["%d security update%s pending" % (n, "" if n == 1 else "s")] if n else []) + (["reboot required"] if reboot else [])
+    shown = [p for p in scan["packages"] if p["security"]][:25]
+    lines = ["Defiant: " + ", ".join(head), ""] + [_upd_line(p) for p in shown]
+    if n > len(shown):
+        lines.append("+%d more" % (n - len(shown)))
+    if scan["count"] > n:
+        lines.append("Other updates: %d" % (scan["count"] - n))
+    if reboot and scan["reboot_pkgs"]:
+        lines.append("Reboot required: " + _clean(", ".join(scan["reboot_pkgs"][:8]), 300))
+    return "\n".join(lines + ["Install: Starfleet, Systems, Defiant, Install updates"])
+
+
+def upd_fail_text(job):
+    code = " (exit %d)" % job["exit"] if job["exit"] is not None else ""
+    return "Defiant: update install failed%s\n\n%s" % (code, "\n".join(_clean(l, 110) for l in job["log"][-25:]))
+
+
+# ---- state: memory, one lock, one file
+
+def _upd_job_idle():
+    return {"state": "idle", "started_at": None, "ended_at": None, "exit": None, "log": [], "lost": False,
+            "installed": None, "reboot_required": None, "contact_at": None}     # contact_at stays inside, the API leaves it out
+
+
+def _upd_fresh():
+    return {"scan": None, "alerted": {}, "job": _upd_job_idle(), "busy": False, "starting": False, "want": False,
+            "started": 0.0, "next_at": 0.0, "first_err": None}
+
+
+_UPD = _upd_fresh()        # scan, alerted and job are saved; the rest lives in memory only
+_UPD_LOCK = threading.Lock()
+_UPD_WAKE = threading.Event()
+_SCAN_KEYS = ("at", "error", "error_at", "count", "security", "packages", "remove", "deferred", "reboot_required", "reboot_pkgs")
+_PKG_KEYS = ("name", "from", "to", "suites", "origin", "security", "third_party")
+
+
+def _upd_save_locked():
+    """Write the saved state atomically. The caller holds _UPD_LOCK. Never raises: a full disk must not stop the worker."""
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(UPD_FILE)), exist_ok=True)
+        with open(UPD_FILE + ".tmp", "w") as f:
+            json.dump({"scan": _UPD["scan"], "alerted": _UPD["alerted"], "job": _UPD["job"]}, f)
+        os.replace(UPD_FILE + ".tmp", UPD_FILE)
+    except OSError as e:
+        print(f"defiant updates: not saved: {e}", flush=True)
+
+
+def _upd_scan_ok(s):
+    t = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool) and abs(v) < 1e12      # an epoch second, not NaN or absurd
+    return (isinstance(s, dict) and all(k in s for k in _SCAN_KEYS) and t(s["at"]) and (s["error_at"] is None or t(s["error_at"]))
+            and (s["error"] is None or isinstance(s["error"], str)) and isinstance(s["reboot_required"], bool)
+            and all(isinstance(s[k], int) for k in ("count", "security"))
+            and all(isinstance(s[k], list) for k in ("packages", "remove", "deferred", "reboot_pkgs"))
+            and all(isinstance(p, dict) and all(k in p for k in _PKG_KEYS) for p in s["packages"]))
+
+
+def defiant_updates_load():
+    """Restore the saved state at start, so the page has data at once after a restart. A file that is missing or
+    does not look right is ignored."""
+    try:
+        with open(UPD_FILE) as f:
+            saved = json.load(f)
+        scan, job, alerted = saved["scan"], saved["job"], saved["alerted"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return
+    with _UPD_LOCK:
+        if _upd_scan_ok(scan):
+            _UPD["scan"] = scan
+        if isinstance(alerted, dict) and isinstance(alerted.get("sig"), str):
+            _UPD["alerted"] = {"sig": alerted["sig"], "at": alerted.get("at")}
+        idle = _upd_job_idle()
+        if isinstance(job, dict) and job.get("state") in ("running", "done", "failed") and isinstance(job.get("log"), list):
+            j = dict(idle, **{k: v for k, v in job.items() if k in idle})
+            j["log"] = [str(l)[:300] for l in j["log"]][-40:]
+            if j["state"] != "running":
+                _UPD["job"] = j
+            elif isinstance(j["started_at"], (int, float)):
+                _UPD["job"] = dict(j, contact_at=time.time())          # a Fleet restart is not lost contact
+
+
+def defiant_updates_view():
+    """GET /api/defiant/updates: served from memory, no ssh in the request."""
+    if not DEFIANT_HOST:
+        return {"configured": False}
+    with _UPD_LOCK:
+        scan, job, busy, next_at, first = _UPD["scan"], _UPD["job"], _UPD["busy"], _UPD["next_at"], _UPD["first_err"]
+    if not scan and (busy or first):      # no good scan yet: say that it is running, or why the first one failed
+        scan = {"at": None, "error": first and first[0], "error_at": first and first[1], "count": 0, "security": 0,
+                "packages": [], "remove": [], "deferred": [], "reboot_required": False, "reboot_pkgs": []}
+    return {"configured": True, "now": time.time(), "scan": dict(scan, next_at=next_at, busy=busy) if scan else None,
+            "critical": bool(scan and (scan["security"] > 0 or scan["reboot_required"])),
+            "job": {k: v for k, v in job.items() if k != "contact_at"}}
+
+
+def defiant_updates_summary():
+    """The short form for /api/defiant: None until the first successful scan."""
+    with _UPD_LOCK:
+        scan, job = _UPD["scan"], _UPD["job"]
+    if not scan:
+        return None
+    return {"count": scan["count"], "security": scan["security"], "deferred": len(scan["deferred"]),
+            "remove": len(scan["remove"]), "scan_at": scan["at"], "job_state": job["state"]}
+
+
+def defiant_updates_scan_request():
+    """POST /api/defiant/updates/scan: asks the worker for a scan; the scan itself never runs in the caller's thread."""
+    if not DEFIANT_HOST:
+        raise ValueError("Defiant is not configured.")
+    with _UPD_LOCK:
+        if _UPD["busy"] or _UPD["starting"] or _UPD["job"]["state"] == "running":
+            return {"ok": True, "started": False, "reason": "busy"}
+        if time.time() - _UPD["started"] < UPD_GAP:
+            return {"ok": True, "started": False, "reason": "recent"}
+        _UPD["busy"] = _UPD["want"] = True               # the page shows "Scanning..." at once
+    _UPD_WAKE.set()
+    return {"ok": True, "started": True}
+
+
+def defiant_updates_install(key):
+    """POST /api/defiant/updates/install: start the upgrade on Defiant as one detached systemd unit. Needs the
+    Starfleet key. It runs root commands on another machine, so the key is checked by ctxproxy's own check, which
+    fails closed (key_check lets any key through when no idle model is known). It touches no model, container or
+    llama-swap member. A unit that is already running, or may be because ssh timed out, is answered with an error
+    but followed from then on as the install job. The unit may remove packages only when Fleet's own latest scan is
+    good, recent and lists removals (upd_allow_remove); else apt is told --no-remove and the job ends failed, with a hint."""
+    computer_auth(key)
+    if not DEFIANT_HOST:
+        raise ValueError("Defiant is not configured.")
+    now = time.time()
+    with _UPD_LOCK:
+        if _UPD["job"]["state"] == "running" or _UPD["starting"]:
+            raise PermissionError("An update is already running.")
+        if _UPD["busy"]:
+            raise PermissionError("A scan is running. Try again in a minute.")
+        _UPD["starting"] = True      # a second click gets the 409, and the worker neither polls nor scans until the unit is up
+        start = upd_start(upd_allow_remove(_UPD["scan"], now))      # apt may remove packages only when the latest scan is good, recent and lists removals
+    live = False                     # the unit runs, or may run, on Defiant: the worker watches it from here on, whoever started it
+    try:
+        r = _def_ssh(start, 40)
+        if "FLEET-BUSY" in r.stdout:
+            live = True              # a unit Fleet knew nothing of (it restarted during the start, or the answer got lost)
+            raise PermissionError("The update unit is already running on Defiant.")
+        if "FLEET-RC:0" not in r.stdout:
+            raise OSError(_clean(" ".join((r.stdout + r.stderr).split()) or f"ssh exit {r.returncode}", 200))
+        live = True
+    except subprocess.TimeoutExpired:
+        live = True                  # ssh may have died after systemd-run had started the unit; the unit's own log tells
+        raise OSError("ssh to Defiant timed out. The install may be running: look at the Updates block.")
+    finally:
+        with _UPD_LOCK:
+            _UPD["starting"] = False
+            if live:                 # only now: before this the log on the host is still the previous run's
+                _UPD["job"] = dict(_upd_job_idle(), state="running", started_at=now, contact_at=now)
+                _upd_save_locked()
+        if live:
+            _UPD_WAKE.set()          # the worker polls it now, not up to a minute from now
+    return {"ok": True, "started_at": now}
+
+
+# ---- the worker (blocking calls live here, never in a request thread)
+
+def _tg_send(text):
+    """One Telegram message through the Starfleet Command bot's send script (success = exit 0). Blocks up to 40 s, so
+    worker threads only. Never raises, and never prints what the script said: that can carry the bot's token."""
+    try:
+        ok = subprocess.run(["/usr/bin/python3", TELEGRAM_SEND, text], capture_output=True, timeout=40,
+                            stdin=subprocess.DEVNULL).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        ok = False
+    if not ok:
+        print("defiant updates: Telegram message not sent", flush=True)
+    return ok
+
+
+def _upd_notify(scan):
+    """Alert on a critical scan once. A failed send is not remembered, so the next scan tries again."""
+    with _UPD_LOCK:
+        sent = _UPD["alerted"].get("sig")
+    act = upd_alert_decision(scan, sent)
+    if act == "send" and _tg_send(upd_alert_text(scan)):
+        with _UPD_LOCK:
+            _UPD["alerted"] = {"sig": upd_signature(scan), "at": time.time()}
+            _upd_save_locked()
+    elif act == "clear":
+        with _UPD_LOCK:
+            _UPD["alerted"] = {}
+            _upd_save_locked()
+
+
+def _upd_scan_once(now):
+    with _UPD_LOCK:
+        _UPD["busy"], _UPD["want"], _UPD["started"] = True, False, now
+    data = err = None
+    try:
+        r = _def_ssh(UPD_SCAN, 300)
+        if "FLEET-SCAN end" not in r.stdout:
+            raise OSError((r.stderr or f"ssh exit {r.returncode}").strip()[-200:])
+        data = parse_scan_output(r.stdout)
+    except subprocess.TimeoutExpired:
+        err = "ssh timed out"
+    except Exception as e:          # a parser bug must fail the scan, not leave it "Scanning..." for good
+        err = _clean(e if isinstance(e, (OSError, ValueError)) else f"{e.__class__.__name__}: {e}", 200)
+    with _UPD_LOCK:
+        if data:
+            _UPD["scan"], _UPD["first_err"] = dict(data, at=now, error=None, error_at=None), None
+        elif _UPD["scan"]:                              # the last good data stays, the error rides on it
+            _UPD["scan"] = dict(_UPD["scan"], error=err, error_at=now)
+        else:                                           # never a good scan: the view still shows why (in memory only)
+            _UPD["first_err"] = (err, now)
+        _UPD["busy"], _UPD["next_at"] = False, now + (UPD_EVERY if data else UPD_RETRY)
+        _upd_save_locked()
+        scan = _UPD["scan"]
+    if data:
+        _upd_notify(scan)
+    else:
+        print(f"defiant updates: scan failed: {err}", flush=True)
+
+
+def _upd_poll(now):
+    """Poll the running install once; True while it is still running. When it ended, a rescan is due at once and a
+    failure is sent as one long Telegram message (a success is only shown on the page)."""
+    try:
+        r = _def_ssh(UPD_POLL, 30)
+        obs = parse_job_probe(r.stdout) if r.returncode != 255 else None       # 255: ssh itself failed, what came may be cut short
+    except (OSError, subprocess.SubprocessError):
+        obs = None
+    with _UPD_LOCK:
+        job = _UPD["job"] = upd_job_step(_UPD["job"], obs, now)
+        if job["state"] != "running":
+            _UPD["want"], _UPD["next_at"] = True, now
+        _upd_save_locked()
+    if job["state"] == "failed":
+        _tg_send(upd_fail_text(job))
+    return job["state"] == "running"
+
+
+def _upd_tick(now):
+    """One pass of the worker; returns how long to sleep."""
+    with _UPD_LOCK:
+        running, next_at = _UPD["job"]["state"] == "running", _UPD["next_at"]
+        due = (_UPD["want"] or now >= next_at) and not _UPD["starting"]
+    if running:
+        return 5 if _upd_poll(now) else 0
+    if due:
+        _upd_scan_once(now)
+        return 0
+    return min(60, max(1, next_at - now))
+
+
+def defiant_updates_worker():
+    """Hourly scan, alerts and polling of a running install (also one that survived a Fleet restart). main() starts
+    it only when Defiant is configured."""
+    now = time.time()
+    with _UPD_LOCK:
+        scan = _UPD["scan"]
+        last = max(scan["at"], scan["error_at"] or 0) if scan else 0
+        gap = UPD_RETRY if scan and scan["error"] else UPD_EVERY
+        _UPD["next_at"] = last + gap if now - last < UPD_FRESH else now + UPD_FIRST
+    while True:
+        try:
+            wait = _upd_tick(time.time())
+        except Exception as e:      # a surprise must not end the worker
+            print(f"defiant updates: {e.__class__.__name__}: {str(e)[:160]}", flush=True)
+            wait = 30
+        _UPD_WAKE.wait(wait)
+        _UPD_WAKE.clear()
 
 
 # ---------------------------------------------------------------- Computer (knowledge chat)
@@ -3538,13 +4073,13 @@ def ev_detect(w, open_keys):
     # web server
     d = w.get("defiant")
     if d is None:
-        hold += ["web-host", "web-down:", "cert:", "reboot-needed"]
+        hold += ["web-host", "web-down:", "cert:", "reboot-needed", "updates-security"]
     elif d.get("configured") is not False:
         if d.get("errors") and not d.get("sites"):
             conds["web-host"] = dict(kind="web-down", level="act", title="Web server not answering", go="#/systems/defiant", for_s=300, remind=True,
                                      text="Defiant cannot be checked: " + d["errors"][0][:100], push="The web server cannot be checked.",
                                      clear_s=300, ok="The web server answers again.")
-            hold += ["web-down:", "cert:", "reboot-needed"]
+            hold += ["web-down:", "cert:", "reboot-needed", "updates-security"]
         else:
             if not d.get("sites"):
                 hold += ["web-down:", "cert:"]
@@ -3560,6 +4095,20 @@ def ev_detect(w, open_keys):
             if d.get("reboot_required"):
                 conds["reboot-needed"] = dict(kind="reboot-needed", level="notice", title="Web server needs a reboot", go="#/systems/defiant",
                                               text="Defiant has installed updates and needs a reboot.", ok="Defiant has rebooted.")
+            # Security updates waiting: the update scan's summary (d["upd"]: from memory, no ssh; None until the first good scan). One key
+            # whatever the count, so a scan that says 1, 2, then 1 is one episode. It opens at once and closes when a scan finds none; a
+            # failed scan keeps the last good numbers, so it closes nothing. No reminder: Defiant installs security updates by itself
+            # overnight, so one still waiting after 6 hours is normal and two reminders would make three pushes for every batch (the open
+            # entry stays in the list). Both texts carry the count only: a package name comes from the host, and a push passes through Apple.
+            u = d.get("upd")
+            if u is None:
+                hold.append("updates-security")                                 # no good scan yet: unknown, not clean
+            elif u.get("security"):
+                sec = u["security"]
+                what = f"{sec} security update{'' if sec == 1 else 's'} waiting on Defiant."
+                conds["updates-security"] = dict(kind="updates-security", level="act", title="Security updates waiting", go="#/systems/defiant",
+                                                 text=what + " Open Defiant to see the list and install.", push=what,
+                                                 ok="No security updates are waiting on Defiant any more.")
     # coding sessions waiting for you: stalled for 30 minutes to 6 hours (older ones are abandoned, not waiting)
     s = w.get("sessions")
     if s is None:
@@ -4008,6 +4557,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, json.dumps(memory_alpha_state()), "application/json")
         if self.path == "/api/defiant":
             return self._send(200, json.dumps(defiant_state()), "application/json")
+        if self.path == "/api/defiant/updates":
+            return self._send(200, json.dumps(defiant_updates_view()), "application/json")
         if self.path == "/api/containers":
             return self._send(200, json.dumps(containers_state()), "application/json")
         if self.path == "/api/cluster/update":          # pending updates per Spark + the last/current run
@@ -4192,6 +4743,25 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(502, json.dumps({"error": str(e)[:200]}), "application/json")
             print(f"ENGINEERING stop: {len(res['ended'])} sessions ended, {len(res['stopped'])} containers stopped, "
                   f"{len(res['refused'])} refused, {len(res['errors'])} failed", flush=True)
+            return self._send(200, json.dumps(res), "application/json")
+        if self.path == "/api/defiant/updates/scan":       # no key: it only reads
+            try:
+                res = defiant_updates_scan_request()
+            except ValueError as e:
+                return self._send(400, json.dumps({"error": str(e)}), "application/json")
+            return self._send(200, json.dumps(res), "application/json")
+        if self.path == "/api/defiant/updates/install":
+            try:
+                res = defiant_updates_install(key)
+            except urllib.error.HTTPError as e:
+                return self._send(403, json.dumps({"error": _err_text(e)}), "application/json")
+            except PermissionError as e:
+                return self._send(409, json.dumps({"error": str(e)}), "application/json")
+            except ValueError as e:
+                return self._send(400, json.dumps({"error": str(e)}), "application/json")
+            except (urllib.error.URLError, OSError, subprocess.SubprocessError) as e:
+                return self._send(502, json.dumps({"error": str(e)[:200]}), "application/json")
+            print("DEFIANT updates install started", flush=True)
             return self._send(200, json.dumps(res), "application/json")
         if self.path == "/api/containers/stop":
             try:
@@ -4510,6 +5080,25 @@ def _ev_selfcheck():
         assert "cert:example.org" in D(Df(sites=[site(cert_days=9)]))[0] and "reboot-needed" in D(Df(reboot_required=True))[0]
         c, h = D(Df(sites=[], errors=["ssh failed"]))
         assert "web-host" in c and "web-down:" in h
+        us = lambda sec, **kw: dict({"count": sec + 2, "security": sec, "deferred": 1, "remove": 0, "scan_at": now - 600, "job_state": "idle"}, **kw)
+        c, h = D(Df(upd=us(3)))
+        assert c["updates-security"]["level"] == "act" and c["updates-security"]["title"] == "Security updates waiting" and "updates-security" not in h
+        assert c["updates-security"]["go"] == "#/systems/defiant" and c["updates-security"]["push"] == "3 security updates waiting on Defiant."
+        assert "3 security updates" in c["updates-security"]["text"] and D(Df(upd=us(1)))[0]["updates-security"]["push"] == "1 security update waiting on Defiant."
+        assert c["updates-security"].get("for_s", 0) == 0 and not c["updates-security"].get("remind"), "opens at once and never repeats"
+        assert "updates-security" not in D(Df(upd=us(0)))[0] and "updates-security" not in D(Df(upd=us(0)))[1], "a clean scan: nothing waiting and nothing unknown"
+        for unknown in (Df(), Df(upd=None), W(), Df(sites=[], errors=["ssh failed"], upd=us(2))):
+            c, h = D(unknown)
+            assert "updates-security" not in c and "updates-security" in h, "no good scan yet, or a host that cannot be checked: held"
+        assert "openssl" not in json.dumps(D(Df(upd=us(2, names=["openssl"], packages=[{"name": "openssl"}])))[0]["updates-security"]), "the count only, never a package name"
+        eps, seen = {}, []
+        for t, sec in ((0, 1), (3600, 2), (7200, 1)):                              # the hourly scan: 1, then 2, then 1 again
+            seen += names(ev_step(eps, *D(Df(upd=us(sec))), t))
+        assert seen == ["open"] and eps["updates-security"]["spec"]["push"] == "1 security update waiting on Defiant.", "one episode, however the count moves"
+        assert ev_step(eps, *D(Df(upd=us(1))), 3 * EV_REMIND_S) == [], "no reminder: the open entry stays"
+        assert ev_step(eps, *D(Df(upd=None)), 10 ** 6) == [] and "updates-security" in eps, "an unknown scan closes nothing"
+        acts = ev_step(eps, *D(Df(upd=us(0))), 10 ** 6 + 5)
+        assert names(acts) == ["resolve"] and "No security updates" in acts[0][2]["ok"] and eps == {}, "a clean scan closes it"
         K1 = "sessions-waiting:jean-luc:" + _ev_hash("s1")
         Ss = lambda *x, **kw: W(sessions={"nodes": {"jean-luc": dict({"error": None, "sessions": list(x)}, **kw)}})
         ses = lambda age, **kw: dict({"id": "s1", "stalled": True, "updated_secs_ago": age}, **kw)
@@ -5007,6 +5596,9 @@ def main():
     clusterupdate.init(NODES, key_check, _cluster_busy, _sudo_reboot)
     for fn in (poll_nodes, poll_swap, keepalive, ctx_max_worker, load_queue_worker, ct_worker, events_worker):
         threading.Thread(target=fn, daemon=True).start()
+    if DEFIANT_HOST:
+        defiant_updates_load()
+        threading.Thread(target=defiant_updates_worker, daemon=True).start()
     pins = load_pins()
     print(f"Fleet on http://{host}:{a.port}   (llama-swap {SWAP})", flush=True)
     print(f"pinned: {', '.join(pins) if pins else 'none'}", flush=True)

@@ -1,8 +1,8 @@
 /* Fixtures and scenes for the Systems screens (vendor/padd-systems.js): Sessions, Main Engineering,
    Deep Space NAS, Memory Alpha, Defiant. All names and numbers are made up. This file answers only
-   /api/containers, /api/nas, /api/nas/stats, the session tail and the three POSTs; sessions, Memory Alpha
-   and Defiant come from scenes-core.js, and a scene that needs another answer from one of those swaps it
-   in with over(). */
+   /api/containers, /api/nas, /api/nas/stats, the session tail and the POSTs; sessions, Memory Alpha,
+   Defiant and its package updates come from scenes-core.js, and a scene that needs another answer from
+   one of those swaps it in with over(). */
 "use strict";
 const F = require("./scenes-core.js").fixtures, { keyOk, denied, now } = F;
 const KB = 1048576, SSH = "ssh: connect to host demo-host port 22: Connection timed out";
@@ -94,6 +94,17 @@ exports.post = (p, body, variant, h) => {
     return {ok: true};
   }
   if(p === "/api/memoryalpha/backup") return !keyOk(h) ? denied : variant === "refuse" ? {__status: 409, body: {error: "A snapshot is already running."}} : {ok: true};
+  if(p === "/api/defiant/updates/scan"){                        /* takes no key, so none may be sent; "recent" is the 60 s limit */
+    if(h["x-starfleet-key"]) return {__status: 400, body: {error: "fixture: the Starfleet key was sent to a route that takes none"}};
+    return /-recent$/.test(variant) ? {ok: true, started: false, reason: "recent"} : /-busy$/.test(variant) ? {ok: true, started: false, reason: "busy"} : {ok: true, started: true};
+  }
+  if(p === "/api/defiant/updates/install"){
+    if(!keyOk(h)) return denied;
+    if(/-conflict$/.test(variant)) return {__status: 409, body: {error: "an install is already running"}};
+    if(/-sshfail$/.test(variant)) return {__status: 502, body: {error: SSH}};
+    F.begun.set(variant, now());                                 /* from here on Fleet answers "running" */
+    return {ok: true, started_at: now()};
+  }
 };
 
 /* ---- scenes */
@@ -134,6 +145,28 @@ const YES = '[data-k="yes"]', NO = '[data-k="no"]', STOP = '[data-act="sys.cstop
 const enterKey = async t => { await t.type("#p-keyin", "fixture-key"); await t.tap("#p-keygo"); await t.wait(600); };
 const ENG = "#/systems/engineering", NAS = "#/systems/nas", SES = "#/systems/sessions", ALPHA = "#/systems/alpha", DEF = "#/systems/defiant";
 const stopPost = ["/api/containers/stop", {node: "jean-luc", name: "mcp-scrape-1"}], nasPost = (target, action) => ["/api/nas/control", {target, action}];
+const INSTALL = '[data-act="sys.install"]', SCAN = '[data-act="sys.scan"]', instPost = ["/api/defiant/updates/install", {}], scanPost = ["/api/defiant/updates/scan", {}];
+/* the Updates block sits under the Server block: scroll one of its sections up to the sticky header */
+const toSec = title => page => page.evaluate(t => { const h = [...document.querySelectorAll("#p-view .p-sec h2")].find(x => x.textContent === t);
+  scrollTo(0, h.getBoundingClientRect().top + scrollY - document.getElementById("p-hd").offsetHeight - 6); }, title);
+const toUpd = toSec("Updates"), toPkgs = toSec("Packages");
+const toast = async (page, re, what) => { await page.waitForTimeout(200); const t = await page.evaluate(() => document.querySelector("#p-toast").textContent); if(!re.test(t)) throw new Error(`expected the toast to ${what}, it says ${JSON.stringify(t)}`); };
+const upHits = async (page, ms) => { F.hits.upd = 0; await page.waitForTimeout(ms); return F.hits.upd; };
+const fresh = async (page, t) => { F.begun.clear(); await page.evaluate(() => PADD.refresh(["updates", "defiant"])); await t.wait(400); };      /* no install accepted yet, whatever an earlier scene did */
+/* the Updates figure of the Server panel on the Defiant screen */
+const serverUpdates = page => page.evaluate(() => { const d = [...document.querySelectorAll("#p-view .p-sy-pans .p-kv > div")].find(x => x.querySelector("span").textContent === "Updates"); return d && d.querySelector("b").textContent; });
+/* the Defiant row of the Systems list: what it says and its tag */
+const rowSays = (page, re, tag) => page.evaluate(([a, b]) => { const r = document.querySelector('#p-view [data-act="go"][data-arg="#/systems/defiant"]');
+  if(!r) throw new Error("no Defiant row"); const s = [...r.querySelectorAll(".p-s")].map(x => x.textContent).join(" | ");
+  if(!new RegExp(a).test(s)) throw new Error(`the Defiant row says ${JSON.stringify(s)}`); if(!new RegExp(b).test(r.querySelector(".p-tag").textContent)) throw new Error(`the Defiant tag says ${r.querySelector(".p-tag").textContent}`); }, [re.source, tag.source]);
+/* the Defiant items of Bridge > Needs attention, in order, as "title|subtitle"; a security item must be amber */
+const attention = (page, want) => page.evaluate(want => {
+  const rows = [...document.querySelectorAll('#p-view [data-act="go"][data-arg="#/systems/defiant"]')], got = rows.map(r => `${r.querySelector(".p-t").textContent}|${r.querySelector(".p-s").textContent}`);
+  if(JSON.stringify(got) !== JSON.stringify(want)) throw new Error(`Defiant items: expected ${JSON.stringify(want)}, saw ${JSON.stringify(got)}`);
+  for(const r of rows){ const c = /--c:\s*var\(--(\w+)\)/.exec(r.getAttribute("style")); if(/security update/.test(r.textContent) && (!c || c[1] !== "amber")) throw new Error("the security item is not amber: " + r.getAttribute("style")); }
+}, want);
+const toAttention = page => page.evaluate(() => { const h = [...document.querySelectorAll("#p-view .p-sec h2")].find(x => x.textContent === "Needs attention"); scrollTo(0, h.getBoundingClientRect().top + scrollY - document.getElementById("p-hd").offsetHeight - 6); });
+const defDownWith = async (page, upd) => over("/api/defiant", "defiant", () => ({configured: true, containers: [], sites: [], problems: [], errors: [SSH], status: "error", upd, at: now()}))(page);
 
 exports.scenes = [
   /* Systems */
@@ -247,4 +280,185 @@ exports.scenes = [
   {name: "sys-defiant-off", hash: DEF, variant: "busy", run: defOff},
   {name: "sys-defiant-down", hash: DEF, variant: "busy", run: defDown},
   {name: "sys-defiant-offline", hash: DEF, variant: "offline"},
+
+  /* Defiant: package updates, one scene per state of /api/defiant/updates (scenes-core.js: variant "upd-<state>") */
+  {name: "sys-defiant-upd-never", hash: DEF, variant: "upd-never", run: async (page, t) => { await toUpd(page);
+    await must(page, () => /No scan yet/.test(document.querySelector("#p-view").textContent) && document.querySelector('[data-act="sys.install"]').disabled && !document.querySelector('[data-act="sys.scan"]').disabled
+      && [...document.querySelectorAll("#p-view .p-sec h2")].some(h => h.textContent === "Updates") && ![...document.querySelectorAll("#p-view .p-sec h2")].some(h => h.textContent === "Packages")
+      && /The first one runs shortly after Fleet starts\./.test(document.querySelector("#p-view").textContent),
+      "No scan yet and that the first one runs shortly after Fleet starts, Install off and Scan now on, no package list"); }},
+  {name: "sys-defiant-upd-pending", hash: DEF, variant: "upd-pending", run: async (page, t) => { await toUpd(page); await t.shot("top");
+    await must(page, () => {
+      const rows = [...document.querySelectorAll("#p-view .p-sy-flat")].filter(r => r.querySelector(".p-sy-path")), txt = document.querySelector("#p-view").textContent;
+      const more = [...document.querySelectorAll("#p-view .p-sy-flat .p-t")].find(x => /^\+\d+ more$/.test(x.textContent));
+      return rows.length === 12 && rows.map(r => r.querySelector(".p-tag.warn") ? "S" : "-").join("") === "SSSS--------" && more && more.textContent === "+12 more"
+        && rows[0].textContent.startsWith("libc6") && /2\.42-0ubuntu3 → 2\.42-0ubuntu3\.1/.test(rows[0].textContent) && /resolute-updates, resolute-security/.test(rows[0].textContent)
+        && /third party \(UbuntuESMApps\)/.test(rows[1].textContent) && /third party \(Docker\)/.test(txt) && /new 7\.0\.0-1031\.31/.test(txt)
+        && /The install removes 2 packages: libnsl-compat1, python3-legacy-shim/.test(txt) && /4 held back by Ubuntu's staged rollout/.test(txt) && /Reboot needed for linux-image-7\.0\.0-1025-generic/.test(txt)
+        && /Last scan \d\d:\d\d \(5 min ago\) · next \d\d:\d\d/.test(txt) && !document.querySelector('[data-act="sys.install"]').disabled && !document.querySelector('[data-act="sys.scan"]').disabled
+        && document.querySelector('[data-act="sys.install"]').textContent === "Install updates" && /Fleet scans every hour and sends security updates and a pending reboot once to Telegram\./.test(txt);
+    }, "12 package rows with the four security ones first, +12 more, removals, held back, reboot, scan times, both buttons on, the note on where the alerts go");
+    await toPkgs(page); await t.shot("list"); }},
+  {name: "sys-defiant-upd-pending-old", hash: DEF, variant: "upd-pending", shell: "old", run: async (page, t) => { await toUpd(page); await t.shot("top"); await toPkgs(page); }},
+  {name: "sys-defiant-upd-pending-small", hash: DEF, variant: "upd-pending", shell: "small", run: async (page, t) => { await toUpd(page); await t.shot("top"); await toPkgs(page); }},
+  {name: "sys-defiant-upd-running", hash: DEF, variant: "upd-running", run: async (page, t) => { await toUpd(page);
+    await must(page, () => { const log = document.querySelector("#p-view .p-sy-log"), txt = document.querySelector("#p-view").textContent;
+      return /Installing updates/.test(txt) && log && log.textContent.split("\n").length === 10 && /Processing triggers for man-db/.test(log.textContent) && !/FLEET-APT-START/.test(log.textContent)
+        && document.querySelector('[data-act="sys.install"]').disabled && document.querySelector('[data-act="sys.install"]').textContent === "Installing" && document.querySelector('[data-act="sys.scan"]').disabled
+        && /An install is running, progress below/.test(txt) && /log refreshes every 3 seconds/.test(txt) && !/Lost contact/.test(txt);
+    }, "the progress panel with the last 10 log lines, Install and Scan now off");
+    await t.shot("top"); }},
+  {name: "sys-defiant-upd-running-small", hash: DEF, variant: "upd-running", shell: "small", run: async (page, t) => { await toUpd(page); await t.shot("top"); }},
+  {name: "sys-defiant-upd-lost", hash: DEF, variant: "upd-lost", run: async (page, t) => { await toUpd(page);
+    await must(page, () => /Lost contact with Defiant, retrying\. The install keeps running there/.test(document.querySelector("#p-view").textContent) && document.querySelector("#p-view .p-sy-log"), "the lost contact line over the log"); }},
+  {name: "sys-defiant-upd-done", hash: DEF, variant: "upd-done", run: async (page, t) => { await toUpd(page);
+    await must(page, () => { const txt = document.querySelector("#p-view").textContent;
+      return /Install finished/.test(txt) && /24\s*installed/.test(txt) && /reboot required afterwards: yes/.test(txt) && /Reboot Defiant when it suits you/.test(txt) && /0\s*to install/.test(txt) && !document.querySelector("#p-view .p-sy-log"); }, "the result line: 24 installed, reboot required"); }},
+  {name: "sys-defiant-upd-done-rebooted", hash: DEF, variant: "upd-done", run: async (page, t) => {       /* Defiant was rebooted since: the latest scan wants none, the old result says what it was */
+    const b = F.updates("upd-done"); b.scan = Object.assign({}, b.scan, {reboot_required: false, reboot_pkgs: []}); b.critical = false;
+    await over("/api/defiant/updates", "updates", () => Object.assign({}, b, {now: now() + .5}))(page); await toUpd(page);
+    await must(page, () => { const txt = document.querySelector("#p-view").textContent;
+      const chip = [...document.querySelectorAll(".p-sy-up .p-kv > div")].find(d => d.querySelector("span").textContent === "Reboot");
+      return /Install finished/.test(txt) && /24\s*installed/.test(txt) && /reboot required afterwards: yes/.test(txt) && !/Reboot Defiant when it suits you/.test(txt) && chip && chip.querySelector("b").textContent === "No"; },
+      "the old result as it was, no hint to reboot once the latest scan says none is pending"); }},
+  {name: "sys-defiant-upd-server-count", hash: DEF, variant: "upd-pending", run: async (page, t) => {       /* the probe counts 28 (it holds back what phasing holds back); the scan, the Systems row and the desktop say 24 */
+    const n = await serverUpdates(page); if(n !== "24") throw new Error(`the Server panel says ${n} updates, the scan says 24`);
+    await must(page, () => /Reboot required\. 24 updates are pending\./.test(document.querySelector("#p-view").textContent), "the reboot message to carry the scan's count"); }},
+  {name: "sys-defiant-upd-server-count-clean", hash: DEF, variant: "upd-clean", run: async (page, t) => {
+    const n = await serverUpdates(page); if(n !== "0") throw new Error(`the Server panel says ${n} updates, the scan says none`); }},
+  {name: "sys-defiant-upd-failed", hash: DEF, variant: "upd-failed", run: async (page, t) => { await toUpd(page);
+    await must(page, () => { const log = document.querySelector("#p-view .p-sy-log.err"), txt = document.querySelector("#p-view").textContent;
+      return /Install failed/.test(txt) && /exit 100/.test(txt) && log && /Could not get lock/.test(log.textContent) && /FLEET-APT-EXIT 100/.test(log.textContent)
+        && getComputedStyle(document.querySelector("#p-view .p-card .p-free[style*=red]")).color !== getComputedStyle(document.body).color; }, "exit 100 and the log tail in red"); }},
+  {name: "sys-defiant-upd-failed-small", hash: DEF, variant: "upd-failed", shell: "small", run: async (page, t) => { await toUpd(page); await t.shot("top"); await page.evaluate(() => scrollBy(0, 300)); }},
+  {name: "sys-defiant-upd-clean", hash: DEF, variant: "upd-clean", run: async (page, t) => { await toUpd(page);
+    await must(page, () => { const txt = document.querySelector("#p-view").textContent;
+      return /0\s*to install/.test(txt) && /Nothing to install\./.test(txt) && document.querySelector('[data-act="sys.install"]').disabled && !/Packages/.test(txt) && /4 held back by Ubuntu's staged rollout/.test(txt); },
+      "nothing to install, Install off with its reason, the held back note"); }},
+  {name: "sys-defiant-upd-scanning", hash: DEF, variant: "upd-scanning", run: async (page, t) => { await toUpd(page);
+    await must(page, () => /Scanning\.\.\./.test(document.querySelector("#p-view").textContent) && document.querySelector('[data-act="sys.scan"]').textContent === "Scanning" && document.querySelector('[data-act="sys.scan"]').disabled
+      && document.querySelector('[data-act="sys.install"]').disabled && /A scan is running, try again in a minute\./.test(document.querySelector("#p-view").textContent),
+      "Scanning... with Scan now and Install off (Fleet refuses an install during a scan)"); }},
+  {name: "sys-defiant-upd-error", hash: DEF, variant: "upd-error", run: async (page, t) => { await toUpd(page);
+    await must(page, () => /Scan failed 4 min ago, showing the scan from \d\d:\d\d: E: Failed to fetch http:\/\/ports\.example\.org\/ubuntu-ports\/dists\/resolute-updates\/InRelease Temporary failure/.test(document.querySelector("#p-view").textContent)
+      && /24\s*to install/.test(document.querySelector("#p-view").textContent), "the scan error over the last good scan"); }},
+  {name: "sys-defiant-upd-firstfail", hash: DEF, variant: "upd-firstfail", run: async (page, t) => { await toUpd(page);
+    await must(page, () => { const txt = document.querySelector("#p-view").textContent;
+      return /No scan yet/.test(txt) && /Scan failed 2 min ago: ssh: connect to host demo-host/.test(txt) && document.querySelector('[data-act="sys.install"]').disabled
+        && /No scan yet\. Fleet tries again at \d\d:\d\d\./.test(txt) && !/shortly after Fleet starts/.test(txt); }, "the first scan failed: No scan yet, the error and when Fleet tries again"); }},
+  {name: "sys-defiant-upd-hostile", hash: DEF, variant: "upd-hostile", run: async (page, t) => { await toUpd(page);
+    await must(page, () => { const v = document.querySelector("#p-view"), txt = v.textContent;
+      return !window.__pwned && !v.querySelector("img, script, #evil, em") && /<img src=x onerror/.test(txt) && /<b id="evil">boom<\/b>/.test(txt) && /1<b>2 → 3<i>4/.test(txt) && /<script>window\.__pwned=1<\/script>/.test(txt) && /<b>k<\/b>/.test(txt); },
+      "every remote string shown as text, no markup from it in the page");
+    await t.tap(INSTALL); await must(page, () => { const x = document.querySelector(".p-sheet"); return x && !x.querySelector("img, script") && /<img src=x onerror/.test(x.textContent); }, "the confirm text escaped too"); await t.shot("asked"); }},
+  {name: "sys-defiant-upd-unreachable", hash: DEF, variant: "upd-down", run: async (page, t) => { await toUpd(page);       /* only the updates source fails: the rest of the screen is still there */
+    await must(page, () => /upstream down/.test(document.querySelector("#p-view").textContent) && /Server/.test(document.querySelector("#p-view").textContent) && !document.querySelector('[data-act="sys.install"]'), "the error in place of the block"); }},
+  {name: "sys-defiant-upd-notset", hash: DEF, variant: "upd-pending", run: async (page, t) => { await over("/api/defiant/updates", "updates", () => ({configured: false}))(page);       /* Fleet says it has no Defiant: no block, no buttons, no polling */
+    await must(page, () => !document.querySelector('[data-act="sys.install"]') && ![...document.querySelectorAll("#p-view .p-sec h2")].some(h => h.textContent === "Updates"), "no Updates block");
+    const n = await upHits(page, 3600); if(n !== 0) throw new Error(`expected no read after "configured: false", saw ${n}`); }},
+  {name: "sys-defiant-upd-lost-sync", hash: DEF, variant: "upd-pending", run: async (page, t) => { await down("/api/defiant/updates", "updates")(page); await toUpd(page);
+    await must(page, () => /Showing the last answer, from \d\d:\d\d:\d\d/.test(document.querySelector("#p-view").textContent) && /24\s*to install/.test(document.querySelector("#p-view").textContent), "Sync lost over the last answer"); }},
+  {name: "sys-defiant-upd-probe-down", hash: DEF, variant: "upd-running", run: async (page, t) => { await defDown(page); await toUpd(page);       /* the probe fails while the upgrade runs: the job stays in view */
+    await must(page, () => /Installing updates/.test(document.querySelector("#p-view").textContent) && document.querySelector("#p-view .p-sy-log"), "the install still shown under the probe's error"); }},
+
+  /* Defiant: Scan now (no key) */
+  {name: "sys-defiant-scan", hash: DEF, variant: "upd-pending", posts: [scanPost], run: async (page, t) => { await toUpd(page);
+    const same = F.updates("upd-pending");      /* Fleet's answer does not change until a scan ends (the fixture's own times move every second): freeze it */
+    await over("/api/defiant/updates", "updates", () => same)(page); await t.tap(SCAN);
+    await toast(page, /Scan started\./, "say the scan started");
+    await must(page, () => document.querySelector('[data-act="sys.scan"]').textContent === "Scanning" && document.querySelector('[data-act="sys.scan"]').disabled && /Scanning\.\.\./.test(document.querySelector("#p-view").textContent),
+      "Scanning... while Fleet wakes its worker");
+    await must(page, () => document.querySelector('[data-act="sys.install"]').disabled, "Install off while the scan runs"); await t.shot("after");
+    const ended = Object.assign({}, same, {scan: Object.assign({}, same.scan, {at: same.scan.at + 90})});      /* the scan ended: a new stamp, though the grace is not over */
+    await over("/api/defiant/updates", "updates", () => ended)(page);
+    await must(page, () => document.querySelector('[data-act="sys.scan"]').textContent === "Scan now" && !document.querySelector('[data-act="sys.scan"]').disabled && !/Scanning\.\.\./.test(document.querySelector("#p-view").textContent)
+      && !document.querySelector('[data-act="sys.install"]').disabled, "the result ends Scanning... at once, not after the grace"); }},
+  {name: "sys-defiant-scan-recent", hash: DEF, variant: "upd-pending-recent", posts: [scanPost], run: async (page, t) => { await toUpd(page); await t.tap(SCAN);
+    await toast(page, /A scan ran a moment ago\./, "say a scan just ran");
+    await must(page, () => !document.querySelector('[data-act="sys.scan"]').disabled && document.querySelector('[data-act="sys.scan"]').textContent === "Scan now", "Scan now back on"); }},
+  {name: "sys-defiant-scan-busy", hash: DEF, variant: "upd-pending-busy", posts: [scanPost], run: async (page, t) => { await toUpd(page); await t.tap(SCAN); await toast(page, /A scan is already running\./, "say a scan is running"); }},
+  {name: "sys-defiant-scan-nokey", hash: DEF, variant: "upd-pending", key: false, posts: [scanPost], run: async (page, t) => { await toUpd(page); await t.tap(SCAN);       /* a scan needs no key: no key sheet */
+    await toast(page, /Scan started\./, "say the scan started"); await must(page, () => !document.querySelector("#p-keyin") && !document.querySelector(".p-sheet.on"), "no key sheet"); }},
+  {name: "sys-defiant-scan-off", hash: DEF, variant: "upd-running", run: async (page, t) => { await toUpd(page);       /* an install is running: Scan now is off and sends nothing */
+    await page.locator(SCAN).tap({force: true}).catch(() => {}); await t.wait(300); await must(page, () => document.querySelector('[data-act="sys.scan"]').disabled, "Scan now off during an install"); }},
+
+  /* Defiant: Install updates (Starfleet key, confirm sheet) */
+  {name: "sys-defiant-install", hash: DEF, variant: "upd-pending-install", posts: [instPost], run: async (page, t) => { await fresh(page, t); await toUpd(page); await t.tap(INSTALL); await t.shot("asked");
+    await must(page, () => { const x = document.querySelector(".p-sheet .p-text").textContent;
+      return document.querySelector(".p-sheet h3").textContent === "Install updates?" && /^24 packages will be upgraded, 4 of them security updates\./.test(x) && /It removes 2 packages: libnsl-compat1, python3-legacy-shim\./.test(x)
+        && /It restarts services \(containerd, docker, tailscale\): the sites can be unreachable for a few seconds\./.test(x) && /It needs a reboot afterwards \(libc6, linux-image\), and this button never reboots\./.test(x); },
+      "the count, the removals and both warnings in the confirm text");
+    await t.tap(YES); await toast(page, /Install started\./, "say the install started");
+    await must(page, () => /Installing updates/.test(document.querySelector("#p-view").textContent) && document.querySelector('[data-act="sys.install"]').disabled && document.querySelector("#p-view .p-sy-log"),
+      "Fleet's own refresh to show the running install"); await t.shot("running"); }},
+  {name: "sys-defiant-install-small", hash: DEF, variant: "upd-pending-small", shell: "small", run: async (page, t) => { await toUpd(page); await t.tap(INSTALL); await t.shot("asked");
+    await must(page, () => { const r = document.querySelector('.p-sheet [data-k="yes"]').getBoundingClientRect(); return r.top > 0 && r.bottom <= innerHeight; }, "the confirm button on screen without scrolling the sheet"); await t.tap(NO); }},
+  {name: "sys-defiant-install-quiet", hash: DEF, variant: "upd-few", run: async (page, t) => { await toUpd(page); await t.tap(INSTALL);       /* no service, no reboot, no removal: only the count */
+    await must(page, () => document.querySelector(".p-sheet .p-text").textContent === "5 packages will be upgraded, 2 of them security updates.", "a confirm text with the count alone"); await t.shot("asked"); await t.tap(NO); }},
+  {name: "sys-defiant-install-cancel", hash: DEF, variant: "upd-pending", run: async (page, t) => { await toUpd(page); await t.tap(INSTALL); await t.tap(NO); await t.wait(300);
+    await must(page, () => !document.querySelector('[data-k="yes"]') && !document.querySelector('[data-act="sys.install"]').disabled, "the sheet closed and Install still on"); }},
+  {name: "sys-defiant-install-double-tap", hash: DEF, variant: "upd-pending", run: async (page, t) => { await toUpd(page); await t.tap(INSTALL);
+    await page.evaluate(() => document.querySelector('[data-k="yes"]').click()); await page.waitForTimeout(150);
+    await must(page, () => !!document.querySelector('[data-k="yes"]'), "the confirm sheet to ignore a tap in its first moments"); await t.tap(NO); }},
+  {name: "sys-defiant-install-nokey", hash: DEF, variant: "upd-pending-nokey", key: false, posts: [instPost, instPost], run: async (page, t) => { await fresh(page, t); await toUpd(page);
+    await t.tap(INSTALL); await t.tap(YES); await t.shot("asked"); await enterKey(t);
+    await must(page, () => /Installing updates/.test(document.querySelector("#p-view").textContent), "the install running after the key was entered"); }},
+  {name: "sys-defiant-install-conflict", hash: DEF, variant: "upd-pending-conflict", posts: [instPost], run: async (page, t) => { await toUpd(page); await t.tap(INSTALL); await t.tap(YES);
+    await toast(page, /Install failed: an install is already running/, "say an install is already running");
+    await must(page, () => !document.querySelector('[data-act="sys.install"]').disabled && document.querySelector('[data-act="sys.install"]').textContent === "Install updates", "Install back on after the refusal"); }},
+  {name: "sys-defiant-install-sshfail", hash: DEF, variant: "upd-pending-sshfail", posts: [instPost], run: async (page, t) => { await toUpd(page); await t.tap(INSTALL); await t.tap(YES);
+    await toast(page, /Install failed: ssh: connect to host demo-host/, "carry the ssh error"); }},
+  {name: "sys-defiant-install-off-clean", hash: DEF, variant: "upd-clean", run: async (page, t) => { await toUpd(page);       /* nothing to install: the button is off, and a tap on it sends nothing */
+    await page.locator(INSTALL).tap({force: true}).catch(() => {}); await t.wait(300);
+    await must(page, () => document.querySelector('[data-act="sys.install"]').disabled && !document.querySelector('[data-k="yes"]') && /Nothing to install\./.test(document.querySelector("#p-view").textContent), "Install off with its reason and no sheet"); }},
+  {name: "sys-defiant-install-off-running", hash: DEF, variant: "upd-running", run: async (page, t) => { await toUpd(page);
+    await page.locator(INSTALL).tap({force: true}).catch(() => {}); await t.wait(300); await must(page, () => !document.querySelector('[data-k="yes"]'), "no sheet while an install runs"); }},
+  {name: "sys-defiant-install-off-noscan", hash: DEF, variant: "upd-never", run: async (page, t) => { await toUpd(page);
+    await page.locator(INSTALL).tap({force: true}).catch(() => {}); await t.wait(300);
+    await must(page, () => !document.querySelector('[data-k="yes"]') && /No scan yet: scan first\./.test(document.querySelector("#p-view").textContent), "no sheet before the first scan"); }},
+
+  /* Defiant: how often the screen asks (3 s while a scan or an install is on its way or none has run, else every 30 s) and who asks at all */
+  {name: "sys-defiant-upd-poll-running", hash: DEF, variant: "upd-running", run: async (page, t) => { const n = await upHits(page, 9500);
+    if(n < 2 || n > 4) throw new Error(`expected 2 to 4 reads of the updates in 9.5 s while an install runs, saw ${n}`); }},
+  {name: "sys-defiant-upd-poll-noscan", hash: DEF, variant: "upd-never", run: async (page, t) => { const n = await upHits(page, 9500);
+    if(n < 2 || n > 4) throw new Error(`expected 2 to 4 reads in 9.5 s before the first scan, saw ${n}`); }},
+  {name: "sys-defiant-upd-poll-firstfail", hash: DEF, variant: "upd-firstfail", run: async (page, t) => { const n = await upHits(page, 9500);
+    if(n !== 0) throw new Error(`expected no read in 9.5 s after a failed first scan (Fleet retries in minutes), saw ${n}`); }},
+  {name: "sys-defiant-upd-poll-scanning", hash: DEF, variant: "upd-scanning", run: async (page, t) => { const n = await upHits(page, 9500);
+    if(n < 2 || n > 4) throw new Error(`expected 2 to 4 reads in 9.5 s while a scan runs, saw ${n}`); }},
+  {name: "sys-defiant-upd-poll-idle", hash: DEF, variant: "upd-pending", run: async (page, t) => { const n = await upHits(page, 9500);
+    if(n !== 0) throw new Error(`expected no read in 9.5 s while nothing runs, saw ${n}`); }},
+  {name: "sys-defiant-upd-poll-leave", hash: DEF, variant: "upd-running", run: async (page, t) => { await t.tap('[data-act="back"]'); await t.wait(400);       /* back to Systems: the 3 s timer is gone with the screen */
+    const n = await upHits(page, 4500); if(n !== 0) throw new Error(`expected no read after leaving the Defiant screen, saw ${n}`); }},
+  {name: "sys-root-updates-no-poll", hash: "#/systems", variant: "upd-running", run: async (page, t) => { const n = await upHits(page, 2500); if(n !== 0) throw new Error(`the Systems list read the updates ${n} times`); }},
+  {name: "bridge-updates-no-poll", hash: "#/bridge", variant: "upd-running", run: async (page, t) => { const n = await upHits(page, 2500); if(n !== 0) throw new Error(`the Bridge read the updates ${n} times`); }},
+
+  /* Systems list: the Defiant row (the scan's figures, the probe's count until there is one) */
+  {name: "sys-root-updates", hash: "#/systems", variant: "upd-pending", run: async (page, t) => { await rowSays(page, /24 updates pending · 4 security/, /Attention/); }},
+  {name: "sys-root-updates-small", hash: "#/systems", variant: "upd-pending", shell: "small", run: async (page, t) => { await rowSays(page, /24 updates pending · 4 security/, /Attention/); }},
+  {name: "sys-root-updates-old", hash: "#/systems", variant: "upd-pending", shell: "old", run: async (page, t) => { await rowSays(page, /24 updates pending · 4 security/, /Attention/); }},
+  {name: "sys-root-updates-few", hash: "#/systems", variant: "upd-few", run: async (page, t) => { await rowSays(page, /5 updates pending · 2 security/, /Attention/); }},
+  {name: "sys-root-updates-single", hash: "#/systems", variant: "upd-few", run: async (page, t) => { await over("/api/defiant", "defiant", () => { const d = F.defiant("upd-few"); d.upd = {count: 1, security: 1, deferred: 0, remove: 0, scan_at: now() - 60, job_state: "idle"}; return d; })(page, t);
+    await rowSays(page, /1 update pending · 1 security/, /Attention/); }},
+  {name: "sys-root-updates-noscan", hash: "#/systems", variant: "upd-never", run: async (page, t) => { await rowSays(page, /Web server · 7 updates pending/, /Nominal/); }},
+  {name: "sys-root-updates-none", hash: "#/systems", variant: "nominal", run: async (page, t) => { await rowSays(page, /\| Web server$/, /Nominal/); }},
+  {name: "sys-root-updates-busy", hash: "#/systems", variant: "busy", run: async (page, t) => { await rowSays(page, /Web server · 7 updates pending/, /Reboot/); }},
+
+  /* Bridge: Needs attention. Security updates are amber, one item, and never twice (Fleet also lists them among its problems) */
+  {name: "bridge-defiant-security", hash: "#/bridge", variant: "upd-few", run: async (page, t) => { await attention(page, ["Defiant: 2 security updates pending|Web server · 5 updates in all"]); await toAttention(page); }},
+  {name: "bridge-defiant-security-reboot", hash: "#/bridge", variant: "upd-pending", run: async (page, t) => {
+    await attention(page, ["Defiant needs a reboot|Web server · 24 updates", "Defiant: 4 security updates pending|Web server · 24 updates in all"]); await toAttention(page); }},
+  {name: "bridge-defiant-security-other", hash: "#/bridge", variant: "upd-few", run: async (page, t) => {       /* another problem as well: its own item, then the security one */
+    await over("/api/defiant", "defiant", () => Object.assign(F.defiant("upd-few"), {problems: ["docs.example.org: certificate expires in 9 days", "2 security updates pending"]}))(page, t);
+    await attention(page, ["Defiant|docs.example.org: certificate expires in 9 days", "Defiant: 2 security updates pending|Web server · 5 updates in all"]); await toAttention(page); }},
+  {name: "bridge-defiant-security-down", hash: "#/bridge", variant: "upd-few", run: async (page, t) => {       /* the probe failed: a red Defiant item, and the amber one from the last scan */
+    await defDownWith(page, F.defiant("upd-few").upd); await attention(page, [`Defiant|${SSH}`, "Defiant: 2 security updates pending|Web server · 5 updates in all"]); await toAttention(page); }},
+  {name: "bridge-defiant-security-small", hash: "#/bridge", variant: "upd-pending", shell: "small", run: async (page, t) => { await toAttention(page); }},
+  {name: "bridge-defiant-security-old", hash: "#/bridge", variant: "upd-few", shell: "old", run: async (page, t) => { await toAttention(page); }},
+  {name: "bridge-defiant-security-go", hash: "#/bridge", variant: "upd-few", run: async (page, t) => {       /* the header pill lists it, the row opens the Defiant screen */
+    await t.tap("#p-stat"); await must(page, () => document.querySelector('.p-sheet [data-act="go"][data-arg="#/systems/defiant"] .p-t').textContent === "Defiant: 2 security updates pending", "the status sheet to list the security item"); await t.shot("sheet");
+    await t.tap('.p-sheet [data-act="go"][data-arg="#/systems/defiant"]'); await t.wait(300);
+    await must(page, () => location.hash === "#/systems/defiant" && document.querySelector("#p-title").textContent === "Defiant" && !document.querySelector(".p-sheet.on"), "the Defiant screen after the tap"); }},
+  {name: "bridge-defiant-reboot-only", hash: "#/bridge", variant: "busy", run: async (page, t) => { await attention(page, ["Defiant needs a reboot|Web server · 7 updates"]); }},
+  {name: "bridge-defiant-clean", hash: "#/bridge", variant: "upd-clean", run: async (page, t) => { await attention(page, []); }},
 ];

@@ -1,0 +1,3 @@
+#!/bin/bash
+# Only the probe's container listing; anything else fails quietly.
+case "$*" in *CTR:*) printf 'CTR:caddy|running|Up 41 days\nCTR:app-web|running|Up 12 days (healthy)\n' ;; *) exit 1 ;; esac

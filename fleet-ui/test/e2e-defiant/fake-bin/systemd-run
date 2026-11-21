@@ -1,0 +1,26 @@
+#!/bin/bash
+# Stands in for `systemd-run --unit=NAME --collect -p StandardOutput=truncate:LOG -p StandardError=inherit -E VAR=value
+# COMMAND...`: starts the command as one detached process (own session) and returns at once. The log is opened the way
+# systemd opens it: truncate: empties it, append: appends, file: writes from the start WITHOUT truncating, so a shorter
+# run leaves the end of the previous log behind. stderr goes to the same open file (inherit). One unit at a time; its
+# pid is what the fake systemctl looks at.
+H=$E2E_HOST
+echo "$(date +%s.%N) systemd-run $*" >> "$H/calls.log"
+out=/dev/null mode=file
+while [ $# -gt 0 ]; do case $1 in
+  --unit=* | --collect) shift ;;
+  -p) case $2 in StandardOutput=truncate:* | StandardOutput=append:* | StandardOutput=file:*) mode=${2#StandardOutput=}; out=${mode#*:}; mode=${mode%%:*} ;; esac; shift 2 ;;
+  -E) export "${2?}"; shift 2 ;;
+  *) break ;;
+esac; done
+if [ -s "$H/unit.pid" ] && kill -0 "$(cat "$H/unit.pid")" 2>/dev/null; then
+  echo "Failed to start transient service unit: Unit fleet-apt-upgrade.service was already loaded or has a fragment file." >&2; exit 1; fi
+rm -f "$H/unit.pid"
+unit() { setsid bash -c 'echo $$ > "$1"; shift; exec "$@"' _ "$H/unit.pid" "$@" < /dev/null; }
+case $mode in
+  truncate) unit "$@" > "$out" 2>&1 & ;;
+  append) unit "$@" >> "$out" 2>&1 & ;;
+  *) unit "$@" 1<> "$out" 2>&1 & ;;
+esac
+for ((i = 0; i < 100 && ! -s "$H/unit.pid"; i++)); do sleep 0.05; done
+echo "Running as unit: fleet-apt-upgrade.service" >&2

@@ -11,7 +11,7 @@
          stage   true = fixed-height screen (chat, map): it gets #p-stage instead of the scrolling #p-view
          needs   { source: milliseconds } polled while the screen is open; render() runs after every answer
      P.data.<source>, P.at.<source> (ms), P.err.<source> ("key" = Starfleet key missing or refused)
-         sources: state, containers, nas, nasstats, alpha, defiant, sessions, events; add one with P.sources.x = {url, key}
+         sources: state, containers, nas, nasstats, alpha, defiant, updates, sessions, events; add one with P.sources.x = {url, key}
      P.events               Fleet's message list (see "messages" below); the app calls PADD.pushState, PADD.pushToken, PADD.open
      P.api.get(url, opt), P.api.post(url, body, opt)   JSON in, JSON out, throws Error with .status
          a 403 that means "key" opens the key sheet and retries once; opt.prompt:false turns that off
@@ -85,6 +85,7 @@ P.run = async fn => { try{ return await fn(); }catch(e){ if(!(e && e.quiet)){ P.
    off; a keyed source without an accepted key waits for a new key instead of asking for one. */
 P.sources = { state: {url: "/api/state", timeout: 8000}, containers: {url: "/api/containers"}, nas: {url: "/api/nas"},
   nasstats: {url: "/api/nas/stats"}, alpha: {url: "/api/memoryalpha"}, defiant: {url: "/api/defiant"},
+  updates: {url: "/api/defiant/updates"},                  /* the package scan and install job: only the Defiant screen asks for it */
   sessions: {url: "/api/computer/sessions", key: true}, events: {url: "/api/events", timeout: 8000} };
 const BASE = {state: 6000, sessions: 30000, alpha: 120000, defiant: 120000, events: 15000};   /* every screen: the header's status and the tab figures */
 let needs = Object.assign({}, BASE);
@@ -334,8 +335,12 @@ P.status = () => {
   if(a && (a.status === "warn" || a.status === "error")) items.push({lv: a.status === "error" ? 2 : 1, sys: 1, t: "Memory Alpha", s: [...(a.errors || []), ...(a.problems || [])][0] || "Backup needs a look", go: "#/systems/alpha"});
   const d = P.data.defiant;
   if(d && d.configured !== false){
-    if(d.status === "error" || d.status === "warn") items.push({lv: d.status === "error" ? 2 : 1, sys: 1, t: "Defiant", s: [...(d.errors || []), ...(d.problems || [])][0] || "Web server needs a look", go: "#/systems/defiant"});
-    else if(d.reboot_required) items.push({lv: 1, sys: 1, t: "Defiant needs a reboot", s: `Web server${d.updates != null ? ` · ${d.updates} updates` : ""}`, go: "#/systems/defiant"});
+    const sec = d.upd ? d.upd.security : 0, upn = d.upd ? d.upd.count : d.updates;       /* the scan's count; the probe's also counts what phasing holds back */
+    /* Fleet also lists the security count among the problems: when it is the only one, the item below says it once */
+    const own = sec > 0 && d.status === "warn" && (d.problems || []).length + (d.errors || []).length === 1;
+    if(d.status === "error" || (d.status === "warn" && !own)) items.push({lv: d.status === "error" ? 2 : 1, sys: 1, t: "Defiant", s: [...(d.errors || []), ...(d.problems || [])][0] || "Web server needs a look", go: "#/systems/defiant"});
+    else if(d.reboot_required) items.push({lv: 1, sys: 1, t: "Defiant needs a reboot", s: `Web server${upn != null ? ` · ${upn} updates` : ""}`, go: "#/systems/defiant"});
+    if(sec > 0) items.push({lv: 1, sys: 1, t: `Defiant: ${sec} security update${sec > 1 ? "s" : ""} pending`, s: `Web server · ${d.upd.count} update${d.upd.count === 1 ? "" : "s"} in all`, go: "#/systems/defiant"});   /* amber: red is for outages */
     for(const x of d.sites || []) if(x.cert_days != null && x.cert_days < 14 && d.status === "ok") items.push({lv: 1, sys: 1, t: `Certificate ends in ${x.cert_days} d`, s: x.domain, go: "#/systems/defiant"});
   }
   return {level: P.err.state ? "sync" : ["nominal", "attention", "fault"][Math.max(0, ...items.map(i => i.lv))], items};

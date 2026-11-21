@@ -1,0 +1,10 @@
+#!/bin/bash
+# Stands in for `systemctl is-active [--quiet] UNIT`, the only thing Fleet asks. The unit counts as active
+# while the process the fake systemd-run started is alive (a zombie is not).
+[ "$1" = is-active ] || exit 1
+shift; quiet=; [ "$1" = --quiet ] && { quiet=1; shift; }
+pid=$(cat "$E2E_HOST/unit.pid" 2>/dev/null)
+state=$(awk '/^State:/ { print $2 }' "/proc/${pid:-0}/status" 2>/dev/null)
+if [ -n "$state" ] && [ "$state" != Z ]; then [ -n "$quiet" ] || echo active; exit 0; fi
+[ -n "$quiet" ] || echo inactive
+exit 3

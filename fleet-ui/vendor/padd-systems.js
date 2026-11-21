@@ -4,8 +4,8 @@
    both: when fleet.html changes one, change it here too. Source lines as of 2026-11-19: nasKind L1442,
    NAS actions L1456-1465 and L1567, hardware L1537, containers L1597-1631, formats L1659, Memory Alpha
    L1678, Defiant L1734. Sessions follow the Mac app (Sources/OpencodeMonitor/Models.swift, ContentView.swift).
-   Payloads: containers_state, nas_state, nas_stats, memory_alpha_state, defiant_state, sessions_state and
-   session_tail in fleet.py. */
+   Payloads: containers_state, nas_state, nas_stats, memory_alpha_state, defiant_state, /api/defiant/updates,
+   sessions_state and session_tail in fleet.py. The Updates block of Defiant follows fleet.html's. */
 (() => {
 "use strict";
 const P = window.PADD, H = P.h, TAG = P.model.TAG;
@@ -16,6 +16,7 @@ const mb = m => m == null ? "–" : m >= 1024 ? (m / 1024).toFixed(1) + " GB" : 
 const fmtB = b => b == null ? "–" : b >= 1e12 ? (b / 1e12).toFixed(2) + " TB" : b >= 1e9 ? (b / 1e9).toFixed(1) + " GB" : b >= 1e6 ? (b / 1e6).toFixed(0) + " MB" : Math.round(b / 1e3) + " kB";
 const fmtN = n => n == null ? "–" : n.toLocaleString("en-US");
 const fmtT = t => t ? new Date(t * 1000).toLocaleString([], {weekday: "short", day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit", hour12: false}) : "–";
+const hm = t => t ? new Date(t * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", hour12: false}) : "–";
 const until = t => !t ? "–" : t < now() ? "due" : "in " + dur(t - now());
 const rate = b => b == null ? "–" : b >= 1e6 ? (b / 1e6).toFixed(1) + " MB/s" : (b / 1e3).toFixed(0) + " kB/s";
 const STATE = {ok: ["Nominal", "ready"], warn: ["Attention", "warn"], error: ["Fault", "fault"], off: ["Not configured", ""]};
@@ -32,7 +33,7 @@ const notes = d => [[d.errors, " err"], [d.problems, ""]].map(([l, c]) => (l || 
 const fail = (what, e) => { if(e && e.quiet) throw e; throw new Error(`${what}: ${(e && e.message) || e}`); };
 const fig = v => { const [n, u] = String(v).split(" "); return `<b>${esc(n)}${u ? `<small>${esc(u)}</small>` : ""}</b>`; };
 /* a row that only shows something; lines are HTML */
-const info = o => `<div class="p-row p-sy-flat" style="--c:var(--${o.c || "grid"})"><span class="p-m"><span class="p-t p-sel">${esc(o.t)}</span>${
+const info = o => `<div class="p-row p-sy-flat" style="--c:var(--${o.c || "grid"})"><span class="p-m"><span class="p-t${o.wrap ? " wrap" : ""} p-sel">${esc(o.t)}</span>${
   (o.lines || []).filter(Boolean).map(l => `<span class="p-s">${l}</span>`).join("")}${o.e ? `<span class="p-s wrap p-sel" style="color:var(--red)">${esc(o.e)}</span>` : ""}</span>${o.tag ? H.tag(o.tag, o.tagc) : ""}</div>`;
 const dl = rows => `<div class="p-sy-dl">${rows.map(([k, v]) => `<div><span>${esc(k)}</span><b class="p-sel">${esc(v == null || v === "" ? "–" : v)}</b></div>`).join("")}</div>`;
 const pan = (c, title, big, sub, kv, mid) => `<div class="p-card" style="--c:var(--${c})"><h3>${esc(title)}</h3>${big ? `<div class="p-free">${big}</div>` : ""}${mid || ""}${
@@ -46,7 +47,12 @@ P.css(`
 .p-sy-fig b{font-size:20px;font-weight:700;line-height:1;color:var(--peach);white-space:nowrap}
 .p-sy-fig small{margin-left:4px;font-size:12px;font-weight:600;color:var(--dim);letter-spacing:.1em;text-transform:uppercase}
 .p-sy-amb{color:var(--amber)}
+.p-kv .p-sy-amb{color:var(--amber)}
+.p-sy-up{overflow-wrap:anywhere}            /* an apt error or a package name can hold a URL with no break in it */
 .p-sy-flat:active{background:var(--card)}
+.p-sy-log{margin-top:8px;padding:8px 10px;background:var(--ink);border-left:4px solid var(--track);font:400 11px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;
+  letter-spacing:0;color:var(--text);white-space:pre-wrap;overflow-wrap:anywhere}
+.p-sy-log.err{color:#f0a9a9;border-left-color:var(--red)}
 .p-sy-state{display:flex;align-items:center;gap:10px;margin:8px 0 2px}
 .p-sy-pans{display:flex;flex-direction:column;gap:6px}
 .p-sy-pans .p-kv{margin-bottom:0}
@@ -113,8 +119,9 @@ const SUM = {
     if(d.configured === false) return {s: "Not set up", tag: "Not configured"};
     const sites = d.sites || [], up = sites.filter(x => !siteBad(x)).length, cert = Math.min(...sites.map(x => x.cert_days).filter(x => x != null));
     const [tag, tagc] = d.status === "ok" && d.reboot_required ? ["Reboot", "warn"] : stateTag(d.status);
+    const n = d.upd ? d.upd.count : d.updates, m = d.upd ? d.upd.security : 0;       /* the hourly scan, the probe's count until there is one */
     return {s: `${up === sites.length ? up : up + " of " + sites.length} site${sites.length === 1 ? "" : "s"} up${isFinite(cert) ? ` · certificates ${cert} days` : ""}`,
-      s2: `Web server${d.updates ? ` · ${d.updates} updates pending` : ""}`, tag, tagc};
+      s2: n ? `${m ? "" : "Web server · "}${plural(n, "update")} pending${m ? ` · ${m} security` : ""}` : "Web server", tag, tagc};
   },
   core: () => ({}),
 };
@@ -508,11 +515,12 @@ P.on("sys.backup", () => P.run(async () => {
   finally{ mabusy = false; P.refresh(["alpha"]); P.paint(); }
 }));
 
-/* ================================================================ Defiant: the web server, read only */
+/* ================================================================ Defiant: the web server and its package updates */
 const siteBad = s => !!(s.error || !s.status || (s.status >= 400 && s.status !== 401));    /* 401 = password-protected on purpose */
-P.screens["systems/defiant"] = { tab: "systems", title: "Defiant", color: "peach", parent: "#/systems", needs: {defiant: 15000},
+P.screens["systems/defiant"] = { tab: "systems", title: "Defiant", color: "peach", parent: "#/systems", needs: {defiant: 15000, updates: 30000},
   render(el){
     synced("defiant");
+    if(upLive(P.data.updates) && !upTimer) upTimer = setTimeout(() => { upTimer = 0; P.refresh(["updates"]); }, 3000);     /* a scan or the install is on its way: ask again in 3 s (after Back a late timer reads nothing: only the open screen's sources are polled) */
     if(wait(el, "defiant")) return;
     const d = P.data.defiant;
     if(d.configured === false){ P.put(el, `<div class="p-sy-state">${H.tag("Not configured")}</div><div class="p-card" style="--c:var(--peach)"><h3>Defiant is not set up</h3>
@@ -520,18 +528,19 @@ P.screens["systems/defiant"] = { tab: "systems", title: "Defiant", color: "peach
     const [tag, tagc] = stateTag(d.status), memU = d.mem_total_kb ? (1 - d.mem_avail_kb / d.mem_total_kb) * 100 : null, diskU = d.disk_total ? d.disk_used / d.disk_total * 100 : null;
     const sc = p => p == null ? "" : p > 90 ? "red" : p > 80 ? "amber" : "", gbi = kb => kb ? (kb / 1048576).toFixed(1) : "–";
     const hostC = d.status === "ok" ? "peach" : d.status === "warn" ? "amber" : "red", cpuC = sc(Math.max(d.cpu_pct || 0, memU || 0)), diskC = sc(diskU);
-    const sites = d.sites || [], ctrs = d.containers || [];
-    if(d.host == null){ P.put(el, `<div class="p-sy-state">${H.tag(tag, tagc)}</div>${lost("defiant")}${notes(d) || empty("The web server sent no figures")}`); return; }   /* the probe failed: only its error */
+    const sites = d.sites || [], ctrs = d.containers || [], upn = d.upd ? d.upd.count : d.updates;       /* the scan's count (the probe's also counts what phasing holds back) until there is a scan */
+    if(d.host == null){ P.put(el, `<div class="p-sy-state">${H.tag(tag, tagc)}</div>${lost("defiant")}${notes(d) || empty("The web server sent no figures")}${updBlock()}`); return; }   /* the probe failed: its error, and the install still in view (the upgrade can restart the network) */
     P.put(el, `<div class="p-sy-state">${H.tag(tag, tagc)}<span class="p-s">${esc(d.os || "")}${d.kernel ? " · kernel " + esc(d.kernel) : ""}</span></div>
       ${lost("defiant")}${notes(d)}
-      ${d.reboot_required ? H.msg(`Reboot required.${d.updates ? ` ${d.updates} updates are pending.` : ""}`) : ""}
+      ${d.reboot_required ? H.msg(`Reboot required.${upn ? ` ${plural(upn, "update")} ${upn === 1 ? "is" : "are"} pending.` : ""}`) : ""}
       ${H.sec("Server")}<div class="p-sy-pans">
       ${pan(hostC, d.host || "Defiant", d.uptime_s ? `${esc(dur(d.uptime_s))}<small>up</small>` : "–", "",
-        [["Cores", d.cpus || "–"], ["Load", String(d.load || "–").split(" ")[0]], ["Updates", d.updates ?? "–"], ["Reboot", d.reboot_required ? "Required" : "No"]])}
+        [["Cores", d.cpus || "–"], ["Load", String(d.load || "–").split(" ")[0]], ["Updates", upn ?? "–"], ["Reboot", d.reboot_required ? "Required" : "No"]])}
       <div class="p-card" style="--c:var(--${cpuC || "peach"})"><h3>CPU and memory</h3><div class="p-free">${esc(d.cpu_pct ?? "–")}<small>% CPU</small></div>${gauge(d.cpu_pct, sc(d.cpu_pct))}
         <div class="p-s wrap">Memory ${memU == null ? "–" : memU.toFixed(0) + " % used"} · ${gbi(d.mem_avail_kb)} of ${gbi(d.mem_total_kb)} GiB free</div>${gauge(memU, sc(memU))}</div>
       ${pan(diskC || "peach", "Disk and network", `${esc(fmtB(d.disk_used))}<small>of ${esc(fmtB(d.disk_total))}</small>`, "",
         [["Free", fmtB(d.disk_avail)], ["In", rate(d.rx_bps)], ["Out", rate(d.tx_bps)]], gauge(diskU, diskC))}</div>
+      ${updBlock()}
       ${H.sec("Sites", sites.length || "")}<div class="p-list">${sites.map(s => { const bad = siteBad(s), soon = s.cert_days != null && s.cert_days < 14;
         return info({c: bad ? "red" : soon ? "amber" : "blue", t: s.domain, e: s.error, tag: s.status ? s.status + (s.status === 401 ? " protected" : "") : "down", tagc: bad ? "fault" : "ready",
           lines: [[s.ms == null ? "" : s.ms + " ms", s.cert_days == null ? "" : `<span${soon ? ' class="p-sy-amb"' : ""}>certificate ${esc(s.cert_days)} days</span>`].filter(Boolean).join(" · "),
@@ -539,4 +548,88 @@ P.screens["systems/defiant"] = { tab: "systems", title: "Defiant", color: "peach
       ${H.sec("Containers", ctrs.length || "")}<div class="p-list">${ctrs.map(c => info({c: c.state === "running" ? "blue" : "red", t: c.name, lines: [esc(c.status)], tag: c.state, tagc: c.state === "running" ? "ready" : "fault"})).join("")
         || `<div class="p-empty">No containers</div>`}</div>`);
   } };
+
+/* ---- package updates (fleet.html, Updates block: same rules, same words). Fleet runs an apt simulation on Defiant every
+   hour and keeps the result in memory, so /api/defiant/updates is cheap. While a scan or the install runs, or none has
+   run yet, the screen asks again every 3 s. Package names, versions and log lines come from the server: escaped everywhere. */
+const UP_SVC = /^(docker|containerd|tailscale)/, UP_BOOT = /^(linux-image|libc6$)/;      /* restart services / need a reboot */
+const UP_ROWS = 12;                                                                       /* a phone lists the first 12, security first; the Mac page lists them all */
+const upName = x => typeof x === "string" ? x : x && x.name != null ? x.name : "";     /* a removal may arrive as a name or as an object */
+const upSome = (l, n) => l.length > n ? `${l.slice(0, n).join(", ")}, +${l.length - n} more` : l.join(", ");
+const upFam = (re, l) => [...new Set(l.map(x => (String(x).match(re) || [])[1]).filter(Boolean))];
+let sgrace = 0, igrace = 0, smark = "", imark = 0, upTimer = 0;     /* a scan / the install counts as starting until this time: forever while its request is out, 8 s after Fleet accepted it */
+const going = t => Date.now() < t;
+const upMark = u => u && u.scan ? `${u.scan.at}|${u.scan.error_at}` : "";     /* changes when a scan ends */
+const sgoing = u => going(sgrace) && upMark(u) === smark;     /* a scan asked for here is running until its result shows, not for the whole grace */
+const igoing = u => going(igrace) && ((u.job || {}).started_at || 0) === imark;     /* an install asked for here is starting until Fleet shows its job (a new start time) */
+const upLive = u => !!u && u.configured !== false && (!u.scan || u.scan.busy || (u.job || {}).state === "running" || sgoing(u) || igoing(u));
+const upWhy = (u, sc) => (u.job || {}).state === "running" ? "An install is running, progress below." : igoing(u) ? "Starting the install..."
+  : sc.busy || sgoing(u) ? "A scan is running, try again in a minute." : !sc.at ? "No scan yet: scan first." : !sc.count ? "Nothing to install." : "";     /* Fleet answers 409 to an install during a scan */
+const upLog = (log, bad) => { const l = (log || []).slice(-10); return l.length ? `<div class="p-sy-log p-sel${bad ? " err" : ""}">${l.map(esc).join("\n")}</div>` : ""; };
+const upRow = p => info({c: p.security ? "amber" : p.third_party ? "mauve" : "blue", t: p.name, wrap: true, tag: p.security ? "Security" : "", tagc: "warn",
+  lines: [`<span class="p-sy-path">${p.from ? `${esc(p.from)} → ${esc(p.to)}` : `new ${esc(p.to)}`}</span>`,
+    `<span class="p-sy-path">${esc((p.suites || []).join(", "))}${p.third_party ? ` · third party${p.origin ? ` (${esc(p.origin)})` : ""}` : ""}</span>`]});
+function upJob(j, reboot){      /* reboot: the latest scan still wants one */
+  const at = j.started_at ? `Started ${hm(j.started_at)}` : "";
+  if(j.state === "running") return `<div class="p-card" style="--c:var(--${j.lost ? "amber" : "peach"})"><h3>Installing updates</h3>
+    <div class="p-free">${j.started_at ? `${esc(dur(now() - j.started_at))}<small>running</small>` : "..."}</div><div class="p-track indet"><i></i></div>
+    <div class="p-s wrap p-sel">${at} · log refreshes every 3 seconds</div>
+    ${j.lost ? H.msg("Lost contact with Defiant, retrying. The install keeps running there.") : ""}
+    ${upLog(j.log) || `<div class="p-s" style="margin-top:8px">Waiting for the first line of output...</div>`}</div>`;
+  if(j.state === "done") return `<div class="p-card" style="--c:var(--blue)"><h3>Install finished</h3>
+    <div class="p-free">${j.installed != null ? `${esc(j.installed)}<small>installed</small>` : "Done"}</div>
+    <div class="p-s wrap p-sel">${j.ended_at ? `${ago(j.ended_at)} · ` : ""}reboot required afterwards: ${j.reboot_required == null ? "unknown" : j.reboot_required ? "yes" : "no"}</div>
+    ${reboot ? `<p>Reboot Defiant when it suits you. The Install updates button never reboots.</p>` : ""}</div>`;
+  if(j.state === "failed") return `<div class="p-card" style="--c:var(--red)"><h3>Install failed</h3>
+    <div class="p-free" style="color:var(--red)">${j.exit != null ? `exit ${esc(j.exit)}` : "no exit code"}</div>
+    <div class="p-s wrap p-sel">${at}${j.ended_at ? ` · ended ${ago(j.ended_at)}` : ""}</div>
+    ${upLog(j.log, true) || `<div class="p-s" style="margin-top:8px">No log lines.</div>`}</div>`;
+  return "";
+}
+function updBlock(){
+  const u = P.data.updates;
+  if(!u) return H.sec("Updates") + (P.err.updates ? H.msg(P.err.updates, true) : empty("Checking..."));
+  if(u.configured === false) return "";
+  const s = u.scan || {}, j = u.job || {}, ok = !!s.at, run = j.state === "running", pk = s.packages || [], gone = (s.remove || []).map(upName), bp = s.reboot_pkgs || [];
+  const n = +s.count || 0, sec = +s.security || 0, held = (s.deferred || []).length, scanning = !!s.busy || sgoing(u), why = upWhy(u, s);
+  const shown = pk.slice(0, UP_ROWS), rest = n - shown.length, restSec = pk.slice(UP_ROWS).filter(p => p.security).length;
+  return `<div class="p-sy-up">${H.sec("Updates", ok ? `${n} pending` : "")}${lost("updates")}
+    ${s.error ? H.msg(sent(`Scan failed${s.error_at ? " " + ago(s.error_at) : ""}${ok ? ", showing the scan from " + hm(s.at) : ""}: ${s.error}`)) : ""}
+    <div class="p-card" style="--c:var(--${sec || s.reboot_required || s.error ? "amber" : "peach"})"><h3>Pending updates</h3>
+      ${ok ? `<div class="p-free">${n}<small>to install</small></div>` : ""}
+      ${scanning ? `<div class="p-track indet"><i></i></div><div class="p-s">Scanning...</div>` : ""}
+      ${ok ? `<div class="p-kv"><div><b${sec ? ' class="p-sy-amb"' : ""}>${sec}</b><span>Security</span></div><div><b>${held}</b><span>Held back</span></div>${
+        gone.length ? `<div><b>${gone.length}</b><span>Remove</span></div>` : ""}<div><b${s.reboot_required ? ' class="p-sy-amb"' : ""}>${s.reboot_required ? "Required" : "No"}</b><span>Reboot</span></div></div>` : ""}
+      <div class="p-s wrap p-sel">${ok ? `Last scan ${hm(s.at)} (${ago(s.at)})${s.next_at ? ` · next ${hm(s.next_at)}` : ""}` : s.error ? `No scan yet. Fleet tries again at ${hm(s.next_at)}.` : "No scan yet. The first one runs shortly after Fleet starts."}</div>
+      ${held ? `<p>${held} held back by Ubuntu's staged rollout: Ubuntu releases them in steps, they follow by themselves.</p>` : ""}
+      ${s.reboot_required && bp.length ? `<p>Reboot needed for ${esc(upSome(bp, 4))}.</p>` : ""}</div>
+    <div class="p-pair" style="margin-top:8px"><button class="p-btn ghost" type="button" data-act="sys.scan"${scanning || run ? " disabled" : ""}>${scanning ? "Scanning" : "Scan now"}</button>
+      <button class="p-btn" type="button" data-act="sys.install"${why ? " disabled" : ""}>${igoing(u) && !run ? "Starting" : run ? "Installing" : "Install updates"}</button></div>
+    <p class="p-note p-sel">${esc(why || "Fleet scans every hour and sends security updates and a pending reboot once to Telegram. Install needs the Starfleet key and never reboots Defiant.")}</p>
+    ${upJob(j, s.reboot_required)}
+    ${gone.length ? H.msg(`The install removes ${plural(gone.length, "package")}: ${upSome(gone, 6)}.`) : ""}
+    ${pk.length ? `${H.sec("Packages", n)}<div class="p-list">${shown.map(upRow).join("")}${rest > 0 ? info({t: `+${rest} more`, lines: [esc(restSec ? `${restSec} of them security updates` : "No security updates among them")]}) : ""}</div>` : ""}</div>`;
+}
+P.on("sys.scan", () => P.run(async () => {
+  if(sgoing(P.data.updates)) return;
+  smark = upMark(P.data.updates); sgrace = Infinity; P.paint();
+  try{ const j = await P.api.post("/api/defiant/updates/scan", {}, {key: false});             /* a scan only looks: no key */
+       if(j && j.started === false){ sgrace = 0; P.toast(j.reason === "busy" ? "A scan is already running." : "A scan ran a moment ago."); }
+       else { sgrace = Date.now() + 8000; P.haptic("success"); P.toast("Scan started."); } }
+  catch(e){ sgrace = 0; fail("Scan failed", e); }
+  finally{ P.refresh(["updates"]); P.paint(); }
+}));
+P.on("sys.install", () => P.run(async () => {
+  const u = P.data.updates, s = (u && u.scan) || {}; if(!u || upWhy(u, s)) return;
+  const names = (s.packages || []).map(p => p.name), gone = (s.remove || []).map(upName), svc = upFam(UP_SVC, names), reb = upFam(UP_BOOT, names), sec = +s.security || 0;
+  if(!await P.confirm({title: "Install updates?", sub: "Defiant", yes: "Install",
+    text: `${plural(+s.count, "package")} will be upgraded${sec ? `, ${sec} of them security updates` : ""}.`
+      + (gone.length ? ` It removes ${plural(gone.length, "package")}: ${upSome(gone, 6)}.` : "")
+      + (svc.length ? ` It restarts services (${svc.join(", ")}): the sites can be unreachable for a few seconds.` : "")
+      + (reb.length ? ` It needs a reboot afterwards (${reb.join(", ")}), and this button never reboots.` : "")})) return;
+  imark = (P.data.updates.job || {}).started_at || 0; igrace = Infinity; P.paint();
+  try{ await P.api.post("/api/defiant/updates/install", {}, {timeout: 60000}); igrace = Date.now() + 8000; P.haptic("success"); P.toast("Install started."); }
+  catch(e){ igrace = 0; fail("Install failed", e); }
+  finally{ P.refresh(["updates"]); P.paint(); }
+}));
 })();
