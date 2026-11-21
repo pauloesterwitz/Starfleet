@@ -2,7 +2,7 @@
 # Self-update, run by Starfleet Command at every start and from Check for Updates (SelfUpdate
 # in App.swift) in the clone the running build came from, with the app's bundle path and
 # process id:
-#   1. fast-forwards main from Gitea (the remote "gitea"; never a merge, never on another branch),
+#   1. fast-forwards main from origin (never a merge, never on another branch),
 #   2. Mac: when the app's sources changed since this build, rebuilds with package.sh,
 #      swaps the bundle, quits the running app and opens the new one (whose own start
 #      then does step 3),
@@ -11,7 +11,7 @@
 #      installs it on the iPhone that is connected now.
 # The web page needs none of this: Fleet serves it fresh.
 #
-# Exit codes, for the dropdown: 0 nothing (more) to do, 3 Gitea not reachable, 4 the clone
+# Exit codes, for the dropdown: 0 nothing (more) to do, 3 origin not reachable, 4 the clone
 # is not on main, cannot fast-forward, or has uncommitted changes in the app's sources, 5 the
 # Mac app is up to date but the iPhone app was not updated, 6 another update is running;
 # anything else is a failure. A Mac update does not report back: it quits the app and opens
@@ -40,14 +40,8 @@ trap 'rm -f "$LOCK"; [ -z "${relaunch:-}" ] || open "$APP_PATH"' EXIT
 
 [ "$(git symbolic-ref -q --short HEAD)" = main ] || { echo "clone is not on main, no update"; exit 4; }
 stuck=0
-# Updates come from Gitea on the NAS, not GitHub. The clone may have been made from GitHub, so the remote is added on first use;
-# `git config starfleet.updateRemote <name>` or `starfleet.updateUrl <url>` overrides it.
-REMOTE=$(git config --get starfleet.updateRemote || echo gitea)
-if ! git remote get-url "$REMOTE" >/dev/null 2>&1; then
-    git remote add "$REMOTE" "$(git config --get starfleet.updateUrl || echo ssh://git@deep-space-nas:2223/cluster/starfleet.git)"
-fi
-if git fetch -q "$REMOTE" main; then
-    git merge -q --ff-only "$REMOTE/main" \
+if git fetch -q origin main; then
+    git merge -q --ff-only origin/main \
         || { echo "main cannot fast-forward (local commits or changes), staying on $(git rev-parse --short HEAD)"; stuck=4; }
 else
     echo "fetch failed (offline?), checking against $(git rev-parse --short HEAD)"; stuck=3

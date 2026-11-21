@@ -1691,7 +1691,7 @@ every start, and from **Check for Updates…** in the dropdown or the app menu, 
 [`update.sh`](update.sh) from the clone it was built from (`package.sh` stamps that path
 and the commit into the bundle), in the background:
 
-1. `main` is fast-forwarded from Gitea (remote `gitea`, added on first use; `git config starfleet.updateRemote` or `starfleet.updateUrl` overrides). Never a merge; a clone on another branch, or
+1. `main` is fast-forwarded from `origin`. Never a merge; a clone on another branch, or
    with local commits, is left alone.
 2. **Mac**: when the app's sources changed since the running build, `package.sh`
    rebuilds it, and the app quits, is swapped for the new bundle and opens again. The
@@ -1711,7 +1711,7 @@ lock (`shlock`) that is dropped once its process is gone, and the update quits a
 opened again meanwhile too. The dropdown shows how the last run ended:
 
 - up to date, with the build's commit;
-- Gitea not reachable;
+- GitHub not reachable;
 - the clone is on another branch, cannot fast-forward, or has uncommitted changes in the
   app's sources;
 - the iPhone app was not updated (phone away, or its build failed);

@@ -109,7 +109,7 @@ struct HelpButton: View {
 
 /// Updates itself at every start, and on demand from Check for Updates…. package.sh stamps
 /// the clone this build came from into the bundle (Resources/repo-path); that clone's
-/// update.sh fast-forwards main from Gitea, rebuilds and relaunches this app when its
+/// update.sh fast-forwards main from origin, rebuilds and relaunches this app when its
 /// sources changed, and reinstalls the iPhone app when ios/ changed or its signing profile
 /// expired. It logs to
 /// ~/Library/Logs/Starfleet Command update.log. A `swift run` build has no stamp: no update.
@@ -174,7 +174,7 @@ final class SelfUpdate: ObservableObject {
         let build = AboutPanel.buildCommit.map { " (build \($0))" } ?? ""
         switch status {
         case 0: finish("Up to date\(build).", failed: false)
-        case 3: finish("Gitea not reachable. No update\(build).", failed: true)
+        case 3: finish("GitHub not reachable. No update\(build).", failed: true)
         case 4: finish("The clone is not on main, or has commits or changes of its own: update it by hand.", failed: true)
         case 5: finish("Mac app up to date\(build); the iPhone app was not updated: see the log.", failed: true)
         case 6: finish("Another update is already running.", failed: false)
