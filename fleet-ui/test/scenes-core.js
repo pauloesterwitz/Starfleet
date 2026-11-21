@@ -83,6 +83,7 @@ exports.get = (p, variant, q, h) => {
   if(p === "/api/events" && !(q.get("ev") || /[?&]ev=/.test((h || {}).referer || ""))) return {events: [], latest: 0, open: [], at: now()};   /* the default: no messages. scenes-messages answers a page opened as /padd?ev=<set> */
   if(p === "/api/memoryalpha") return alpha();
   if(p === "/api/defiant") return defiant(variant);
+  if(p === "/api/cluster/update") return {state: {phase: "idle"}, pending: {}, pending_at: null};
   if(p === "/api/computer/sessions") return keyOk(h) ? sessions(variant) : denied;
   if(p === "/api/computer/models") return keyOk(h) ? {models: [{id: "qwen38fn-sglang-tp2-starfleet", vision: true}], servers: {}} : denied;   /* the key check */
 };
