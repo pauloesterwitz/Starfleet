@@ -3760,6 +3760,25 @@ def computer_transcribe(wav):
     raise OSError("transcription failed: " + "; ".join(errors))
 
 
+def computer_speak(body):
+    """One sentence of a reply, spoken in the ship's-computer voice (Piper + RVC on a Spark's CPU). The voice is a Shuttle Bay
+    Speech member (api "tts") that Paul loads; like everything in Computer this never loads a model. Returns (wav bytes, language)."""
+    text = " ".join(str(body.get("text", "")).split())
+    if not text:
+        raise ValueError("no text")
+    if len(text) > 600:
+        raise ValueError("at most 600 characters per request")
+    lang = body.get("lang")
+    urls = [p["url"] for r in speech.state().get("members", []) if r.get("api") == "tts"
+            for p in r["per_node"].values() if p.get("state") == "ready" and p.get("url")]
+    if not urls:
+        raise PermissionError("The Computer voice is not loaded. Load it in Shuttle Bay (Speech).")
+    req = urllib.request.Request(urls[0] + "/speak", method="POST", headers={"Content-Type": "application/json"},
+                                 data=json.dumps({"text": text, **({"lang": lang} if lang in ("de", "en") else {})}).encode())
+    with urllib.request.urlopen(req, timeout=120) as r:      # a long sentence on a busy CPU takes seconds; the page prefetches
+        return r.read(), r.headers.get("X-Voice-Lang")
+
+
 # ---------------------------------------------------------------- agent sessions (phone interface)
 # What the Mac app reads over ssh, for a client that has no ssh: ~/bin/opencode-status.py and
 # ~/bin/opencode-export-tail.py on each node (cluster/, deployed by sync-hosts.sh). Session titles and
@@ -4386,9 +4405,14 @@ def push_dispatch(pairs):
 
 # ---------------------------------------------------------------- http
 
-CSP = ("default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' "
+CSP = ("default-src 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline' "
        "https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data: blob:; "
        "media-src 'self' blob:; connect-src 'self'; form-action 'none'; base-uri 'none'; frame-ancestors 'self'")
+
+
+VOICE_DIR = os.path.expanduser(os.environ.get("FLEET_VOICE_DIR", "~/computer-voice"))
+VOICE_RT = {"ort.wasm.min.js": "application/javascript", "ort-wasm-simd-threaded.mjs": "application/javascript", "ort-wasm-simd-threaded.wasm": "application/wasm",
+            "piper_phonemize.js": "application/javascript", "piper_phonemize.wasm": "application/wasm", "piper_phonemize.data": "application/octet-stream"}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -4439,6 +4463,22 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(data or b"{}")
         except ValueError:
             return self._send(400, '{"error":"bad json"}', "application/json")
+        if self.path == "/api/computer/speak":         # a sentence of a reply, spoken (computer_speak); the page plays the WAV
+            try:
+                wav, _lang = computer_speak(body)
+            except PermissionError as e:
+                return self._send(409, json.dumps({"error": str(e)}), "application/json")
+            except ValueError as e:
+                return self._send(400, json.dumps({"error": str(e)}), "application/json")
+            except urllib.error.HTTPError as e:           # the voice server's own answer: nothing to say / too long
+                try:
+                    msg = str(json.loads(e.read()).get("error") or "")
+                except (ValueError, AttributeError, OSError):
+                    msg = ""
+                return self._send(e.code if e.code in (400, 413) else 502, json.dumps({"error": (msg or f"voice server: HTTP {e.code}")[:200]}), "application/json")
+            except OSError as e:                          # URLError is an OSError too
+                return self._send(502, json.dumps({"error": "voice server: " + str(e)[:160]}), "application/json")
+            return self._send(200, wav, "audio/wav")
         if self.path == "/api/computer/wiki/edit":     # Memory Core's Edit button: save / rename one page (wikiedit.py)
             try:
                 out = wikicore.page_edit(body)
@@ -4492,6 +4532,21 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(404, '{"error":"unknown"}', "application/json")
 
     def do_GET(self):
+        if self.path.startswith("/voice-rt/"):            # on-device voice: onnxruntime-web, the phonemizer and its data (public code, not the voices)
+            name = self.path[len("/voice-rt/"):].split("?")[0]
+            if name not in VOICE_RT:
+                return self._send(404, "", "text/plain")
+            p = os.path.join(VOICE_DIR, "web-rt", name)
+            if not os.path.isfile(p):
+                return self._send(404, "", "text/plain")
+            with open(p, "rb") as f:
+                data = f.read()
+            self.send_response(200)
+            self.send_header("Content-Type", VOICE_RT[name])
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "max-age=86400")
+            self.end_headers()
+            return self.wfile.write(data)
         if self.path.startswith("/vendor/"):
             name = self.path[len("/vendor/"):]
             if not re.fullmatch(r"[a-z0-9.-]+\.(js|css)", name):
@@ -4509,6 +4564,13 @@ class Handler(BaseHTTPRequestHandler):
             u = urllib.parse.urlsplit(self.path)
             q = urllib.parse.parse_qs(u.query)
             try:
+                if u.path.startswith("/api/computer/voice-model/"):   # the distilled voices (they carry the imitated voice: keyed, never in a repo)
+                    name = u.path[len("/api/computer/voice-model/"):]
+                    p = os.path.join(VOICE_DIR, "voices", name)
+                    if not re.fullmatch(r"(en|de)\.onnx(\.json)?", name) or not os.path.isfile(p):
+                        return self._send(404, '{"error":"no such voice file"}', "application/json")
+                    with open(p, "rb") as f:
+                        return self._send(200, f.read(), "application/json" if name.endswith(".json") else "application/octet-stream")
                 if u.path == "/api/computer/models":
                     t = computer_tools()
                     return self._send(200, json.dumps({"models": computer_models(),

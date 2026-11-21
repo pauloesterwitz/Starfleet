@@ -292,6 +292,9 @@ body.fs #compview{height:calc(100vh - 36px)}
 .cm{margin:0 0 14px;max-width:980px}
 .cm .who{font-size:11px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;margin-bottom:3px}
 .cm.user .who{color:var(--peach)} .cm.bot .who{color:var(--blue)}
+.cm .who .spk{margin-left:10px;height:18px;padding:0 10px;border:0;border-radius:9px;background:var(--grid);color:var(--blue);font:700 10px/18px var(--lcars);letter-spacing:.14em;text-transform:uppercase;cursor:pointer;vertical-align:1px}
+.cm .who .spk::before{content:"Speak"} .cm .who .spk[data-state]::before{content:"Stop"} .cm .who .spk[data-state=loading]::before{content:"Stop \00b7  ..."}
+.cm .who .spk:hover{background:var(--blue);color:#000}
 .cm .body{border-left:6px solid var(--grid);padding:6px 12px;background:#0b0803;color:#f3e6d8;font-family:-apple-system,"Segoe UI",
   Roboto,"Helvetica Neue",sans-serif;font-size:15px;line-height:1.55;letter-spacing:normal;overflow-wrap:anywhere}
 .cm.user .body{border-left-color:var(--peach)} .cm.bot .body{border-left-color:var(--blue)}
@@ -507,7 +510,7 @@ html.fs{scrollbar-width:none} html.fs::-webkit-scrollbar{display:none}
   #rows td.empty{flex:1 1 100%}
 }
 </style><link rel="stylesheet" href="/vendor/atom-one-dark.min.css"><link rel="stylesheet" href="/vendor/memcore.css">
-<script src="/vendor/marked.min.js"></script><script src="/vendor/purify.min.js"></script><script src="/vendor/highlight.min.js"></script><script src="/vendor/speech.js"></script>
+<script src="/vendor/marked.min.js"></script><script src="/vendor/purify.min.js"></script><script src="/vendor/highlight.min.js"></script><script src="/vendor/speech.js"></script><script src="/vendor/computer-voice.js"></script><script src="/vendor/computer-voice-local.js"></script>
 </head><body>
 <div id="adov"><div class="box">
   <div class="e1"></div><div class="hd" id="adhd">Auto Destruct Sequence</div>
@@ -656,6 +659,7 @@ html.fs{scrollbar-width:none} html.fs::-webkit-scrollbar{display:none}
           <button class="tpill on" data-tool="wiki" title="Search and read your wiki (local)">Wiki</button>
           <button class="tpill web on" data-tool="vane" title="vane research (internet). Every query is checked first: no customer names, secrets, personal data or pasted text leave this host.">Vane</button>
           <button class="tpill web on" data-tool="google" title="Google search (internet). Every query is checked first: no customer names, secrets, personal data or pasted text leave this host.">Google</button>
+          <button class="tpill" id="compvoice" title="Computer reads each new reply aloud in the ship's computer voice. The voice must be loaded in Shuttle Bay (Speech).">Auto speak</button>
           <button class="tpill" id="comphot" title="Set the key combination that opens Computer and starts the microphone">Hotkey</button>
           <button class="tpill" id="complogb" type="button" hidden title="Open this conversation's access log in Memory Core: which wiki pages Computer searched, read and cited">Access log</button>
           <span id="comphint"></span>
@@ -2079,6 +2083,12 @@ async function compJSON(url,opt){
   if(!r.ok) throw new Error(j.error||("HTTP "+r.status));
   return j;
 }
+/* Computer voice (vendor/computer-voice.js): a Speak button on every reply; the Auto speak pill reads new replies aloud while they stream */
+const compSpk=new WeakMap();      /* reply element -> its markdown, for the Speak button */
+CV.init({say:(t,e)=>compMsg(t,e)});
+(()=>{ const b=document.getElementById("compvoice"), paint=()=>b.classList.toggle("on",CV.auto);
+  CV.onauto=paint; paint(); b.onclick=()=>{ CV.auto=!CV.auto; if(CV.auto) CV.prime(); };
+  document.getElementById("complog").addEventListener("click",e=>{ const s=e.target.closest(".spk"); if(s) CV.toggle(s,compSpk.get(s.closest(".cm"))||""); }); })();
 async function compOpen(){
   compHint();
   try{
@@ -2105,7 +2115,7 @@ async function compList(){
     (j.chats||[]).map(c=>`<div class="it ${compChat&&compChat.id===c.id?"on":""}" onclick="compLoad('${c.id}')"><span>${esc(c.title)}
       <small>${ago(c.updated)}</small></span><button title="Delete this chat" onclick="event.stopPropagation();compDel('${c.id}',this)">✕</button></div>`).join("");
 }
-function compNew(){ compChat=null; compWikiSet(false); document.getElementById("complog").innerHTML=""; compList(); document.getElementById("comptext").focus(); }
+function compNew(){ CV.stop(); compChat=null; compWikiSet(false); document.getElementById("complog").innerHTML=""; compList(); document.getElementById("comptext").focus(); }
 async function compDel(id,btn){
   if(btn.dataset.arm!=="1"){ btn.dataset.arm="1"; btn.textContent="Sure?"; setTimeout(()=>{ btn.dataset.arm=""; btn.textContent="✕"; },3000); return; }
   try{ await compJSON("/api/computer/delete",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id})}); }catch(e){ compMsg(e.message,true); }
@@ -2116,7 +2126,7 @@ function compUserHTML(content){
   return content.map(p=>p.type==="text"?md(p.text):`<img src="${esc(p.image_url.url)}" alt="attached image">`).join("");
 }
 function compBot(){ const el=document.createElement("div"); el.className="cm bot";
-  el.innerHTML=`<div class="who">Computer</div><div class="tools"></div><details class="think" hidden><summary>Thinking</summary><pre></pre></details><div class="body"></div><div class="thumbs"></div>`;
+  el.innerHTML=`<div class="who">Computer<button class="spk" type="button" aria-label="Read this reply aloud" title="Read this reply aloud in the ship's computer voice"></button></div><div class="tools"></div><details class="think" hidden><summary>Thinking</summary><pre></pre></details><div class="body"></div><div class="thumbs"></div>`;
   return el; }
 function compAddUser(content){ const el=document.createElement("div"); el.className="cm user";
   el.innerHTML=`<div class="who">You</div><div class="body">${compUserHTML(content)}</div>`; document.getElementById("complog").appendChild(el); }
@@ -2124,7 +2134,7 @@ function compChip(el,name,args,web){ const q=args&&(args.query||args.path||args.
   el.querySelector(".tools").insertAdjacentHTML("beforeend",`<span class="tc ${web?"web":""}" title="${esc(JSON.stringify(args||{}))}"><b>${esc(name)}</b>${esc(String(q).slice(0,80))}</span>`); }
 function compHL(el){ compRemote(el); if(window.hljs) el.querySelectorAll("pre code").forEach(c=>{ try{ hljs.highlightElement(c); }catch(e){} }); }
 const WEB=n=>/^(vane|google)_/.test(n);
-async function compLoad(id){
+async function compLoad(id){ CV.stop();
   try{ compChat=await compJSON("/api/computer/chat?id="+encodeURIComponent(id)); }catch(e){ return compMsg(e.message,true); }
   const log=document.getElementById("complog"); log.innerHTML=""; let bot=null;
   for(const m of compChat.messages){
@@ -2132,7 +2142,7 @@ async function compLoad(id){
     else if(m.role==="assistant"){ if(!bot){ bot=compBot(); log.appendChild(bot); }
       if(m.reasoning){ const d=bot.querySelector(".think"); d.hidden=false; d.querySelector("pre").textContent+=m.reasoning; }
       (m.tool_calls||[]).forEach(tc=>{ let a={}; try{ a=JSON.parse(tc.function.arguments||"{}"); }catch(e){} compChip(bot,tc.function.name,a,WEB(tc.function.name)); });
-      if(m.content){ bot.querySelector(".body").innerHTML=md(m.content); compHL(bot); } }
+      if(m.content){ bot.querySelector(".body").innerHTML=md(m.content); compHL(bot); compSpk.set(bot,m.content); } }
     else if(m.role==="tool"&&bot){ (m.images||[]).forEach(u=>bot.querySelector(".thumbs").insertAdjacentHTML("beforeend",`<img src="${esc(u)}" alt="tool image">`)); }
   }
   log.scrollTop=log.scrollHeight; compList();
@@ -2147,8 +2157,8 @@ async function compSend(){
   const imgs=compImgs.slice(); compImgs=[]; compAtt(); ta.value="";
   compAddUser(imgs.length?[{type:"text",text},...imgs.map(u=>({type:"image_url",image_url:{url:u}}))]:text);
   const log=document.getElementById("complog"), bot=compBot(); log.appendChild(bot); log.scrollTop=log.scrollHeight;
-  let txt="", think="", raf=0, gotDone=false;
-  const paint=()=>{ raf=0; bot.querySelector(".body").innerHTML=md(txt)||'<span class="st loading">working...</span>'; compHL(bot); log.scrollTop=log.scrollHeight; };
+  let txt="", think="", raf=0, gotDone=false; CV.stop(); CV.prime(); const vs=CV.stream(bot.querySelector(".spk"));
+  const paint=()=>{ raf=0; compSpk.set(bot,txt); bot.querySelector(".body").innerHTML=md(txt)||'<span class="st loading">working...</span>'; compHL(bot); log.scrollTop=log.scrollHeight; };
   paint();
   try{
     const r=await fetch("/api/computer/send",{method:"POST",headers:{"Content-Type":"application/json"},
@@ -2158,7 +2168,7 @@ async function compSend(){
     for(;;){ const {value,done}=await rd.read(); if(done) break; buf+=dec.decode(value,{stream:true});
       let i; while((i=buf.indexOf("\n\n"))>=0){ const line=buf.slice(0,i); buf=buf.slice(i+2);
         if(!line.startsWith("data:")) continue; let e; try{ e=JSON.parse(line.slice(5)); }catch(x){ continue; }
-        if(e.type==="token"){ txt+=e.text; if(!raf) raf=requestAnimationFrame(paint); }
+        if(e.type==="token"){ txt+=e.text; if(vs) vs.feed(txt); if(!raf) raf=requestAnimationFrame(paint); }
         else if(e.type==="reasoning"){ think+=e.text; const d=bot.querySelector(".think"); d.hidden=false; d.querySelector("pre").textContent=think; }
         else if(e.type==="tool_call"){ if(txt){ txt+="\n\n"; } compChip(bot,e.name,e.args,WEB(e.name)); }
         else if(e.type==="tool_result"){ if(/^wiki_/.test(e.name||"")) compWikiSet(true); if(e.guarded) compMsg("Web guard: a query with customer names, personal data, a secret or copied text was not sent; the model rephrases it.");
@@ -2168,7 +2178,7 @@ async function compSend(){
         else if(e.type==="done"){ compChat={id:e.id}; gotDone=true; } } }
     if(!gotDone) compMsg("The connection ended before the answer finished. Reopen this chat to see what was saved.",true);
   }catch(e){ compMsg(e.message,true); }
-  paint(); compBusy=false; document.getElementById("compsend").disabled=false; compList();
+  paint(); if(vs) vs.end(txt); compBusy=false; document.getElementById("compsend").disabled=false; compList();
 }
 document.getElementById("compsend").onclick=compSend;
 document.getElementById("comptext").addEventListener("keydown",e=>{ if(e.key==="Enter"&&!e.shiftKey&&!e.isComposing){ e.preventDefault(); compSend(); } });
@@ -2233,7 +2243,7 @@ function setView(v){
   if(ctrOn) ctrPoll(); else clearTimeout(ctrTimer);
   if(maOn) maPoll(); else clearTimeout(maTimer);
   if(defOn) defPoll(); else{ clearTimeout(defTimer); clearTimeout(updTimer); clearTimeout(updArmT); updArmed=false; }
-  if(compOn) compOpen();
+  if(compOn) compOpen(); else CV.stop();     /* leaving Computer ends the speech: its Stop button is not on screen any more */
   if(v==="wiki"){ if(window.wikiOpen) wikiOpen(); } else if(window.wikiClose) wikiClose();   /* vendor/memcore.js */
 }
 Object.entries(VIEWS).forEach(([k,[b]])=>document.getElementById(b).addEventListener("click",()=>setView(k)));

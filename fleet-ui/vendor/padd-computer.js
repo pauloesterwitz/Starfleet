@@ -98,6 +98,10 @@ html.kb .p-comp{padding-bottom:8px}
 .p-cchat{display:flex;gap:4px}
 .p-cchat .p-row{flex:1;min-width:0}
 .p-cdel{flex:none;min-width:76px;border:0;padding:0 12px;background:var(--card);color:var(--red);font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:.1em}
+.p-spk{align-self:flex-start;display:inline-flex;align-items:center;gap:8px;min-height:44px;padding:0 16px 0 12px;border:0;border-radius:22px;background:var(--card);color:var(--blue);font:700 12px var(--lcars);letter-spacing:.14em;text-transform:uppercase}
+.p-spk svg{width:20px;height:20px;fill:currentColor}
+.p-spk::after{content:"Speak"} .p-spk[data-state]{background:var(--blue);color:#000} .p-spk[data-state]::after{content:"Stop"}
+.p-ma:empty~.p-spk{display:none}
 `);
 
 /* ---------------------------------------------------------------- markdown (fleet.html L1795-1810)
@@ -182,14 +186,15 @@ function userEl(content){
   const el = mk("p-mu", typeof content === "string" ? md(content) : content.map(p => p.type === "text" ? md(p.text) : thumb(p.image_url.url, "attached image")).join(""));
   compRemote(el); return el;
 }
-const botEl = () => mk("p-cbot", `<div class="p-ctools"></div><details class="p-cthink" hidden><summary>Thinking</summary><pre></pre></details><div class="p-ma"></div><div class="p-cthumbs"></div>`);
+const SPK = '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 8h3l4-3.5v11L6 12H3z"/><path d="M13 7.5a3.5 3.5 0 010 5M15.5 5a7 7 0 010 10" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>', spk = new WeakMap();      /* spk: reply element -> its markdown, for the Speak button (vendor/computer-voice.js) */
+const botEl = () => mk("p-cbot", `<div class="p-ctools"></div><details class="p-cthink" hidden><summary>Thinking</summary><pre></pre></details><div class="p-ma"></div><div class="p-cthumbs"></div><button class="p-spk" type="button" data-act="comp-speak" aria-label="Read this reply aloud">${SPK}</button>`);
 const part = (bot, c) => bot.querySelector("." + c);
 const chip = (bot, name, args) => part(bot, "p-ctools").insertAdjacentHTML("beforeend", `<span class="p-tool${WEB(name) ? " web" : ""}"><i></i><b>${
   esc(String(name).replace(/_/g, " "))}</b><span>${esc(String((args && (args.query || args.path || args.q)) || "").slice(0, 80))}</span></span>`);
 const thumbs = (bot, urls) => part(bot, "p-cthumbs").insertAdjacentHTML("beforeend", (urls || []).map(u => thumb(u, "tool image")).join(""));
 const think = (bot, t) => { const d = part(bot, "p-cthink"); d.hidden = false; d.lastChild.textContent = t; };
 const say = (bot, t, err) => bot.insertAdjacentHTML("beforeend", H.msg(t, err));
-function fresh(){ turn = null; chat = null; msgs.replaceChildren(hint); btn(); }
+function fresh(){ CV.stop(); turn = null; chat = null; msgs.replaceChildren(hint); btn(); }
 
 /* a stored chat (fleet.html compLoad). The text of every round is kept, as it is while streaming. */
 async function show(c){
@@ -203,7 +208,7 @@ async function show(c){
       if(m.reasoning) think(bot, th += m.reasoning);
       (m.tool_calls || []).forEach(tc => { let a = {}; try{ a = JSON.parse(tc.function.arguments || "{}"); }catch(e){} chip(bot, tc.function.name, a); });
       if(m.error) say(bot, m.content, true);
-      else if(m.content){ txt += (txt ? "\n\n" : "") + m.content; part(bot, "p-ma").innerHTML = md(txt); }
+      else if(m.content){ txt += (txt ? "\n\n" : "") + m.content; part(bot, "p-ma").innerHTML = md(txt); spk.set(bot, txt); }
     }
     else if(m.role === "tool" && bot) thumbs(bot, m.images);
   }
@@ -215,7 +220,7 @@ async function open(id){
     let c;
     try{ c = await P.api.get("/api/computer/chat?id=" + encodeURIComponent(id)); }
     catch(e){ if(e.status === 404) e.message = "This chat is not stored. A chat that is still being answered is stored when the answer is finished."; throw e; }
-    turn = null; chat = {id: c.id, title: c.title}; await show(c); btn();
+    CV.stop(); turn = null; chat = {id: c.id, title: c.title}; await show(c); btn();
     if(mounted) P.go("#/computer/" + c.id, true);
   });
 }
@@ -237,9 +242,10 @@ async function send(){
   const body = {id: chat ? chat.id : null, text, model: m.id, tools: tools(), images};
   const user = userEl(images.length ? [{type: "text", text}, ...images.map(url => ({type: "image_url", image_url: {url}}))] : text), bot = botEl(), out = part(bot, "p-ma");
   imgs = []; ta.value = ""; ta.blur(); grow(); drawAtt(); msgs.append(user, bot); P.haptic("medium");
+  CV.stop(); CV.prime(); const vs = CV.stream(part(bot, "p-spk"));
   let txt = "", th = "", id = body.id, since = Date.now() / 1000, done = false, failed = false, guarded = false, timer = 0;
   /* markdown is parsed again at most every 150 ms; code is highlighted once, at the end */
-  const paint = last => { clearTimeout(timer); timer = 0;
+  const paint = last => { clearTimeout(timer); timer = 0; spk.set(bot, txt);
     out.innerHTML = (txt ? md(txt) : "") + (last === true ? "" : `<div class="p-cwork">Working<div class="p-track indet"><i></i></div></div>`);
     if(last === true) compHL(out); else compRemote(out); stick(); };
   paint(); stick(true);
@@ -273,7 +279,7 @@ async function send(){
     for(;;){ const {value, done: end} = await rd.read(); if(end) break; beat++; buf += dec.decode(value, {stream: true});
       let i; while((i = buf.indexOf("\n\n")) >= 0){ const line = buf.slice(0, i); buf = buf.slice(i + 2);
         if(!line.startsWith("data:")) continue; let e; try{ e = JSON.parse(line.slice(5)); }catch(x){ continue; }
-        if(e.type === "token"){ txt += e.text; if(!timer) timer = setTimeout(paint, 150); }
+        if(e.type === "token"){ txt += e.text; if(vs) vs.feed(txt); if(!timer) timer = setTimeout(paint, 150); }
         else if(e.type === "reasoning"){ think(bot, th += e.text); stick(); }
         else if(e.type === "tool_call"){ if(txt) txt += "\n\n"; chip(bot, e.name, e.args); stick(); }
         else if(e.type === "tool_result"){ if(e.guarded && !guarded){ guarded = true; say(bot, GUARD); } thumbs(bot, e.images); stick(); }
@@ -282,7 +288,7 @@ async function send(){
         else if(e.type === "done") done = true; } }
   }catch(e){}                          /* a cut connection ends like a stream without "done" */
   rd = null; document.removeEventListener("visibilitychange", wake);
-  paint(true);
+  paint(true); if(vs) vs.end(txt);
   if(!done && !failed){
     if(!id) say(bot, "The connection ended before the answer started. Look in Chats in a moment.", true);
     else { say(bot, "The connection ended before the answer finished. Computer keeps writing it; this chat is checked every 3 seconds."); stick();
@@ -361,6 +367,9 @@ P.on("comp-main", () => { if(Date.now() < hold) return; if(voice === "rec" || !(
 P.on("comp-attach", () => file.click());
 P.on("comp-unattach", i => { imgs.splice(+i, 1); drawAtt(); });
 P.on("comp-img", (a, el) => { P.sheet({title: "Image", color: "magenta", body: `<img class="p-cfull" src="${esc(el.firstChild.src)}" alt="">`}); });
+P.on("comp-speak", (a, el) => { CV.toggle(el, spk.get(el.closest(".p-cbot")) || ""); P.haptic("select"); });
+P.on("comp-voice", () => { CV.auto = !CV.auto; if(CV.auto) CV.prime(); P.haptic("select"); P.paint(); });
+CV.init({headers: () => ({"X-Starfleet-Key": P.key.get()}), say: (t, e) => P.toast(t, e ? "err" : undefined)});
 P.on("comp-new", () => { fresh(); P.haptic("select"); P.go("#/computer", true); });
 P.on("comp-tool", t => { const on = tools();
   LS.set("computerTools", TOOLS.map(x => x[0]).filter(x => (x === t) !== on.includes(x)).join(",") || "none");   /* "none": an empty value would mean all */
@@ -399,7 +408,7 @@ P.screens.computer = { tab: "computer", title: "Computer", color: "magenta", sta
     P.mdReady().catch(quiet);
     want = arg && arg !== (chat && chat.id) ? arg : "";       /* opened in render(), once the key has been accepted */
   },
-  unmount(){ mounted = false; top = log.scrollTop; if(rec) mic(); },
+  unmount(){ mounted = false; top = log.scrollTop; if(rec) mic(); if(!/^#\/?computer(\/|$)/.test(location.hash)) CV.stop(); },   /* another screen, not just another chat id */
   render(){
     const d = P.data.cmodels, key = P.err.cmodels === "key", m = model();
     P.hx(key ? "" : HX);
@@ -415,7 +424,8 @@ P.screens.computer = { tab: "computer", title: "Computer", color: "magenta", sta
     P.put(warn, H.msg(down.map(([t, l]) => `${l} is not answering (${srv[t].error}). Computer answers without it.`).join(" ")));
     P.put(bar, `<button class="p-chip set p-cmodel" type="button" data-act="comp-models" aria-label="Model: ${esc(MN(m.id))}"><span><em>${esc(MN(m.id))}</em>${m.vision ? "<em>&nbsp;· vision</em>" : ""}</span></button>` +
       TOOLS.map(([t, l, web]) => { const is = on.includes(t), bad = srv[t] && srv[t].error;
-        return H.chip({act: "comp-tool", arg: t, label: l, on: is, cls: bad ? "p-cdown" : is && web ? "amber" : ""}); }).join(""));
+        return H.chip({act: "comp-tool", arg: t, label: l, on: is, cls: bad ? "p-cdown" : is && web ? "amber" : ""}); }).join("") +
+      H.chip({act: "comp-voice", label: "Auto speak", on: CV.auto}));
     if(imgs.length && !m.vision){ imgs = []; drawAtt(); }
     btn();
   } };
