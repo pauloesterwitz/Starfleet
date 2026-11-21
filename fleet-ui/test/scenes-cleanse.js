@@ -41,6 +41,7 @@ exports.get = (p, variant) => {
   if(p === "/api/containers" && /^cleanse/.test(variant || "")) return payload(variant);
 };
 exports.post = (p, body, variant, h) => {
+  if(p === "/api/engineering/idle" && /^cleanse/.test(variant || "")) return C.keyOk(h) ? {ok: true, idle_hours: body.hours} : C.denied;
   if(p !== "/api/engineering/stop" || !/^cleanse/.test(variant || "")) return;
   if(!C.keyOk(h)) return C.denied;
   const res = {ok: true, stopped: [], ended: [], refused: [], errors: [], freed_mb: 0};
@@ -64,7 +65,7 @@ const must = (ok, what) => { if(!ok) throw new Error(what); };
 const open = '[data-act="sys.copen"]', go = '[data-act="sys.cgo"]', X = ".p-sheet.on .p-x";
 const tiles = page => page.$$eval(".p-sheet.on .p-read b", b => b.map(x => x.textContent.trim()));
 const toasts = page => page.$$eval("#p-toast .p-toast", t => t.map(x => x.textContent.trim()));
-const STOP = "/api/engineering/stop";
+const STOP = "/api/engineering/stop", IDLE = "/api/engineering/idle";
 const ALL4 = [{node: "jean-luc", pid: 4101}, {node: "jean-luc", pid: 4106}, {node: "jean-luc", pid: 4102}, {node: "jean-luc", pid: 4103}];
 const ALLC = ["demo-scrape-1", "demo-search-1", "demo-db-1", "demo-vane"].map(name => ({node: "jean-luc", name})).concat([{node: "kathryn", name: "demo-mcp-9"}]);
 const S = (name, variant, o) => Object.assign({name: "cln-" + name, hash: "#/systems/engineering", variant, settle: 700}, o);
@@ -78,16 +79,20 @@ exports.scenes = [
     await t.shot("list"); }}),
   S("sheet", "cleanse", {run: async (page, t) => { await t.tap(open);
     const b = await tiles(page); must(b.join() === "4,5,13.3 GB", "plan tiles " + b.join()); await t.shot("sheet"); }}),
-  S("sheet-3-days", "cleanse", {run: async (page, t) => { await t.tap(open); await t.tap('[data-act="sys.cdays"][data-arg="3"]');
+  S("sheet-3-days", "cleanse", {posts: [[IDLE, {hours: 72}]], run: async (page, t) => { await t.tap(open); await t.tap('[data-act="sys.cdays"][data-arg="72"]'); await t.wait(300);
     const b = await tiles(page); must(b.join() === "2,2,8.8 GB", "3 days " + b.join()); }}),
-  S("sheet-7-days", "cleanse", {run: async (page, t) => { await t.tap(open); await t.tap('[data-act="sys.cdays"][data-arg="7"]');
+  S("sheet-7-days", "cleanse", {posts: [[IDLE, {hours: 168}]], run: async (page, t) => { await t.tap(open); await t.tap('[data-act="sys.cdays"][data-arg="168"]'); await t.wait(300);
     const b = await tiles(page); must(b.join() === "1,0,3.8 GB", "7 days " + b.join()); await t.shot("sheet"); }}),
+  S("sheet-field", "cleanse", {posts: [[IDLE, {hours: 35}]], run: async (page, t) => { await t.tap(open);   /* the "Idle after" field, shared with the Mac */
+    await page.fill("#p-sy-ih", "35"); await page.$eval("#p-sy-ih", e => e.dispatchEvent(new Event("change", {bubbles: true}))); await t.wait(400);
+    const b = await tiles(page); must(b.join() === "3,4,11.7 GB", "35 hours " + b.join());
+    must(await page.$eval("#p-sy-ih", e => e.value) === "35", "the field keeps the value"); await t.shot("field"); }}),
   S("go", "cleanse", {posts: [[STOP, {containers: ALLC, sessions: ALL4}]], run: async (page, t) => {
     await t.tap(open); await t.wait(200); await t.tap(go); await t.wait(400);
     const m = await toasts(page); must(m.length === 1 && m[0] === "Ended 4 sessions, stopped 2 containers, freed about 13.3 GB.", "toast " + JSON.stringify(m));
     must(!(await page.$(".p-sheet.on")), "the sheet closes after a cleanse"); await t.shot("done"); }}),
-  S("go-3-days", "cleanse", {posts: [[STOP, {containers: ALLC.slice(0, 2), sessions: [ALL4[0], ALL4[1]]}]], run: async (page, t) => {
-    await t.tap(open); await t.tap('[data-act="sys.cdays"][data-arg="3"]'); await t.wait(100); await t.tap(go); await t.wait(300);
+  S("go-3-days", "cleanse", {posts: [[IDLE, {hours: 72}], [STOP, {containers: ALLC.slice(0, 2), sessions: [ALL4[0], ALL4[1]]}]], run: async (page, t) => {
+    await t.tap(open); await t.tap('[data-act="sys.cdays"][data-arg="72"]'); await t.wait(400); await t.tap(go); await t.wait(300);
     must((await toasts(page))[0] === "Ended 2 sessions, stopped 0 containers, freed about 8.8 GB.", "3 days result"); }}),
   S("double-tap", "cleanse", {run: async (page, t) => {
     await page.evaluate(() => { document.querySelector('[data-act="sys.copen"]').click(); document.querySelector('[data-act="sys.cgo"]').click(); });

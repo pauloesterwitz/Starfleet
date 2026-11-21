@@ -374,6 +374,10 @@ th[data-sort]::after{content:attr(data-dir);margin-left:4px}
 #ctrbar #ctrclean{background:var(--mauve);color:#000} #ctrbar #ctrgo:not(:disabled){background:#8a2222;color:#fff}
 #ctrbar button.armed{background:var(--red)!important;color:#000!important;animation:adblink 1s steps(2) infinite}
 #ctrbar button:disabled{opacity:.32;cursor:default}
+#ctrbar label{font-size:13px;color:var(--dim);text-transform:uppercase;letter-spacing:.06em;display:flex;align-items:center;gap:6px}
+#ctrbar input{width:64px;height:26px;background:#000;color:var(--peach);border:1px solid #fff4;border-radius:12px;padding:0 8px;
+  font:inherit;font-size:14px;font-weight:700;text-align:center}
+#ctrbar input:focus{outline:0;border-color:var(--orange)}
 #ctrsum{font-size:13px;color:var(--dim);text-transform:uppercase;letter-spacing:.06em}
 #ctrinfo{display:none;background:#0d1a2a;color:var(--blue);border-left:8px solid var(--blue);padding:6px 14px;font-size:13px;
   text-transform:uppercase;margin-top:6px}
@@ -616,7 +620,7 @@ html.fs{scrollbar-width:none} html.fs::-webkit-scrollbar{display:none}
       <div class="bar"><span id="ctrmeta">--</span></div>
     </div>
     <div id="ctrmsg"></div>
-    <div id="ctrbar"><button id="ctrclean" type="button" title="Select every agent session and container idle for more than 24 h, then click again to end them all">Cleansing</button>
+    <div id="ctrbar"><label id="ctridle" title="How long a session or container must be idle to count as idle: the amber marks and what Cleansing selects. Shared with the phone; changing it needs the Starfleet key.">Idle after <input id="ctrih" type="number" min="1" max="720" step="1" inputmode="numeric"> h</label><button id="ctrclean" type="button" title="Select every agent session and container idle for longer than Idle after, then click again to end them all">Cleansing</button>
       <button id="ctrnone" type="button" title="Clear the selection">Select none</button>
       <button id="ctrgo" type="button" disabled title="End the selected sessions and stop the selected containers (click twice)">Stop selected</button>
       <span id="ctrsum">Tick rows to stop several at once</span></div>
@@ -1654,12 +1658,14 @@ var ctrOn=false;
 let ctrTimer=null, ctrLast=null, ctrArm=null, ctrArmT=null, ctrBusy={};
 const ctrMB=m=>m==null?"–":m>=1024?(m/1024).toFixed(1)+" GB":m+" MB";
 const ctrDur=s=>s==null?"–":s<90?Math.round(s)+" s":s<5400?Math.round(s/60)+" min":s<172800?(s/3600).toFixed(s<36000?1:0)+" h":Math.round(s/86400)+" d";
+function ctrHrs(){ return (ctrLast&&ctrLast.idle_hours)||24; }   /* the shared "Idle after" setting (fleet.py idle_hours) */
+function ctrLim(){ return ctrHrs()*3600; }
 const CTR_KIND={gpu:"Model",session:"Session",service:"Service"};
 function ctrIdle(c){
-  if(c.session_idle_s!=null) return `<span class="${c.session_idle_s>86400?"idle-long":""}" title="Owning session last active ${ctrDur(c.session_idle_s)} ago">session ${ctrDur(c.session_idle_s)}</span>`;
+  if(c.session_idle_s!=null) return `<span class="${c.session_idle_s>ctrLim()?"idle-long":""}" title="Owning session last active ${ctrDur(c.session_idle_s)} ago">session ${ctrDur(c.session_idle_s)}</span>`;
   if(c.cpu_idle_s==null) return "–";
   if(c.cpu_idle_s<60&&!c.cpu_idle_ge) return `<span class="idle-act" title="Used CPU in the last minute">active</span>`;
-  return `<span class="${c.cpu_idle_s>86400?"idle-long":""}" title="No CPU use for this long${c.cpu_idle_ge?" (at least: counted since Fleet started watching)":""}">${c.cpu_idle_ge?"≥ ":""}${ctrDur(c.cpu_idle_s)}</span>`;
+  return `<span class="${c.cpu_idle_s>ctrLim()?"idle-long":""}" title="No CPU use for this long${c.cpu_idle_ge?" (at least: counted since Fleet started watching)":""}">${c.cpu_idle_ge?"≥ ":""}${ctrDur(c.cpu_idle_s)}</span>`;
 }
 function ctrPaint(){
   const d=ctrLast; if(!d) return;
@@ -1700,7 +1706,7 @@ function ctrPaint(){
       <th class="num" data-sort="ctr" data-first="-1">Containers</th></tr></thead><tbody>`+(ss.length?ss.map(s=>{
       const ck=`s:${s.node}/${s.pid}`, on=ctrSel.has(ck), cwd=s.cwd?s.cwd.replace(/^\/home\/[^/]+/,"~"):"";
       const idle=s.idle_s==null?`<span title="Unknown: no transcript or terminal to read. Cleansing never selects it.">–</span>`
-        :s.idle_s<60?`<span class="idle-act">active</span>`:`<span class="${s.idle_s>86400?"idle-long":""}" title="Last activity ${ctrDur(s.idle_s)} ago">${ctrDur(s.idle_s)}</span>`;
+        :s.idle_s<60?`<span class="idle-act">active</span>`:`<span class="${s.idle_s>ctrLim()?"idle-long":""}" title="Last activity ${ctrDur(s.idle_s)} ago">${ctrDur(s.idle_s)}</span>`;
       return `<tr class="${on?"picked":""}"><td class="ck"><input type="checkbox" class="ck" data-k="${esc(ck)}" ${on?"checked":""}></td>
         <td><div class="mid">${esc(s.tool)}${s.session?` · ${esc(s.session)}`:""}</div><div class="sub" title="${esc(s.cwd||"")}">${esc(cwd)} · pid ${s.pid}</div></td>
         <td>${esc(s.model||"–")}</td><td><span title="${esc(new Date(s.started*1000).toLocaleString())}">${ctrDur(now-s.started)} ago</span></td>
@@ -1712,7 +1718,7 @@ function ctrPaint(){
 
 /* Multi-select and Cleansing. Keys: "c:<node>/<container>" and "s:<node>/<pid>". The selection survives the
    10 s refresh; what has gone is dropped. Cleansing selects every agent session and every stoppable container
-   idle for more than 24 h (unknown idle never counts) and arms itself: a second click within 8 s ends them.
+   idle for longer than the shared "Idle after" hours (unknown idle never counts) and arms itself: a second click within 8 s ends them.
    Ending a session also ends the MCP containers it launched (docker run -i --rm). Needs the Starfleet key. */
 const ctrSel=new Set(), CTR_DAY=86400;
 let ctrGoArm=null, ctrGoT=null, ctrRunning=false;
@@ -1724,6 +1730,7 @@ function ctrItems(){
   return m;
 }
 function ctrBar(){
+  const ih=document.getElementById("ctrih"); if(document.activeElement!==ih&&ctrLast) ih.value=ctrHrs();
   const it=ctrItems(); [...ctrSel].forEach(k=>{ if(!it.has(k)||!it.get(k).ok) ctrSel.delete(k); });
   const sel=[...ctrSel].map(k=>it.get(k)), ns=sel.filter(x=>x.t==="s").length, nc=sel.length-ns;
   const viaSess=new Set(sel.filter(x=>x.t==="s").map(x=>x.s.pid));
@@ -1766,11 +1773,23 @@ document.getElementById("ctrview").addEventListener("change",e=>{
   x.closest("tr").classList.toggle("picked",x.checked); ctrGoArm=null; ctrBar();
 });
 document.getElementById("ctrnone").onclick=()=>{ ctrSel.clear(); ctrGoArm=null; ctrPaint(); };
+document.getElementById("ctrih").addEventListener("change",async e=>{
+  const h=Number(e.target.value);
+  if(!(h>=1&&h<=720)){ e.target.value=ctrHrs(); ctrInfo("Idle after: enter 1 to 720 hours."); return; }
+  try{
+    const r=await fetch("/api/engineering/idle",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({hours:h})});
+    const j=await r.json().catch(()=>({}));
+    if(r.status===403) throw new Error("Starfleet key missing or wrong (enter it on the Shuttle Bay page, Save key)");
+    if(!r.ok) throw new Error(j.error||("HTTP "+r.status));
+    if(ctrLast) ctrLast.idle_hours=j.idle_hours; ctrGoArm=null; ctrInfo(`Idle after ${j.idle_hours} h: the Mac and the phone both use it now.`);
+  }catch(err){ e.target.value=ctrHrs(); if(ctrLast) ctrLast.actionError="Idle after: "+err.message; }
+  ctrPaint();
+});
 document.getElementById("ctrgo").onclick=()=>{ if(ctrGoArm==="go") ctrRun(); else ctrArmBar("go"); };
 document.getElementById("ctrclean").onclick=()=>{
   if(ctrGoArm==="clean") return ctrRun();
-  ctrSel.clear(); ctrItems().forEach((v,k)=>{ if(v.ok&&v.idle!=null&&v.idle>CTR_DAY) ctrSel.add(k); });
-  if(!ctrSel.size){ ctrInfo("Cleansing: nothing has been idle for more than 24 h."); ctrPaint(); return; }
+  ctrSel.clear(); ctrItems().forEach((v,k)=>{ if(v.ok&&v.idle!=null&&v.idle>ctrLim()) ctrSel.add(k); });
+  if(!ctrSel.size){ ctrInfo(`Cleansing: nothing has been idle for more than ${ctrHrs()} h.`); ctrPaint(); return; }
   ctrInfo(""); ctrPaint(); ctrArmBar("clean");
 };
 async function ctrPoll(){

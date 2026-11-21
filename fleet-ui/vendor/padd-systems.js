@@ -229,12 +229,16 @@ P.on("sys.ses", key => {
 P.on("sys.more", k => { if(!more.delete(k)) more.add(k); drawSession(); });
 
 /* ================================================================ Main Engineering: containers on both Sparks */
+/* "Idle after": one shared value for the Mac and the phone (fleet.py idle_hours, in /api/containers); it sets the amber
+   marks and what Cleansing selects. Changing it is a keyed POST /api/engineering/idle {hours}. */
+const idleHrs = () => (P.data.containers || {}).idle_hours || 24, idleLim = () => idleHrs() * 3600;
+const hrsText = h => h >= 48 && h % 24 === 0 ? `${h / 24} days` : `${h} hour${h === 1 ? "" : "s"}`;
 const CKIND = {gpu: ["Model", "pinned", "magenta"], session: ["Session", "ready", "blue"], service: ["Service", "", "mauve"]};   /* L1599 */
 function cIdle(c){                                           /* L1600 as [text, over 24 h, what it means] */
-  if(c.session_idle_s != null) return [`session idle ${dur(c.session_idle_s)}`, c.session_idle_s > 86400, `The session that owns it was last active ${dur(c.session_idle_s)} ago.`];
+  if(c.session_idle_s != null) return [`session idle ${dur(c.session_idle_s)}`, c.session_idle_s > idleLim(), `The session that owns it was last active ${dur(c.session_idle_s)} ago.`];
   if(c.cpu_idle_s == null) return ["", false, "Not measured yet."];
   if(c.cpu_idle_s < 60 && !c.cpu_idle_ge) return ["active", false, "Used CPU in the last minute."];
-  return [`idle ${c.cpu_idle_ge ? "≥ " : ""}${dur(c.cpu_idle_s)}`, c.cpu_idle_s > 86400,
+  return [`idle ${c.cpu_idle_ge ? "≥ " : ""}${dur(c.cpu_idle_s)}`, c.cpu_idle_s > idleLim(),
     `No CPU use for ${c.cpu_idle_ge ? "at least " : ""}${dur(c.cpu_idle_s)}${c.cpu_idle_ge ? ", counted since Fleet started watching" : ""}.`];
 }
 let cnode = "all", ckind = "", csheet = null, ckey = "";
@@ -278,8 +282,8 @@ P.screens["systems/engineering"] = { tab: "systems", title: "Main Engineering", 
    process) goes in ONE request to POST /api/engineering/stop {containers:[{node,name}], sessions:[{node,pid}]}, which
    needs the Starfleet key, ends the sessions (SIGTERM) and stops the containers. A session's own containers exit with it.
    fleet.py lists the sessions in /api/containers as `sessions`; a Fleet without that list shows none of this. */
-const DAY = 86400, CLEAN_AFTER = [[1, "24 hours"], [3, "3 days"], [7, "7 days"]];
-let cleanDays = 1, cleanSheet = null, cleanBusy = false, cleanAt = 0, ssheet1 = null, skey = "";
+const CLEAN_AFTER = [[2, "2 h"], [12, "12 h"], [24, "24 h"], [72, "3 days"], [168, "7 days"]];
+let cleanSheet = null, cleanBusy = false, cleanAt = 0, ssheet1 = null, skey = "";
 const sessOf = () => (P.data.containers || {}).sessions;
 const idleOf = c => c.session_idle_s ?? c.cpu_idle_s;
 const skeyOf = s => s.node + "/" + s.pid;
@@ -287,10 +291,10 @@ const sName = s => (s.tool || "Agent") + (s.session ? " · " + s.session : "");
 const homeless = p => p ? p.replace(/^\/home\/[^/]+/, "~") : "";
 function sIdle(s){                                           /* as [text, over 24 h] */
   if(s.idle_s == null) return ["idle time unknown", false];
-  return s.idle_s < 60 ? ["active", false] : [`idle ${dur(s.idle_s)}`, s.idle_s > DAY];
+  return s.idle_s < 60 ? ["active", false] : [`idle ${dur(s.idle_s)}`, s.idle_s > idleLim()];
 }
-function cleanPlan(days){
-  const d = P.data.containers || {}, lim = days * DAY;
+function cleanPlan(hours){
+  const d = P.data.containers || {}, lim = hours * 3600;
   const ss = (d.sessions || []).filter(s => !s.fleet && s.idle_s != null && s.idle_s > lim).sort((a, b) => (b.rss_mb + b.ct_ram_mb) - (a.rss_mb + a.ct_ram_mb));
   const cs = (d.containers || []).filter(c => c.stoppable && idleOf(c) != null && idleOf(c) > lim);
   const ended = new Set(ss.map(s => s.pid));
@@ -300,10 +304,10 @@ function cleanPlan(days){
 const plural = (n, w) => `${n} ${w}${n === 1 ? "" : "s"}`;
 function cleanCard(){
   if(!Array.isArray(sessOf())) return "";
-  const p = cleanPlan(1);
+  const h = idleHrs(), p = cleanPlan(h);
   return `<div class="p-card" style="--c:var(--amber);margin-top:8px"><h3>Cleanse idle sessions</h3>
-    <p>${p.n ? `${plural(p.ss.length, "agent session")} and ${plural(p.cs.length, "container")} have been idle for over 24 hours. Ending them frees about ${esc(mb(p.mb))}.`
-      : "Nothing has been idle for over 24 hours."}</p>
+    <p>${p.n ? `${plural(p.ss.length, "agent session")} and ${plural(p.cs.length, "container")} have been idle for over ${esc(hrsText(h))}. Ending them frees about ${esc(mb(p.mb))}.`
+      : `Nothing has been idle for over ${esc(hrsText(h))}.`}</p>
     <div class="p-pair" style="margin-top:11px"><button class="p-btn red" type="button" data-act="sys.copen"${p.n ? "" : " disabled"}>Review and cleanse</button></div></div>`;
 }
 function sessionList(){
@@ -317,17 +321,33 @@ function sessionList(){
       <span class="p-sy-fig">${fig(mb(s.rss_mb + s.ct_ram_mb))}</span></button>`; }).join("") : `<div class="p-empty">No agent sessions</div>`}</div>`;
 }
 function drawClean(){
-  const p = cleanPlan(cleanDays);
+  const f = cleanSheet.body && cleanSheet.body.querySelector("#p-sy-ih");
+  if(f && document.activeElement === f) return;              /* never redraw under a finger that is typing */
+  const h = idleHrs(), p = cleanPlan(h);
   cleanSheet.set(`<p class="p-text">Ends the agent sessions and stops the containers that have been idle for longer than the time below. The containers of an ended session stop with it. A session whose idle time is not known is never touched.</p>
-    <div class="p-lab">Idle for more than</div><div class="p-wrap">${CLEAN_AFTER.map(([d, l]) => H.chip({act: "sys.cdays", arg: String(d), label: l, cls: d === cleanDays ? "set" : ""})).join("")}</div>
+    <div class="p-lab">Idle for more than</div>
+    <label class="p-fieldbox" style="margin-top:6px"><input class="p-field" id="p-sy-ih" type="number" inputmode="numeric" enterkeyhint="done" min="1" max="720" step="1" value="${h}" aria-label="Idle after, in hours"><span style="color:var(--dim)">hours</span></label>
+    <div class="p-wrap" style="margin-top:8px">${CLEAN_AFTER.map(([d, l]) => H.chip({act: "sys.cdays", arg: String(d), label: l, cls: d === h ? "set" : ""})).join("")}</div>
+    <p class="p-note">Shared with the Mac. Changing it needs the Starfleet key.</p>
     <div class="p-read"><div><b>${p.ss.length}</b><span>Sessions</span></div><div><b>${p.cs.length}</b><span>Containers</span></div><div><b>${esc(mb(p.mb))}</b><span>Frees about</span></div></div>
     ${p.ss.length ? `<div class="p-grp">Largest sessions</div><div class="p-list">${p.ss.slice(0, 4).map(s => info({c: "amber", t: sName(s), lines: [`${esc(sIdle(s)[0])} · ${esc(mb(s.rss_mb + s.ct_ram_mb))}`]})).join("")}</div>${p.ss.length > 4 ? `<p class="p-note">and ${p.ss.length - 4} more</p>` : ""}` : ""}
     <p class="p-note">An ended session stops running. Its saved conversation stays on disk.</p>
     <div class="p-pair p-acts"><button class="p-btn red" type="button" data-act="sys.cgo"${p.n && !cleanBusy ? "" : " disabled"}>${cleanBusy ? "Cleansing..." : p.n ? `Cleanse ${plural(p.n, "item")}` : "Nothing to cleanse"}</button></div>`);
+  const ih = cleanSheet.body.querySelector("#p-sy-ih");
+  if(ih) ih.addEventListener("change", () => { ih.blur(); setIdle(Number(ih.value)); });
 }
-P.on("sys.copen", () => { cleanDays = 1; cleanAt = Date.now();
+async function setIdle(hours){
+  if(!(hours >= 1 && hours <= 720)){ P.toast("Idle after: 1 to 720 hours.", "err"); if(cleanSheet) drawClean(); return; }
+  try{
+    const j = await P.api.post("/api/engineering/idle", {hours});
+    if(P.data.containers) P.data.containers.idle_hours = j.idle_hours;
+    P.haptic("select"); P.toast(`Idle after ${hrsText(j.idle_hours)}, on the Mac too.`);
+  }catch(e){ if(!e.quiet) P.toast("Idle after: " + e.message, "err"); }
+  if(cleanSheet) drawClean(); P.paint();
+}
+P.on("sys.copen", () => { cleanAt = Date.now();
   cleanSheet = P.sheet({title: "Cleanse idle sessions", color: "red", onClose: () => { cleanSheet = null; }}); drawClean(); });
-P.on("sys.cdays", d => { cleanDays = Number(d) || 1; P.haptic("select"); if(cleanSheet) drawClean(); });
+P.on("sys.cdays", d => setIdle(Number(d)));
 /* one request for everything; what the sheet shows is what is sent, and a tap in the first moments is ignored */
 async function stopRequest(ss, cs){
   const j = await P.api.post("/api/engineering/stop", {containers: cs.map(c => ({node: c.node, name: c.name})), sessions: ss.map(s => ({node: s.node, pid: s.pid}))}, {timeout: 240000});
@@ -338,7 +358,7 @@ async function stopRequest(ss, cs){
 }
 P.on("sys.cgo", () => P.run(async () => {
   if(cleanBusy || Date.now() - cleanAt < 450) return;
-  const p = cleanPlan(cleanDays); if(!p.n) return;
+  const p = cleanPlan(idleHrs()); if(!p.n) return;
   cleanBusy = true; drawClean();
   try{ await stopRequest(p.ss, p.cs); if(cleanSheet) cleanSheet.close(); }
   catch(e){ fail("Cleansing did not finish", e); }

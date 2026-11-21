@@ -2215,6 +2215,37 @@ def _session_rows(node, raw, crows, now):
     return out
 
 
+# How long a session or container must be idle to count as idle: the amber marks in Engineering and what Cleansing
+# selects, on the Mac and the phone alike. One shared value, kept here; changing it needs the key (it steers Cleansing).
+IDLE_FILE = os.path.expanduser("~/.config/fleet-ui/engineering.json")
+IDLE_HOURS_DEFAULT, IDLE_HOURS_MIN, IDLE_HOURS_MAX = 24, 1, 720
+
+
+def idle_hours():
+    try:
+        with open(IDLE_FILE) as f:
+            h = float(json.load(f).get("idle_hours", IDLE_HOURS_DEFAULT))
+        return h if IDLE_HOURS_MIN <= h <= IDLE_HOURS_MAX else IDLE_HOURS_DEFAULT
+    except (OSError, ValueError, TypeError, AttributeError):
+        return IDLE_HOURS_DEFAULT
+
+
+def set_idle_hours(hours, key):
+    key_check(key)                                   # 403 without a valid key
+    try:
+        h = round(float(hours), 1)
+    except (TypeError, ValueError):
+        raise ValueError("hours must be a number")
+    if not IDLE_HOURS_MIN <= h <= IDLE_HOURS_MAX:
+        raise ValueError(f"between {IDLE_HOURS_MIN} and {IDLE_HOURS_MAX} hours")
+    os.makedirs(os.path.dirname(IDLE_FILE), exist_ok=True)
+    tmp = IDLE_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"idle_hours": h}, f)
+    os.replace(tmp, IDLE_FILE)
+    return {"ok": True, "idle_hours": h}
+
+
 def engineering_stop(containers, sessions, key):
     """Bulk stop for Engineering (multi-select and Cleansing): end the chosen agent sessions (SIGTERM; their
     `docker run -i --rm` MCP containers exit with them), then `docker stop` the chosen containers, one call per
@@ -4622,7 +4653,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/api/defiant/updates":
             return self._send(200, json.dumps(defiant_updates_view()), "application/json")
         if self.path == "/api/containers":
-            return self._send(200, json.dumps(containers_state()), "application/json")
+            return self._send(200, json.dumps(dict(containers_state(), idle_hours=idle_hours())), "application/json")
         if self.path == "/api/cluster/update":          # pending updates per Spark + the last/current run
             return self._send(200, json.dumps(clusterupdate.status()), "application/json")
         if self.path == "/api/nas/stats":
@@ -4795,6 +4826,15 @@ class Handler(BaseHTTPRequestHandler):
             except RuntimeError as e:
                 return self._send(409, json.dumps({"error": str(e)}), "application/json")
             print(f"CLUSTER UPDATE started: run {res['run']}{' (dry run)' if res['dry'] else ''}", flush=True)
+            return self._send(200, json.dumps(res), "application/json")
+        if self.path == "/api/engineering/idle":       # the shared "idle after" hours (keyed)
+            try:
+                res = set_idle_hours(body.get("hours"), key)
+            except urllib.error.HTTPError as e:
+                return self._send(403, json.dumps({"error": _err_text(e)}), "application/json")
+            except ValueError as e:
+                return self._send(400, json.dumps({"error": str(e)}), "application/json")
+            print(f"ENGINEERING idle after {res['idle_hours']} h", flush=True)
             return self._send(200, json.dumps(res), "application/json")
         if self.path == "/api/engineering/stop":       # multi-select and Cleansing
             try:

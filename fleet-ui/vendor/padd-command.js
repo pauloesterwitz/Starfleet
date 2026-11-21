@@ -324,7 +324,7 @@ const ARROWS = `<svg viewBox="0 0 22 16" aria-hidden="true"><path d="M3 2l6 6-6 
 const panel = (name, c, title, text, label, top) => `<section class="p-card" style="--c:${c}${top ? ";margin-top:6px" : ""}"><h3>${title}</h3><p>${text}</p>
   <div class="p-slide"><button class="p-knob" type="button" data-act="cmd-slide" data-arg="${name}" aria-label="${label} ${title}">${ARROWS}</button><span>${label}</span></div></section>`;
 P.sources.cluster = {url: "/api/cluster/update"};     /* pending updates per Spark + the last or current run (clusterupdate.py) */
-P.screens.command = { tab: "command", title: "Command", color: "mauve", needs: {cluster: 10000},
+P.screens.command = { tab: "command", title: "Command", color: "mauve", needs: {cluster: 10000, containers: 15000},
   mount(el){
     el.innerHTML = `${H.sec("Access")}<div id="p-ckey"></div><div id="p-cmsg" style="margin-top:6px"></div>${H.sec("Emergency")}
       ${panel("red", "var(--red)", "Red Alert", "Unloads every model and stops the GPU containers on both Sparks. You get 5 seconds to cancel.", "Slide to arm")}
@@ -347,8 +347,22 @@ P.screens.command = { tab: "command", title: "Command", color: "mauve", needs: {
     P.put(el.querySelector("#p-cmsg"), H.row({tall: true, big: true, act: "go", arg: "#/command/messages", c: "mauve", t: "Messages", chev: true,
       s: P.data.events ? (EV.act ? `${EV.act} need${EV.act === 1 ? "s" : ""} you now` : "Nothing needs you now") : P.err.events ? "Cannot read the list" : "Reading the list...",
       tag: EV.unread ? EV.unread + " unread" : "", tagc: "warn"}));
-    P.put(el.querySelector("#p-cupd"), updCard());
+    P.put(el.querySelector("#p-cupd"), updCard() + cleanseCard());
   } };
+
+/* Cleansing from Command: the same sheet as Systems > Main Engineering (padd-systems.js "sys.copen"), so it is one tap
+   away. Counts use the shared "Idle after" hours from /api/containers. */
+function cleanseCard(){
+  const d = P.data.containers;
+  if(!d || !Array.isArray(d.sessions)) return "";
+  const h = d.idle_hours || 24, lim = h * 3600;
+  const ns = d.sessions.filter(s => !s.fleet && s.idle_s != null && s.idle_s > lim).length;
+  const nc = (d.containers || []).filter(c => c.stoppable && (c.session_idle_s ?? c.cpu_idle_s) != null && (c.session_idle_s ?? c.cpu_idle_s) > lim).length;
+  const hrs = h >= 48 && h % 24 === 0 ? `${h / 24} days` : `${h} hour${h === 1 ? "" : "s"}`;
+  return `<section class="p-card" style="--c:var(--amber);margin-top:8px"><h3>Cleansing</h3>
+    <p>${ns + nc ? `${ns} agent session${ns === 1 ? "" : "s"} and ${nc} container${nc === 1 ? "" : "s"} idle for over ${esc(hrs)}.` : `Nothing idle for over ${esc(hrs)}.`} You can change the time in the sheet.</p>
+    <div class="p-pair" style="margin-top:11px"><button class="p-btn sm red" type="button" data-act="sys.copen">Review and cleanse</button></div></section>`;
+}
 
 /* ---------------------------------------------------------------- Install updates on Starfleet Cluster
    NVIDIA Sync's Update for both Sparks: package lists, apt full-upgrade, firmware. A Spark restarts only when it
