@@ -59,7 +59,7 @@ private let helpSections: [(title: String, body: String)] = [
      """),
     ("Updates", """
      At every start the app updates itself from the clone it was built from: it pulls \
-     `main` from GitHub, rebuilds when the Mac app changed and starts again, and installs \
+     `main` from Gitea, rebuilds when the Mac app changed and starts again, and installs \
      the iPhone app when that changed. **Check for Updates…** in the menu bar dropdown \
      does the same on demand.
      A clone on another branch or with commits of its own is left alone. Building needs \
@@ -99,7 +99,7 @@ enum AboutPanel {
         let credits = NSMutableAttributedString(string: """
             Watches the Starfleet cluster from the menu bar and runs it from the Fleet window.
 
-            Updates itself from GitHub at every start.
+            Updates itself from Gitea at every start.
             \(link)
 
             USB panel protocol after James Buren's hidss (MIT).
