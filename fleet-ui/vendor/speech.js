@@ -13,7 +13,7 @@ function speechModels(sp){
   const rows=[];
   for(const m of (sp&&sp.members)||[]){
     for(const [node,p] of Object.entries(m.per_node||{})){
-      rows.push(Object.assign({},m,p,{id:`${m.id}-${node}`,mid:m.id,node,nodes:[node],kind:"speech",pinned:false,tps:null,ctx:null,effort:null,effort_options:[]}));
+      rows.push(Object.assign({},m,p,{id:`${m.id}-${node}`,mid:m.id,node,nodes:[node],kind:"speech",pinned:!!p.pinned,tps:null,ctx:null,effort:null,effort_options:[]}));
     }
   }
   return rows;
@@ -36,7 +36,7 @@ function speechRow(m, working){
   const lu=m.last&&m.last.op==="unload"&&m.last.ok&&st==="off"
     ?`<div class="sub">last unload freed ${spGB(m.last.freed_mb)}${m.last.cache_dropped_mb?` + ${spGB(m.last.cache_dropped_mb)} of weights dropped from cache`:""}</div>`:"";
   const can=!(busyNow||st==="ready"||st==="queued"||fit.ok===false);
-  return `<tr class="${st==="ready"?"live":""}">
+  return `<tr class="${m.pinned?"pinned":st==="ready"?"live":""}">
     <td><div class="mid">${spEsc(m.label||m.mid)}</div>
         <div class="sub">${spEsc(sub)} &middot; needs ${spGB(m.need_mb)}${held}</div>${where}${warn}${lu}${m.error?`<div class="err">${spEsc(m.error)}</div>`:""}</td>
     <td class="ctx"><select class="ctxsel" disabled title="Each speech server runs on the machine of its row"><option>${SP_NODE[m.node]||spEsc(m.node)}</option></select></td>
@@ -44,6 +44,7 @@ function speechRow(m, working){
     <td><span class="st ${cls}">${label}</span></td>
     <td class="mid">&mdash;</td>
     <td class="act">
+      <button class="${m.pinned?"on":""}" ${busyNow?"disabled":""} title="Keep this server loaded: Pin loads it now, Unload unpins it" onclick="pinSpeech('${m.id}',${!m.pinned})">${m.pinned?"Pinned":"Pin"}</button>
       <button class="${st==="ready"?"on":""}" ${can?"":"disabled"} title="${fit.ok===false&&st==="off"?spEsc(fit.reason):"Load this server on "+(SP_NODE[m.node]||spEsc(m.node))}"
         onclick="loadSpeech('${m.id}')">${st==="ready"?"Loaded":"Load"}</button>
       <button class="unl" ${(st==="off"||st==="unknown"||st==="unloading")?"disabled":""}
@@ -63,6 +64,7 @@ async function spPost(url,id,body){
 }
 const spRow=id=>(last.models||[]).find(m=>m.id===id);
 async function loadSpeech(id){ const m=spRow(id); if(m) await spPost("/api/speech/load",id,{id:m.mid,node:m.node}); }
+async function pinSpeech(id,on){ const m=spRow(id); if(m) await spPost("/api/speech/pin",id,{id:m.mid,node:m.node,pin:on}); }
 async function unloadSpeech(id){
   const m=spRow(id); if(!m) return;
   const j=await spPost("/api/speech/unload",id,{id:m.mid,node:m.node});

@@ -4078,6 +4078,10 @@ def ev_detect(w, open_keys):
                      " Fleet does not reload it by itself: open Models and press Load.",
                 push=f"{nm} is pinned but not running. Open Models and press Load.",
                 ok=f"{nm} is running again, or no longer pinned.")
+    for rk in w.get("speech_lost") or []:                                 # a pinned speech server that is not running (Shuttle Bay, Speech)
+        conds["model-lost:" + rk] = dict(kind="model-lost", level="act", title="Pinned model lost", go="#/models", for_s=120, remind=True,
+                                         text=f"{rk} is pinned but not running. Fleet does not reload it by itself: open Shuttle Bay and press Load.",
+                                         push=f"{rk} is pinned but not running. Open Shuttle Bay and press Load.", ok=f"{rk} is running again, or no longer pinned.")
     # nodes
     for n, info in w["nodes"].items():
         lab = label(n)
@@ -4204,7 +4208,12 @@ def ev_world(now, heavy):
         nodes.setdefault(n, None)
     with _loading_lock:
         loading = set(_loading)
-    return dict(heavy, now=now, nodes=nodes, running=running, errors=errors, pins=load_pins(), models=models,
+    try:
+        sp = speech.state()
+        lost = [f"{m['id']}-{n}" for m in sp.get('members', []) for n, p in m['per_node'].items() if p.get('pinned') and p.get('state') in ('off', 'unknown')]
+    except Exception:
+        lost = []
+    return dict(heavy, now=now, nodes=nodes, running=running, errors=errors, pins=load_pins(), models=models, speech_lost=lost,
                 busy=loading | set(queued_ids()) | set(_llm_busy), cfg=dict(_CFG_CHANGED))
 
 
@@ -4891,6 +4900,18 @@ class Handler(BaseHTTPRequestHandler):
                 ev_audit("Red Alert ran", f"Unloaded {len(res.get('unloaded') or [])} models, stopped "
                          f"{sum(len(v) for v in (res.get('stopped') or {}).values())} containers, freed {(res.get('freed_mb') or 0) // 1024} GB."
                          + (f" {len(res['errors'])} errors." if res.get("errors") else ""), go="#/bridge")
+            return self._send(200, json.dumps(res), "application/json")
+        if self.path == "/api/speech/pin":
+            try:
+                res = speech.set_pin(body.get("id"), body.get("node"), bool(body.get("pin")), key)
+            except urllib.error.HTTPError as e:
+                return self._send(403, json.dumps({"error": _err_text(e)}), "application/json")
+            except PermissionError as e:
+                return self._send(409, json.dumps({"error": str(e)}), "application/json")
+            except ValueError as e:
+                return self._send(400, json.dumps({"error": str(e)}), "application/json")
+            except (urllib.error.URLError, OSError, subprocess.SubprocessError) as e:
+                return self._send(502, json.dumps({"error": str(e)[:200]}), "application/json")
             return self._send(200, json.dumps(res), "application/json")
         if self.path in ("/api/speech/load", "/api/speech/unload"):      # Shuttle Bay's Speech family, keyed like every load (speech.py)
             fn = speech.load if self.path == "/api/speech/load" else speech.unload

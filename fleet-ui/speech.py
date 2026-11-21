@@ -29,6 +29,43 @@ _node = {}       # node -> last `speech-ctl status` JSON plus "t" (or {"error", 
 _busy = {}       # row key -> {"op": "loading"|"unloading", "t0": epoch}
 _last = {}       # row key -> outcome of the last load/unload, for the row and the toast
 _lock = threading.Lock()
+PIN_FILE = os.environ.get("SPEECH_PINS", os.path.expanduser("~/.config/fleet-ui/speech-pins.json"))
+
+
+def pins():
+    """Row keys (member-node) that are pinned."""
+    try:
+        with open(PIN_FILE) as f:
+            return set(json.load(f))
+    except (OSError, ValueError):
+        return set()
+
+
+def _save_pins(p):
+    os.makedirs(os.path.dirname(PIN_FILE), exist_ok=True)
+    tmp = PIN_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(sorted(p), f, indent=2)
+    os.replace(tmp, PIN_FILE)
+
+
+def set_pin(mid, node, on, key):
+    """Pin (and load, if it is not up) or unpin one member on one node. Keyed like every load."""
+    if mid not in members() or node not in _cfg["nodes"]:
+        raise ValueError(f"unknown speech member {mid!r} or node {node!r}")
+    _cfg["key_check"](key)
+    rk, p = rowkey(mid, node), pins()
+    if not on:
+        p.discard(rk)
+        _save_pins(p)
+        return {"ok": True, "pinned": False}
+    p.add(rk)
+    _save_pins(p)
+    with _lock:
+        up = ((_node.get(node) or {}).get("members") or {}).get(mid, {}).get("running")
+    if up:
+        return {"ok": True, "pinned": True}
+    return dict(load(mid, node, key), pinned=True)
 
 
 def init(nodes, key_check, enqueue, dequeue, queued, get_error, clear_error):
@@ -99,6 +136,7 @@ def state():
         with _lock:
             nodes, busy, last = {n: dict(v) for n, v in _node.items()}, {k: dict(v) for k, v in _busy.items()}, dict(_last)
         queued = set(_cfg["queued"]()) if _cfg else set()
+        pinned = pins()
         now = time.time()
         rows = []
         for mid, m in ms.items():
@@ -118,7 +156,7 @@ def state():
                 else:
                     st = "off"
                 host = nd.get("fabric_ip")
-                per[node] = {"state": st, "port": m.get("port"), "url": f"http://{host}:{m.get('port')}" if host and s.get("running") else None,
+                per[node] = {"state": st, "port": m.get("port"), "url": f"http://{host}:{m.get('port')}" if host and s.get("running") else None, "pinned": rk in pinned,
                              "mem_mb": s.get("mem_mb"), "since": s.get("since"), "fit": fit_from(nd, m),
                              "error": _cfg["get_error"](rk), "last": last.get(rk), "busy_s": round(now - busy[rk]["t0"]) if rk in busy else None}
             rows.append({"id": mid, **{k: m.get(k) for k in ("label", "engine", "family", "precision", "params_b", "languages", "need_mb", "api", "endpoint", "note", "port", "max_audio")},
@@ -170,6 +208,10 @@ def unload(mid, node, key):
         raise ValueError(f"unknown speech member {mid!r} or node {node!r}")
     _cfg["key_check"](key)
     rk = rowkey(mid, node)
+    p = pins()
+    if rk in p:                                   # Unload unpins too, else it would be a pin that is not running
+        p.discard(rk)
+        _save_pins(p)
     if _cfg["dequeue"](rk):
         return {"ok": True, "dequeued": True}
     with _lock:
@@ -191,6 +233,7 @@ def unload(mid, node, key):
 def stop_all():
     """For Red Alert: stop every speech server that is running, on every node. Returns {row key: speech-ctl answer}."""
     res = {}
+    _save_pins(set())                             # Red Alert clears every pin, like the LLM pins
     for node in _cfg.get("nodes", {}):
         st = ctl(node, "status", timeout=40)
         for mid, s in (st.get("members") or {}).items():
