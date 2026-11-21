@@ -336,14 +336,17 @@ function drawClean(){
   const ih = cleanSheet.body.querySelector("#p-sy-ih");
   if(ih) ih.addEventListener("change", () => { ih.blur(); setIdle(Number(ih.value)); });
 }
+let idleSending = null;
 async function setIdle(hours){
   if(!(hours >= 1 && hours <= 720)){ P.toast("Idle after: 1 to 720 hours.", "err"); if(cleanSheet) drawClean(); return; }
+  if(hours === idleSending || (idleSending == null && hours === idleHrs())) return;   /* the field's change fires again on blur */
+  idleSending = hours;
   try{
     const j = await P.api.post("/api/engineering/idle", {hours});
     if(P.data.containers) P.data.containers.idle_hours = j.idle_hours;
     P.haptic("select"); P.toast(`Idle after ${hrsText(j.idle_hours)}, on the Mac too.`);
   }catch(e){ if(!e.quiet) P.toast("Idle after: " + e.message, "err"); }
-  if(cleanSheet) drawClean(); P.paint();
+  idleSending = null; if(cleanSheet) drawClean(); P.paint();
 }
 P.on("sys.copen", () => { cleanAt = Date.now();
   cleanSheet = P.sheet({title: "Cleanse idle sessions", color: "red", onClose: () => { cleanSheet = null; }}); drawClean(); });

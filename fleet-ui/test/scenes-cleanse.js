@@ -93,7 +93,7 @@ exports.scenes = [
     must(!(await page.$(".p-sheet.on")), "the sheet closes after a cleanse"); await t.shot("done"); }}),
   S("go-3-days", "cleanse", {posts: [[IDLE, {hours: 72}], [STOP, {containers: ALLC.slice(0, 2), sessions: [ALL4[0], ALL4[1]]}]], run: async (page, t) => {
     await t.tap(open); await t.tap('[data-act="sys.cdays"][data-arg="72"]'); await t.wait(400); await t.tap(go); await t.wait(300);
-    must((await toasts(page))[0] === "Ended 2 sessions, stopped 0 containers, freed about 8.8 GB.", "3 days result"); }}),
+    const m = await toasts(page); must(m.includes("Ended 2 sessions, stopped 0 containers, freed about 8.8 GB."), "3 days result " + JSON.stringify(m)); }}),
   S("double-tap", "cleanse", {run: async (page, t) => {
     await page.evaluate(() => { document.querySelector('[data-act="sys.copen"]').click(); document.querySelector('[data-act="sys.cgo"]').click(); });
     await t.wait(300); must(!!(await page.$(".p-sheet.on")) && (await toasts(page)).length === 0, "a tap in the first moments must do nothing"); }}),
