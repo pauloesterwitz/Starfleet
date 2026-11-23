@@ -31,7 +31,7 @@ final class DesktopWidgetController: ObservableObject {
 
     private func showPanel() {
         if panel == nil {
-            let panel = NSPanel(
+            let panel = DragPanel(
                 contentRect: NSRect(x: 0, y: 0, width: 230, height: 160),
                 styleMask: [.borderless, .nonactivatingPanel],
                 backing: .buffered,
@@ -116,4 +116,34 @@ final class DesktopWidgetController: ObservableObject {
 /// hosting view still takes the hit), so the hosting view itself says yes.
 final class DraggableHostingView<Content: View>: NSHostingView<Content> {
     override var mouseDownCanMoveWindow: Bool { true }
+}
+
+/// Drag that does not depend on hit-testing. Whether a click may move a window is decided per
+/// click by the view under the cursor, and SwiftUI's hosting view answers it unreliably on
+/// recent macOS (two earlier fixes on that route did not hold). So the panel watches the mouse
+/// itself: once a left press has moved more than 3 pt, it hands that press to the window
+/// server (performDrag). A press that does not move is passed on untouched, so buttons and
+/// links keep working.
+final class DragPanel: NSPanel {
+    private var pressed: NSEvent?
+
+    override func sendEvent(_ event: NSEvent) {
+        switch event.type {
+        case .leftMouseDown:
+            pressed = event
+        case .leftMouseUp:
+            pressed = nil
+        case .leftMouseDragged:
+            if let down = pressed,
+               hypot(event.locationInWindow.x - down.locationInWindow.x,
+                     event.locationInWindow.y - down.locationInWindow.y) > 3 {
+                pressed = nil
+                performDrag(with: down)
+                return
+            }
+        default:
+            break
+        }
+        super.sendEvent(event)
+    }
 }
