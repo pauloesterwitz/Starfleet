@@ -8,19 +8,43 @@ const spEsc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":
 const spGB=mb=>mb==null?"--":(mb/1024).toFixed(1)+" GB";
 const SP_NODE={"jean-luc":"JEAN-LUC","kathryn":"KATHRYN"};
 
-/* state.speech -> one pseudo model row per member and node. The row id carries the node suffix like every other row. */
+/* state.speech -> one pseudo model row per member and node. The row id carries the node suffix like every other row, so the
+   state, queue and busy lookups stay per machine. RAM is what the server holds while it runs (measured by speech-ctl), else
+   what it needs to start. */
 function speechModels(sp){
   const rows=[];
   for(const m of (sp&&sp.members)||[]){
     for(const [node,p] of Object.entries(m.per_node||{})){
-      rows.push(Object.assign({},m,p,{id:`${m.id}-${node}`,mid:m.id,node,nodes:[node],kind:"speech",pinned:!!p.pinned,tps:null,ctx:null,effort:null,effort_options:[]}));
+      const held=p.state==="ready"&&p.mem_mb!=null;
+      rows.push(Object.assign({},m,p,{id:`${m.id}-${node}`,mid:m.id,node,nodes:[node],kind:"speech",pinned:!!p.pinned,tps:null,ctx:null,effort:null,effort_options:[],
+        ram_mb:{[node]:held?p.mem_mb:m.need_mb},ram_basis:held?"measured: what the running server holds":"what the server needs to start (weights, cache and working memory)"}));
     }
   }
   return rows;
 }
-/* idempotent: render(last) runs again on every filter click, so rows from an earlier pass are dropped first */
+/* One row per MODEL, the machine picked in its Node dropdown (the same picker the LLM families use: machineSel + setMachine in the
+   main script). Default pick: the machine it already runs on, else the emptier machine it fits on. The other machine's state
+   stays visible on the row (_others), so a server running on the machine you did not pick is never hidden.
+   Idempotent: render(last) runs again on every filter click, so rows from an earlier pass are dropped first. */
 function withSpeech(s){
-  return s&&s.speech?Object.assign({},s,{models:(s.models||[]).filter(m=>!isSpeech(m)).concat(speechModels(s.speech))}):s;
+  if(!s||!s.speech) return s;
+  const sel=typeof machineSel!=="undefined"?machineSel:{}, order=typeof MACHINE_ORDER!=="undefined"?MACHINE_ORDER:["jean-luc","kathryn"];
+  const avail=n=>(((s.speech.nodes||{})[n])||{}).avail_mb||0, by={};
+  speechModels(s.speech).forEach(r=>(by[r.mid]=by[r.mid]||[]).push(r));
+  const rows=Object.values(by).map(list=>{
+    const bn={}; list.forEach(r=>bn[r.node]=r);
+    const busyish=r=>["ready","loading","queued","unloading"].includes(r.state);
+    const live=list.find(busyish);
+    const fits=list.filter(r=>(r.fit||{}).ok).sort((a,b)=>avail(b.node)-avail(a.node))[0];
+    /* a tab that lists by state (Resident, Pinned) or by machine shows the machine that satisfies it, like the LLM families do */
+    const flt=typeof filter!=="undefined"?filter:"";
+    const forced=flt==="live"?list.find(r=>r.state==="ready"):flt==="pinned"?list.find(r=>r.pinned):bn[flt];
+    const pick=forced||bn[sel[list[0].mid]]||list.find(r=>r.pinned)||live||fits||list.slice().sort((a,b)=>order.indexOf(a.node)-order.indexOf(b.node))[0];
+    if(!forced||bn[flt]) sel[pick.mid]=pick.node;
+    return Object.assign({},pick,{_base:pick.mid,_family:order.filter(n=>bn[n]),
+      _others:list.filter(r=>r!==pick&&(busyish(r)||r.pinned)).map(r=>({node:r.node,state:r.state,pinned:r.pinned}))});
+  });
+  return Object.assign({},s,{models:(s.models||[]).filter(m=>!isSpeech(m)).concat(rows)});
 }
 
 function speechRow(m, working){
@@ -30,26 +54,24 @@ function speechRow(m, working){
   const label=st==="queued"?"queued"+(qp?" #"+qp:""):st==="loading"?"loading"+(m.busy_s!=null?" "+m.busy_s+" s":""):st==="unloading"?"unloading":st==="ready"?"loaded":st==="unknown"?"unknown":"stopped";
   const fit=m.fit||{};
   const sub=[m.family||m.engine, m.precision, m.params_b?m.params_b+"B":null, m.languages, m.max_audio&&("audio: "+m.max_audio)].filter(Boolean).join(" · ");
-  const held=st==="ready"&&m.mem_mb!=null?` &middot; holds ${spGB(m.mem_mb)}`:"";
+  const others=(m._others||[]).map(o=>`${SP_NODE[o.node]||spEsc(o.node)}: ${o.state==="ready"?"loaded":o.state==="off"||o.state==="unknown"?"pinned":o.state}${o.pinned&&o.state!=="off"&&o.state!=="unknown"?", pinned":""}`).join(", ");
+  const also=others?`<div class="sub">also on the other machine - ${spEsc(others)}</div>`:"";
   const where=st==="ready"&&m.url?`<div class="sub">${spEsc(m.url+(m.endpoint||""))}</div>`:"";
   const warn=(st==="off"||st==="unknown")&&fit.ok===false?`<div class="err">${spEsc(fit.reason)}</div>`:"";
   const lu=m.last&&m.last.op==="unload"&&m.last.ok&&st==="off"
     ?`<div class="sub">last unload freed ${spGB(m.last.freed_mb)}${m.last.cache_dropped_mb?` + ${spGB(m.last.cache_dropped_mb)} of weights dropped from cache`:""}</div>`:"";
-  const can=!(busyNow||st==="ready"||st==="queued"||fit.ok===false);
   return `<tr class="${m.pinned?"pinned":st==="ready"?"live":""}">
     <td><div class="mid">${spEsc(m.label||m.mid)}</div>
-        <div class="sub">${spEsc(sub)} &middot; needs ${spGB(m.need_mb)}${held}</div>${where}${warn}${lu}${m.error?`<div class="err">${spEsc(m.error)}</div>`:""}</td>
-    <td class="ctx"><select class="ctxsel" disabled title="Each speech server runs on the machine of its row"><option>${SP_NODE[m.node]||spEsc(m.node)}</option></select></td>
+        <div class="sub">${spEsc(sub)} </div>${where}${also}${typeof pinNote==="function"?pinNote(m,st==="ready"):""}${warn}${lu}${m.error?`<div class="err">${spEsc(m.error)}</div>`:""}</td>
+    <td class="ctx"><select class="ctxsel set" title="Where this server runs. State, Load and Unload apply to the machine picked here; the same server can also run on the other machine."
+        onchange="setMachine('${m._base}',this.value)">${(m._family||[m.node]).map(n=>
+        `<option value="${n}"${n===m.node?" selected":""}>${SP_NODE[n]||spEsc(n)}</option>`).join("")}</select></td>
+    <td>${ramCell(m)}</td>
     <td class="mid">&mdash;</td><td class="mid">&mdash;</td><td class="mid">&mdash;</td>
     <td><span class="st ${cls}">${label}</span></td>
     <td class="mid">&mdash;</td>
-    <td class="act">
-      <button class="${m.pinned?"on":""}" ${busyNow?"disabled":""} title="Keep this server loaded: Pin loads it now, Unload unpins it" onclick="pinSpeech('${m.id}',${!m.pinned})">${m.pinned?"Pinned":"Pin"}</button>
-      <button class="${st==="ready"?"on":""}" ${can?"":"disabled"} title="${fit.ok===false&&st==="off"?spEsc(fit.reason):"Load this server on "+(SP_NODE[m.node]||spEsc(m.node))}"
-        onclick="loadSpeech('${m.id}')">${st==="ready"?"Loaded":"Load"}</button>
-      <button class="unl" ${(st==="off"||st==="unknown"||st==="unloading")?"disabled":""}
-        title="${st==="ready"?"Stop the server and give its memory back":st==="queued"?"Drop it from the load queue":"Stop it"}"
-        onclick="unloadSpeech('${m.id}')">${st==="queued"?"Dequeue":st==="loading"?"Cancel":"Unload"}</button></td></tr>`;
+    <td class="act">${loadPinButtons({id:m.id,up:st==="ready",loading:st==="loading",queued:st==="queued",unloading:st==="unloading",pinned:m.pinned,working,
+      blocked:fit.ok===false?fit.reason:"",load:`loadSpeech('${m.id}')`,unload:`unloadSpeech('${m.id}')`,pin:`pinSpeech('${m.id}',${!m.pinned})`})}</td></tr>`;
 }
 
 async function spPost(url,id,body){
@@ -78,7 +100,10 @@ async function unloadSpeech(id){
 (function(){
   const sp={members:[{id:"a",label:"A",per_node:{"jean-luc":{state:"off"},kathryn:{state:"ready"}}}]};
   const s=withSpeech({models:[{id:"llm"}],speech:sp});
-  console.assert(s.models.length===3&&s.models.filter(isSpeech).length===2,"speech: one row per member and node, the LLM row stays");
-  console.assert(withSpeech(s).models.length===3,"speech: withSpeech is idempotent (render(last) runs it again)");
   console.assert(speechModels(sp)[1].id==="a-kathryn"&&speechModels(sp)[1].nodes[0]==="kathryn","speech: row id carries the node suffix");
+  console.assert(s.models.length===2&&s.models.filter(isSpeech).length===1,"speech: ONE row per member (the machine is a dropdown), the LLM row stays");
+  console.assert(s.models[1].node==="kathryn"&&s.models[1]._family.join()==="jean-luc,kathryn","speech: the row shows the machine it runs on, offers both");
+  console.assert(withSpeech(s).models.length===2,"speech: withSpeech is idempotent (render(last) runs it again)");
+  console.assert(withSpeech({speech:{members:[{id:"b",need_mb:5000,per_node:{"jean-luc":{state:"ready",mem_mb:4000},kathryn:{state:"off"}}}]}}).models[0].ram_mb["jean-luc"]===4000,
+    "speech: a running server reports the memory it holds, not its estimate");
 })();

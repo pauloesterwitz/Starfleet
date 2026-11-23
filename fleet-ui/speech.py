@@ -30,6 +30,12 @@ _busy = {}       # row key -> {"op": "loading"|"unloading", "t0": epoch}
 _last = {}       # row key -> outcome of the last load/unload, for the row and the toast
 _lock = threading.Lock()
 PIN_FILE = os.environ.get("SPEECH_PINS", os.path.expanduser("~/.config/fleet-ui/speech-pins.json"))
+# A pin reloads an evicted server, which needs the Starfleet key: kept per pin IN MEMORY ONLY (never in a file, in the state or in a
+# log), dropped with the pin and on a Fleet restart; the page offers the key again when it opens (set_pin ... arm=True).
+_keys = {}       # row key -> Starfleet key
+_retry = {}      # row key -> {"at": epoch of the next try, "n": failed tries in a row}
+_note = {}       # row key -> why a pinned server is not running (shown on its row)
+RETRY_S, RETRY_MAX_S = 120, 1800
 
 
 def pins():
@@ -49,18 +55,25 @@ def _save_pins(p):
     os.replace(tmp, PIN_FILE)
 
 
-def set_pin(mid, node, on, key):
-    """Pin (and load, if it is not up) or unpin one member on one node. Keyed like every load."""
+def set_pin(mid, node, on, key, arm=False):
+    """Pin (and load, if it is not up) or unpin one member on one node. Keyed like every load. arm=True only hands Fleet the key
+    for a pin that already exists (after a restart): nothing is loaded or changed."""
     if mid not in members() or node not in _cfg["nodes"]:
         raise ValueError(f"unknown speech member {mid!r} or node {node!r}")
     _cfg["key_check"](key)
     rk, p = rowkey(mid, node), pins()
+    if arm:
+        if rk in p:
+            _keys[rk] = key
+        return {"ok": True, "armed": rk in p}
     if not on:
         p.discard(rk)
+        _keys.pop(rk, None)
         _save_pins(p)
         return {"ok": True, "pinned": False}
     p.add(rk)
     _save_pins(p)
+    _keys[rk] = key
     with _lock:
         up = ((_node.get(node) or {}).get("members") or {}).get(mid, {}).get("running")
     if up:
@@ -113,7 +126,47 @@ def probe_worker():
     while True:
         for node in _cfg["nodes"]:
             refresh(node)
+        try:
+            reload_pass()
+        except Exception:                         # the probe loop must outlive anything in the reload
+            pass
         time.sleep(POLL_S)
+
+
+def reload_pass():
+    """Load every pinned server that is not running, with the key its pin holds. Servers coexist, so the only gate is that it
+    fits on its machine; a failed or refused load backs off (2 min, doubling, at most 30 min)."""
+    p, now, ms, notes = pins(), time.time(), members(), {}
+    for rk in [k for k in _keys if k not in p]:
+        _keys.pop(rk, None)                       # the pin is gone: so is the key
+    for rk in p:
+        node = next((n for n in _cfg.get("nodes", {}) if rk.endswith("-" + n)), None)
+        mid = rk[:-len(node) - 1] if node else None
+        if not node or mid not in ms:
+            continue
+        with _lock:
+            nd, busy = dict(_node.get(node) or {}), rk in _busy
+        if "members" not in nd:
+            continue                              # this machine has not been probed yet: say nothing
+        if ((nd.get("members") or {}).get(mid) or {}).get("running") or busy or rk in set(_cfg["queued"]()):
+            _retry.pop(rk, None)
+            continue
+        key, r = _keys.get(rk), _retry.get(rk)
+        if not key:
+            notes[rk] = "Not armed: Fleet holds no Starfleet key for this pin. Open Shuttle Bay with the key saved and it reloads by itself."
+        elif r and now < r["at"]:
+            notes[rk] = f"The last load failed; next try in {int((r['at'] - now) // 60) + 1} min."
+        elif not fit_from(nd, ms[mid])["ok"]:
+            notes[rk] = "Waiting: " + fit_from(nd, ms[mid])["reason"]
+        else:
+            n = (r or {}).get("n", 0)
+            _retry[rk] = {"at": now + min(RETRY_MAX_S, RETRY_S * 2 ** n), "n": n + 1}
+            try:
+                load(mid, node, key)
+            except Exception as e:
+                notes[rk] = str(e)[:140]
+    _note.clear()
+    _note.update(notes)
 
 
 def fit_from(nd, m):
@@ -156,7 +209,7 @@ def state():
                 else:
                     st = "off"
                 host = nd.get("fabric_ip")
-                per[node] = {"state": st, "port": m.get("port"), "url": f"http://{host}:{m.get('port')}" if host and s.get("running") else None, "pinned": rk in pinned,
+                per[node] = {"state": st, "port": m.get("port"), "url": f"http://{host}:{m.get('port')}" if host and s.get("running") else None, "pinned": rk in pinned, "pin_armed": rk in _keys, "pin_note": _note.get(rk),
                              "mem_mb": s.get("mem_mb"), "since": s.get("since"), "fit": fit_from(nd, m),
                              "error": _cfg["get_error"](rk), "last": last.get(rk), "busy_s": round(now - busy[rk]["t0"]) if rk in busy else None}
             rows.append({"id": mid, **{k: m.get(k) for k in ("label", "engine", "family", "precision", "params_b", "languages", "need_mb", "api", "endpoint", "note", "port", "max_audio")},
@@ -212,6 +265,7 @@ def unload(mid, node, key):
     if rk in p:                                   # Unload unpins too, else it would be a pin that is not running
         p.discard(rk)
         _save_pins(p)
+    _keys.pop(rk, None)
     if _cfg["dequeue"](rk):
         return {"ok": True, "dequeued": True}
     with _lock:
@@ -234,6 +288,7 @@ def stop_all():
     """For Red Alert: stop every speech server that is running, on every node. Returns {row key: speech-ctl answer}."""
     res = {}
     _save_pins(set())                             # Red Alert clears every pin, like the LLM pins
+    _keys.clear()                                 # ...and every key a pin held
     for node in _cfg.get("nodes", {}):
         st = ctl(node, "status", timeout=40)
         for mid, s in (st.get("members") or {}).items():

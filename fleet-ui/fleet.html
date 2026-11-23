@@ -597,8 +597,9 @@ html.fs{scrollbar-width:none} html.fs::-webkit-scrollbar{display:none}
       <span class="count" id="count"></span>
     </div>
     <table data-table="models"><thead><tr><th data-sort="name">Model</th><th data-sort="node">Node</th>
+      <th data-sort="ram" data-first="-1" title="Memory the model claims on the machine shown in its Node column. A model that runs across both Sparks claims it on each.">RAM</th>
       <th data-sort="speed" data-first="-1">Speed</th><th data-sort="ctx" data-first="-1">Context</th><th data-sort="effort">Effort</th>
-      <th data-sort="state">State</th><th data-sort="ttl" data-first="-1">TTL</th><th class="act" data-sort="pin" data-first="-1">Persistent</th></tr></thead>
+      <th data-sort="state">State</th><th data-sort="ttl" data-first="-1">TTL</th><th class="act" data-sort="pin" data-first="-1" title="Two toggles on every row: Load / Unload, and Pin / Unpin">Load / Pin</th></tr></thead>
       <tbody id="rows"></tbody></table>
 
   </div>
@@ -831,6 +832,21 @@ function nodeCell(m){
     }"><option>${tp2?"STARFLEET TP2":lbl(m.nodes[0])}</option></select>`;
 }
 
+/* RAM column: what the model claims on the machine in its Node column (state.models[].ram_mb is {machine: MB}; fleet.py ram_fields,
+   modelram.py). A TP=2 member claims the same figure on EACH Spark, so its row says so. The tooltip says where the number comes from. */
+const ramGB=mb=>{ const g=mb/1024; return (g>=10?Math.round(g):g.toFixed(1))+" GB"; };
+function ramMB(m){
+  const r=m.ram_mb; if(!r) return null;
+  const v=r[(m.nodes||[])[0]];
+  return v!=null?v:(Object.values(r).find(x=>x!=null)??null);
+}
+function ramCell(m){
+  const mb=ramMB(m); if(mb==null) return `<div class="mid">&mdash;</div>`;
+  const tp2=(m.nodes||[]).length>1;
+  const gate=m.ram_gate_mb&&m.ram_gate_mb!==mb?` Admission floor: ${ramGB(m.ram_gate_mb)}.`:"";
+  return `<div class="mid" title="${String(m.ram_basis||"").replace(/"/g,"&quot;")}${gate}">${ramGB(mb)}</div>${tp2?`<div class="sub">on each Spark</div>`:""}`;
+}
+
 function groupModels(models,run){
   const byBase={}, out=[];
   for(const m of models){
@@ -849,6 +865,8 @@ function groupModels(models,run){
     if(ambiguous||variants.length<2){ out.push(...variants); continue; }
     const pick =
       byMachine[filter] ? filter :
+      filter==="live"&&variants.find(v=>run[v.id]) ? variants.find(v=>run[v.id]).nodes[0] :
+      filter==="pinned"&&variants.find(v=>v.pinned) ? variants.find(v=>v.pinned).nodes[0] :
       byMachine[machineSel[base]] ? machineSel[base] :
       variants.find(v=>run[v.id]) ? variants.find(v=>run[v.id]).nodes[0] :
       variants.find(v=>v.pinned) ? variants.find(v=>v.pinned).nodes[0] :
@@ -862,8 +880,11 @@ function groupModels(models,run){
     const speeds=variants.map(v=>v.tps).filter(t=>typeof t==="number");
     const tps=speeds.length
       ? Math.round(speeds.reduce((a,t)=>a+t,0)/speeds.length*10)/10 : null;
+    /* the twin on the other machine, when it is loaded or pinned too: the row shows one machine, never hides the other */
+    const also=variants.filter(v=>v!==byMachine[pick]&&(run[v.id]||v.pinned))
+      .map(v=>`${(TAG[v.nodes[0]]||["",v.nodes[0]])[1]}: ${run[v.id]?"loaded":"pinned"}${run[v.id]&&v.pinned?", pinned":""}`);
     out.push(Object.assign({},byMachine[pick],
-      {tps,_base:base,_family:MACHINE_ORDER.filter(n=>byMachine[n])}));
+      {tps,_base:base,_family:MACHINE_ORDER.filter(n=>byMachine[n]),_also:also}));
   }
   return out;
 }
@@ -922,29 +943,63 @@ function groupModels(models,run){
    llama-swap members, so there is no speed, context, effort or ttl to show. The Node
    cell becomes a chooser, because for these the node is an INPUT (where you want it to
    run), not a reported fact. */
+/* The two toggles every row of the registry carries, whatever the model is (LLM, embedder, reranker, image, speech server):
+     Load / Unload   one button. Not loaded: "Load" (loads without pinning). Loaded: "Unload". A load in flight: "Cancel", waiting in
+                     the load queue: "Dequeue". Unload, Cancel and Dequeue also unpin, so a pin never outlives the stop you asked for.
+     Pin / Unpin     one button. "Pin" loads the model now if it is not up and marks it to be kept; "Unpin" only drops the mark.
+   s: {up, loading, queued, pinned, working, unloading, blocked (why Load is impossible, or ""), load, unload, pin} where load / unload / pin
+   are the onclick expressions of the row's own handlers. */
+/* A pin reloads an evicted model, which needs the Starfleet key. Fleet holds that key in memory only, so after a Fleet restart a pinned
+   row reports pin_armed:false until this page offers the key again: one POST per such row, at most once a minute. It goes through the
+   row's own pin route with arm:true (nothing is loaded or changed); without a saved key the answer is 403 and nothing happens. */
+const armTried={};
+function armPins(rows){
+  const now=Date.now();
+  for(const m of rows){
+    if(!m.pinned||m.pin_armed!==false||now-(armTried[m.id]||0)<60000) continue;
+    armTried[m.id]=now;
+    const [url,body]=isSpeech(m)?["/api/speech/pin",{id:m.mid,node:m.node,pin:true,arm:true}]
+      :isImg(m)?["/api/imgpin",{model:m.id,pin:true,arm:true}]:["/api/pin",{model:m.id,pin:true,arm:true}];
+    fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}).catch(()=>{});
+  }
+}
+/* why a pinned model that is not loaded is not coming back (fleet.py pin_plan / speech.reload_pass), under the model name */
+const pinNote=(m,up)=>m.pinned&&m.pin_note&&!up?`<div class="sub">${esc(m.pin_note)}</div>`:"";
+
+function loadPinButtons(s){
+  const stop=s.up||s.loading||s.queued;
+  const lu=s.up?["Unload","Unload this model and give its memory back. This also drops its pin."]
+    :s.loading?["Cancel","Abort the load in progress. This also drops its pin."]
+    :s.queued?["Dequeue","Take it out of the load queue. This also drops its pin."]
+    :s.unloading?["Unloading","Being stopped"]
+    :["Load",s.blocked||"Load this model now (needs the Starfleet key). It is not pinned: pin it as well to keep it loaded."];
+  const luOff=s.working||s.unloading||(!stop&&!!s.blocked);
+  return `<button class="${stop?"unl":""}" ${luOff?"disabled":""} title="${String(lu[1]).replace(/"/g,"&quot;")}" onclick="${stop?s.unload:s.load}">${lu[0]}</button>
+    <button class="${s.pinned?"on":""}" ${s.working?"disabled":""} title="${s.pinned?"Unpin: stop keeping this model loaded (it stays loaded until something unloads it)":"Pin: load this model now and keep it loaded. If it is evicted, Fleet loads it again."}"
+      onclick="${s.pin}">${s.pinned?"Unpin":"Pin"}</button>`;
+}
+
 function imgRow(m, working){
   const loaded=!!m.loaded_at, busyNow=working||imgBusy.has(m.id);
   const opts=(m.img_nodes||["jean-luc","kathryn"]).map(n=>
     `<option value="${n}"${m.nodes.includes(n)?" selected":""}>${(TAG[n]||["",n])[1]}</option>`).join("");
-  return `<tr class="${loaded?"live":""}">
+  return `<tr class="${m.pinned?"pinned":loaded?"live":""}">
     <td><div class="mid">${m.id}</div>
         <div class="sub">${KINDLBL[m.kind]||m.kind} &middot; ${
           m.need_mb?(m.need_mb/1024).toFixed(1)+" GB":"&mdash;"}${
-          m.note?" &middot; "+m.note:""}</div></td>
+          m.note?" &middot; "+m.note:""}</div>${pinNote(m,loaded)}</td>
     <td class="ctx"><select class="ctxsel set" ${busyNow?"disabled":""}
         title="Where this model should run. Changing it moves the model: it is warmed on the new node, and renders route there."
         onchange="setImgNode('${m.id}',this.value)">${opts}</select></td>
+    <td>${ramCell(m)}</td>
     <td class="mid">&mdash;</td>
     <td class="mid">&mdash;</td>
     <td class="mid">&mdash;</td>
     <td><span class="st ${busyNow?"loading":queuedPos[m.id]?"queued":loaded?"ready":"stopped"}">${
         busyNow?"loading":queuedPos[m.id]?"queued #"+queuedPos[m.id]:loaded?"loaded":"stopped"}</span></td>
     <td class="mid">&mdash;</td>
-    <td class="act">
-      <button class="${loaded?"on":""}" ${busyNow?"disabled":""}
-        onclick="loadImg('${m.id}')">${loaded?"Loaded":"Load"}</button>
-      <button ${busyNow||(!loaded&&!queuedPos[m.id])?"disabled":""}
-        onclick="unloadImg('${m.id}')">${queuedPos[m.id]&&!loaded?"Dequeue":"Unload"}</button></td></tr>`;
+    <td class="act">${loadPinButtons({id:m.id,up:loaded,queued:queuedPos[m.id],pinned:m.pinned,working:busyNow,
+      load:`loadImg('${m.id}')`,unload:`unloadImg('${m.id}')`,pin:`pinImg('${m.id}',${!m.pinned})`})}</td></tr>`;
 }
 
 const imgBusy=new Set();
@@ -970,28 +1025,31 @@ const loadImg=m=>{
   return imgPost("/api/imgnode",m,{node});
 };
 const unloadImg=m=>imgPost("/api/imgunload",m);
+const pinImg=(m,on)=>imgPost("/api/imgpin",m,{pin:on});
 
 function keep(m,run){
   /* match the name the row SHOWS as well as the real member id -- the label drops the tps
      marker, so "qwen3.6-35b-mtp4" is not a substring of any member id */
   if(query && !(m.id+" "+modelName(m.id)).toLowerCase().includes(query)) return false;
-  /* The Image tab is the ONLY one that shows image/video models. They are not
-     llama-swap members, so node/ttl/context filters are meaningless for them and they
-     would just be rows of dashes everywhere else -- including "All". */
+  /* Every model type takes part in every tab it can: the same two toggles, the same RAM and Node columns on every row, so
+     image/video and speech rows are in All, in the machine tabs, in Resident when loaded and in Pinned when pinned.
+     Only the tabs about a LLM property (Vision, Embeddings, Rerankers, TP2) leave them out, and the Image and Speech tabs
+     show only their own type. */
   if(filter==="speech") return isSpeech(m);
   if(filter==="image") return isImg(m)&&!isSpeech(m);
-  if(isImg(m)) return false;
   switch(filter){
     case "all": return true;
-    case "live": return !!run[m.id];
-    case "pinned": return m.pinned;
-    case "vision": return m.vision==="on";
-    case "starfleet": return m.nodes.length>1;
-    case "embed": return isEmbed(m);
-    case "rerank": return isRerank(m);
+    case "live": return isUp(m,run);
+    case "pinned": return !!m.pinned;
+    case "vision": return !isImg(m)&&m.vision==="on";
+    case "starfleet": return !isImg(m)&&m.nodes.length>1;
+    case "embed": return !isImg(m)&&isEmbed(m);
+    case "rerank": return !isImg(m)&&isRerank(m);
     default: return m.nodes.includes(filter) && m.nodes.length===1;
   }
 }
+/* Loaded, whatever the type: a llama-swap member is resident, an image model has a warm-up on record, a speech server answers. */
+function isUp(m,run){ return isSpeech(m)?m.state==="ready":isImg(m)?!!m.loaded_at:!!run[m.id]; }
 
 function gauge(pct){
   const N=28, on=Math.round(pct/100*N);
@@ -1377,8 +1435,11 @@ function render(s){
   const grouped=groupModels(s.models,run);
   document.getElementById("r-mdl").textContent=
     grouped.filter(m=>!m.kind||m.kind==="llm").length;
-  document.getElementById("r-res").textContent=(s.running||[]).length;
-  document.getElementById("r-pin").textContent=(s.pins||[]).length;
+  /* Resident and Pinned count every type, like the tabs of the same names list them */
+  const spRows=speechModels(s.speech), imgRows=(s.models||[]).filter(m=>isImg(m)&&!isSpeech(m));
+  armPins([...(s.models||[]).filter(m=>!isSpeech(m)),...spRows]);
+  document.getElementById("r-res").textContent=(s.running||[]).length+imgRows.filter(m=>m.loaded_at).length+spRows.filter(m=>m.state==="ready").length;
+  document.getElementById("r-pin").textContent=(s.pins||[]).length+imgRows.filter(m=>m.pinned).length+spRows.filter(m=>m.pinned).length;
   document.getElementById("r-node").textContent=ok.length+"/"+Object.keys(s.nodes).length;
   document.getElementById("r-free").textContent=ok.length?gb(free):"--";
 
@@ -1397,10 +1458,10 @@ function render(s){
   const stOf=m=>loadingIds.has(m.id)?"loading":busy.has(m.id)?"working":queuedPos[m.id]?"queued":(run[m.id]?run[m.id].state:"stopped");
   const shown=sorted("models",grouped.filter(m=>keep(m,run)).sort((a,c)=>   /* default: alphabetical by model name */
     modelName(a.id).localeCompare(modelName(c.id),undefined,{numeric:true,sensitivity:"base"})||a.id.localeCompare(c.id)),
-    {name:m=>modelName(m.id), node:m=>(m.nodes||[]).join(" "), speed:m=>m.tps, ctx:m=>m.ctx||m.ctx_deployed||m.ctx_max,
+    {name:m=>modelName(m.id), node:m=>(m.nodes||[]).join(" "), ram:ramMB, speed:m=>m.tps, ctx:m=>m.ctx||m.ctx_deployed||m.ctx_max,
      effort:m=>m.effort, state:stOf, ttl:m=>run[m.id]&&run[m.id].ttl, pin:m=>m.pinned?1:0});
   document.getElementById("count").textContent=filter==="speech"?`${shown.length} servers`:
-    `${shown.length} of ${grouped.filter(m=>!m.kind||m.kind==="llm").length}`;
+    `${shown.length} of ${grouped.length}`;
 
   /* Never replace the table while a context dropdown has focus: the 3s poll would
      close it mid-choice. Everything else on the page still updates. */
@@ -1422,8 +1483,11 @@ function render(s){
         :"Has a vision tower, but started text-only (--limit-mm-per-prompt image:0)"
         }">IMG${m.vision==="off"?" OFF":""}</span>`:""}</div>${
         modelName(m.id)!==m.id?`<div class="sub">${m.id}</div>`:""}${
+        (m._also||[]).length?`<div class="sub">also on the other machine - ${m._also.join(", ")}</div>`:""}${
+        pinNote(m,!!r)}${
         m.error?`<div class="err">${m.error}</div>`:""}</td>
       <td class="ctx">${nodeCell(m)}</td>
+      <td>${ramCell(m)}</td>
       <td class="mid">${m.tps?m.tps+" T/S":"&mdash;"}</td>
       <td class="ctx">${m.ctx_capable?`<select class="ctxsel${m.ctx?(m.ctx===m.ctx_max?" atmax":" set"):""}"
         ${working?"disabled":""} title="${ctxTitle(m)}"
@@ -1436,13 +1500,9 @@ function render(s){
         :"&mdash;"}</td>
       <td><span class="st ${st}">${st==="queued"?"queued #"+queuedPos[m.id]:st}</span></td>
       <td class="mid">${r&&r.ttl?Math.round(r.ttl/60)+" MIN":"&mdash;"}</td>
-      <td class="act">
-        <button class="${m.pinned?"on":""}" ${working?"disabled":""}
-          onclick="act('/api/pin','${m.id}',${!m.pinned})">${m.pinned?"Pinned":"Pin"}</button>
-        <button class="unl" ${working||(!r&&!m.pinned&&!queuedPos[m.id])?"disabled":""}
-          title="${r?"Unload this model and drop its pin":"Not loaded: drop the pin (cancels a load in progress)"}"
-          onclick="act('/api/unload','${m.id}')">${r||(!m.pinned&&!queuedPos[m.id])?"Unload":queuedPos[m.id]&&!r?"Dequeue":"Unpin"}</button></td></tr>`;
-  }).join("") : `<tr><td colspan="8" class="empty">No models match this filter</td></tr>`;
+      <td class="act">${loadPinButtons({id:m.id,up:!!r,loading,queued:queuedPos[m.id],pinned:m.pinned,working,
+        load:`act('/api/load','${m.id}')`,unload:`act('/api/unload','${m.id}')`,pin:`act('/api/pin','${m.id}',${!m.pinned})`})}</td></tr>`;
+  }).join("") : `<tr><td colspan="9" class="empty">No models match this filter</td></tr>`;
   sortMarks();
 
   document.getElementById("clock").textContent=new Date().toLocaleTimeString();

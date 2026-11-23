@@ -41,6 +41,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import wikicore      # Memory Core view: wiki graph + Computer's wiki trails (read-only)
+import modelram      # RAM each model claims per machine, from its launcher's DRYRUN (modelram.py)
 import speech        # Shuttle Bay's Speech family: speech-to-text servers Fleet starts itself (speech.py)
 import clusterupdate  # "Install updates on Starfleet Cluster": NVIDIA Sync's Update, on both Sparks (clusterupdate.py)
 
@@ -177,6 +178,26 @@ def save_img_nodes(d):
     os.makedirs(os.path.dirname(IMG_NODE_FILE), exist_ok=True)
     with open(IMG_NODE_FILE, "w") as f:
         json.dump(d, f, indent=2, sort_keys=True)
+
+
+def set_img_pin(model, on):
+    """Image pins are a flag beside loaded_at in image-nodes.json: ComfyUI cannot report what it holds, so the flag is all there is."""
+    prefs = load_img_nodes()
+    e = prefs.setdefault(model, {})
+    if on:
+        e["pinned"] = True
+    else:
+        e.pop("pinned", None)
+    save_img_nodes(prefs)
+
+
+def clear_img_pins():
+    """Red Alert: no image model stays pinned."""
+    prefs = load_img_nodes()
+    if any(e.get("pinned") for e in prefs.values()):
+        for e in prefs.values():
+            e.pop("pinned", None)
+        save_img_nodes(prefs)
 
 
 def img_node(model, prefs=None):
@@ -572,6 +593,8 @@ def red_alert(key):
         unloaded = []
     swap_get("/unload", timeout=120, key=key)
     save_pins(set())
+    clear_img_pins()
+    forget_pin_key()                              # no pin survives a Red Alert, and neither does a key it held
     deadline = time.time() + 90
     while swap_running() and time.time() < deadline:
         time.sleep(1)
@@ -1270,10 +1293,72 @@ def resolve_ctx_max():
             pass
 
 
+# ------------------------------------------------ RAM per model per machine (Shuttle Bay's RAM column)
+RAM_FILE = os.path.expanduser("~/.config/fleet-ui/model-ram.json")
+IMAGEGEN_IDLE_MB = 1500        # the empty ComfyUI container (measured 2026-11-21: 1272 MB RAM + 170 MB GPU); loaded image models add their own row's figure
+_ram = {}
+_ram_at = 0.0
+
+
+def _pool_mb(node):
+    """Total memory of a node in MB from the resource probe; "dynamic" (fastest-node) counts the smaller one."""
+    with LOCK:
+        nodes = (STATE.get("nodes") or {})
+    tot = {n: (v.get("mem_total_kb") or 0) // 1024 for n, v in nodes.items() if isinstance(v, dict)}
+    mb = min([v for v in tot.values() if v], default=0) if node == "dynamic" else tot.get(node, 0)
+    return mb or modelram.POOL_FALLBACK_MB
+
+
+def _ram_probe(cmd):
+    """(key, util, need) from a member's launcher via its read-only DRYRUN; skips launchers without one (they borrow a twin)."""
+    launcher, key = _launcher_and_key(cmd)
+    if not launcher:
+        return "", None, None
+    if not _supports_dryrun(launcher):
+        return key, None, None
+    _, out = _model_subdir(launcher, key)
+    util, need = modelram.parse_dryrun(out)
+    return key, util, need
+
+
+def resolve_ram():
+    """Fill _ram for every llama-swap member (off-thread, never blocks a request); the last good table is kept on disk."""
+    global _ram_at
+    cmds = member_cmds()
+    if not cmds:
+        return
+    table = modelram.resolve(cmds, _ram_probe, node_of, _pool_mb)
+    table["imagegen"] = {"ram_mb": {n: IMAGEGEN_IDLE_MB for n in node_of("imagegen")}, "ram_gate_mb": None,
+                         "ram_basis": "the empty ComfyUI container; every loaded image or video model adds the figure of its own row"}
+    if len(table) < len(_ram) // 2:          # a probe pass that lost most members is not an update
+        return
+    _ram.clear()
+    _ram.update(table)
+    _ram_at = time.time()
+    try:
+        os.makedirs(os.path.dirname(RAM_FILE), exist_ok=True)
+        with open(RAM_FILE + ".tmp", "w") as fh:
+            json.dump(table, fh, indent=1, sort_keys=True)
+        os.replace(RAM_FILE + ".tmp", RAM_FILE)
+    except OSError:
+        pass
+
+
+def ram_fields(model):
+    """The RAM keys of one registry row (ram_mb {node: MB}, ram_basis, ram_gate_mb)."""
+    r = _ram.get(model) or {}
+    return {"ram_mb": r.get("ram_mb"), "ram_basis": r.get("ram_basis"), "ram_gate_mb": r.get("ram_gate_mb")}
+
+
 def ctx_max_worker():
     """Resolve lazily: checkpoints do not change under a running fleet, but the KV
     pool is re-measured every pass so a model that has just loaded at a new context
     updates its usable max on its own."""
+    try:
+        with open(RAM_FILE) as fh:
+            _ram.update(json.load(fh))       # the page has RAM figures from the first poll after a restart
+    except (OSError, ValueError):
+        pass
     with _ctx_max_lock:
         _ctx_native.update(load_ctx_max_cache())
         _ctx_pool.update(load_pool_cache())
@@ -1286,6 +1371,11 @@ def ctx_max_worker():
             resolve_effort_options()
             observe_pools()
         except Exception:                       # never take the server down for this
+            pass
+        try:
+            if time.time() - _ram_at > 1800:    # launchers' figures change only when someone edits a launcher
+                resolve_ram()
+        except Exception:
             pass
         time.sleep(120)
 
@@ -1485,6 +1575,7 @@ def poll_swap():
             with LOCK:
                 STATE["models"] = [m["id"] for m in models]
                 STATE["running"] = running
+                STATE["swap_ok_at"] = time.time()      # the pin reload pass trusts "not running" only while this is fresh
                 STATE["errors"].pop("_swap", None)
         except (urllib.error.URLError, OSError, ValueError, KeyError) as e:
             with LOCK:
@@ -1568,6 +1659,7 @@ def cancel_load(model, key=None):
     if model in pins:
         pins.discard(model)
         save_pins(pins)
+    forget_pin_key(model)
     with _cancel_lock:
         _cancelled.add(model)
     with _loading_lock:
@@ -1727,6 +1819,167 @@ def _pins_needing_touch(pins, running_ids, due_for_refresh):
     return [m for m in pins if due_for_refresh or m not in running_ids]
 
 
+# ---------------------------------------------------------------- a pin reloads an evicted model
+# Pin means: keep this model loaded, and load it again if it is evicted. Loading needs the Starfleet key (policy: only a human
+# with the key loads), so a pin keeps the key it was pinned with IN THIS PROCESS'S MEMORY ONLY: never written to a file, never
+# in /api/state, never in a log or event. It is dropped with the pin (Unpin, Unload, Cancel), on Red Alert and on a Fleet
+# restart. After a restart the page offers the key again when it opens (POST ... arm:true), and a pin Fleet holds no key for
+# says so on its row ("not armed") instead of silently doing nothing.
+_PIN_KEYS = {}           # "member" | "img:model" -> Starfleet key
+_PIN_LOCK = threading.Lock()
+_pin_status = {}         # "member" | "img:model" -> one line saying why a pinned model is not running (never a key)
+_pin_retry = {}          # same names -> {"at": epoch of the next try, "n": failed tries in a row}
+PIN_RETRY_S, PIN_RETRY_MAX_S = 120, 1800
+_group_cache = {"mtime": None, "groups": {}}
+
+
+def arm_pin(name, key):
+    if key:
+        with _PIN_LOCK:
+            _PIN_KEYS[name] = key
+
+
+def forget_pin_key(name=None):
+    with _PIN_LOCK:
+        if name is None:
+            _PIN_KEYS.clear()
+        else:
+            _PIN_KEYS.pop(name, None)
+
+
+def pin_armed(name):
+    with _PIN_LOCK:
+        return name in _PIN_KEYS
+
+
+def swap_groups(path=SWAP_CONFIG):
+    """member -> {name, swap, exclusive, persistent} from llama-swap's routing groups; {} when unreadable (a reload then never fires)."""
+    try:
+        mt = os.path.getmtime(path)
+    except OSError:
+        return {}
+    if _group_cache["mtime"] == mt:
+        return _group_cache["groups"]
+    groups = {}
+    try:
+        import yaml
+        with open(path, encoding="utf-8") as fh:
+            cfg = yaml.safe_load(fh) or {}
+        for name, g in ((((cfg.get("routing") or {}).get("router") or {}).get("settings") or {}).get("groups") or {}).items():
+            for m in g.get("members") or []:
+                groups[m] = {"name": name, "swap": bool(g.get("swap")), "exclusive": bool(g.get("exclusive")), "persistent": bool(g.get("persistent"))}
+    except Exception:
+        groups = {}
+    _group_cache.update(mtime=mt, groups=groups)
+    return groups
+
+
+def load_evicts(a, b, groups):
+    """Would loading `a` make llama-swap unload `b`? Same swap:true group, or `a` in an exclusive group and `b` elsewhere
+    (unless b's group is persistent). A member the groups do not know counts as a conflict: fail closed."""
+    ga, gb = groups.get(a), groups.get(b)
+    if ga is None or gb is None:
+        return True
+    if ga["name"] == gb["name"]:
+        return ga["swap"]
+    return ga["exclusive"] and not gb["persistent"]
+
+
+def pin_plan(pins, running, busy, armed, groups, retry, now, models):
+    """Pure decision for pinned llama-swap members that are not running -> (members to load now, {member: why not}).
+    A pin never reloads over something it would evict: that is the user's own choice (another model loaded in its
+    swap group), and two pins in one group would otherwise unload each other forever."""
+    to_load, notes = [], {}
+    for m in pins:
+        if m in running or (models is not None and m not in models):
+            continue
+        if m in busy:
+            notes[m] = "loading now"
+        elif m not in armed:
+            notes[m] = "Not armed: Fleet holds no Starfleet key for this pin. Open Shuttle Bay with the key saved and it reloads by itself."
+        elif [r for r in running if load_evicts(m, r, groups)]:
+            notes[m] = "Waiting: loading it would unload " + ", ".join(_family_base(r) for r in running if load_evicts(m, r, groups)) + ". It reloads as soon as that is gone."
+        elif now < (retry.get(m) or {}).get("at", 0):
+            notes[m] = f"The last load failed; next try in {int(((retry[m]['at'] - now) // 60) + 1)} min."
+        else:
+            to_load.append(m)
+    return to_load, notes
+
+
+def _backoff(retry, name, now):
+    n = (retry.get(name) or {}).get("n", 0)
+    retry[name] = {"at": now + min(PIN_RETRY_MAX_S, PIN_RETRY_S * 2 ** n), "n": n + 1}
+    return n
+
+
+def pin_reload_pass(pins, running_ids):
+    """Load every pinned llama-swap member that is no longer running, when the plan says it may."""
+    with LOCK:
+        models = set(STATE["models"])
+    with _loading_lock:
+        busy = set(_loading)
+    busy |= set(_llm_busy) | set(queued_ids())
+    with _PIN_LOCK:
+        armed = set(_PIN_KEYS)
+        for k in [k for k in _PIN_KEYS if not k.startswith("img:") and k not in pins]:
+            del _PIN_KEYS[k]                         # the pin is gone: so is the key
+    now = time.time()
+    for m in [m for m in _pin_retry if m in running_ids]:
+        _pin_retry.pop(m, None)
+    to_load, notes = pin_plan(pins, running_ids, busy, armed, swap_groups(), _pin_retry, now, models)
+    for m in to_load:
+        with _PIN_LOCK:
+            key = _PIN_KEYS.get(m)
+        if not _backoff(_pin_retry, m, now):
+            ev_append("info", "pin-reload", "Reloading pinned model", f"{_family_base(m)} is pinned and was no longer loaded: Fleet is loading it again.", go="#/models")
+        request_load(m, key)
+    for k in [k for k in _pin_status if not k.startswith("img:")]:
+        _pin_status.pop(k, None)
+    _pin_status.update(notes)
+
+
+def image_pin_pass():
+    """Pinned image/video models: a warm-up on record that ComfyUI no longer backs (its container shrank to idle size) counts as
+    evicted, and the model is warmed again. Re-warming one that was in fact still resident only costs a cached graph."""
+    prefs = load_img_nodes()
+    pinned = [m for m, e in prefs.items() if e.get("pinned")]
+    for k in [k for k in _pin_status if k.startswith("img:") and k[4:] not in pinned]:
+        _pin_status.pop(k, None)
+    with _PIN_LOCK:
+        for k in [k for k in _PIN_KEYS if k.startswith("img:") and k[4:] not in pinned]:
+            del _PIN_KEYS[k]                         # unpinned (or emptied by an unload): the key goes with it
+    if not pinned:
+        return
+    cat = {im["id"]: im for im in image_models()}
+    rows = ((_CT.get("data") or {}).get("containers") or [])
+    now, changed, busy = time.time(), False, set(queued_ids())
+    for m in pinned:
+        if m not in cat:
+            continue
+        e, node = prefs[m], img_node(m, prefs)
+        foot = sum((c.get("ram_mb") or 0) + (c.get("gpu_mb") or 0) for c in rows if c.get("node") == node and "comfy" in (c.get("name") or ""))
+        if e.get("loaded_at") and foot and foot < max(3000, 0.25 * (cat[m].get("need_mb") or 0)) and now - e["loaded_at"] > 120:
+            e.pop("loaded_at", None)
+            changed = True
+        name = "img:" + m
+        if e.get("loaded_at") or m in busy:
+            _pin_status.pop(name, None)
+            _pin_retry.pop(name, None)
+            continue
+        with _PIN_LOCK:
+            key = _PIN_KEYS.get(name)
+        if not key:
+            _pin_status[name] = "Not armed: Fleet holds no Starfleet key for this pin. Open Shuttle Bay with the key saved and it reloads by itself."
+        elif now < (_pin_retry.get(name) or {}).get("at", 0):
+            _pin_status[name] = "The last warm-up failed; Fleet tries again later."
+        else:
+            _backoff(_pin_retry, name, now)
+            _pin_status.pop(name, None)
+            enqueue_light(m, key, lambda mm, kk, n=node: _warm_job(mm, kk, n))
+    if changed:
+        save_img_nodes(prefs)
+
+
 def keepalive():
     """Keep every pinned model resident. 'Persistent' has to mean more than
     outrunning the idle ttl: a pin can also be evicted at any moment by
@@ -1748,6 +2001,12 @@ def keepalive():
             # refreshed; a pin that is not resident waits for a keyed Load in the UI.
             if model in running_ids:
                 _touch_async(model)
+        try:                                    # a pin also reloads a model that is gone, with the key it holds in memory
+            if time.time() - STATE.get("swap_ok_at", 0) < 30:
+                pin_reload_pass(pins, running_ids)
+            image_pin_pass()                    # speech pins reload from speech.py's own probe loop
+        except Exception as e:                  # never take the keepalive down
+            print(f"pin reload pass: {e.__class__.__name__}: {str(e)[:160]}", flush=True)
         if due_for_refresh:
             last_refresh = time.time()
         time.sleep(RECHECK)
@@ -4075,13 +4334,13 @@ def ev_detect(w, open_keys):
             conds["model-lost:" + m] = dict(
                 kind="model-lost", level="act", title="Pinned model lost", go="#/models", for_s=120, remind=True,
                 text=f"{nm} is pinned but not running." + (f" Last error: {err[:120]}" if err else "") +
-                     " Fleet does not reload it by itself: open Models and press Load.",
-                push=f"{nm} is pinned but not running. Open Models and press Load.",
+                     " " + (w.get("pin_note") or {}).get(m, "Open Models and press Load."),
+                push=f"{nm} is pinned but not running. " + (w.get("pin_note") or {}).get(m, "Open Models and press Load.")[:90],
                 ok=f"{nm} is running again, or no longer pinned.")
     for rk in w.get("speech_lost") or []:                                 # a pinned speech server that is not running (Shuttle Bay, Speech)
         conds["model-lost:" + rk] = dict(kind="model-lost", level="act", title="Pinned model lost", go="#/models", for_s=120, remind=True,
-                                         text=f"{rk} is pinned but not running. Fleet does not reload it by itself: open Shuttle Bay and press Load.",
-                                         push=f"{rk} is pinned but not running. Open Shuttle Bay and press Load.", ok=f"{rk} is running again, or no longer pinned.")
+                                         text=f"{rk} is pinned but not running. " + (w.get("pin_note") or {}).get(rk, "Open Shuttle Bay and press Load."),
+                                         push=f"{rk} is pinned but not running. " + (w.get("pin_note") or {}).get(rk, "Open Shuttle Bay and press Load.")[:90], ok=f"{rk} is running again, or no longer pinned.")
     # nodes
     for n, info in w["nodes"].items():
         lab = label(n)
@@ -4214,7 +4473,8 @@ def ev_world(now, heavy):
     except Exception:
         lost = []
     return dict(heavy, now=now, nodes=nodes, running=running, errors=errors, pins=load_pins(), models=models, speech_lost=lost,
-                busy=loading | set(queued_ids()) | set(_llm_busy), cfg=dict(_CFG_CHANGED))
+                busy=loading | set(queued_ids()) | set(_llm_busy), cfg=dict(_CFG_CHANGED),
+                pin_note={**dict(_pin_status), **dict(speech._note)})
 
 
 def _ev_heavy():
@@ -4708,6 +4968,9 @@ class Handler(BaseHTTPRequestHandler):
                     "effort_options": [o["label"] for o in (_effort_opts.get(m) or [])],
                     "ctx_pool": (pools.get(m) or {}).get("pool"),
                     "kind": "llm",
+                    "pin_armed": pin_armed(m),
+                    "pin_note": _pin_status.get(m),
+                    **ram_fields(m),
                 }
                 for m in snap["models"]
             ]
@@ -4722,7 +4985,9 @@ class Handler(BaseHTTPRequestHandler):
                     "id": im["id"],
                     "nodes": [img_node(im["id"], _img_prefs)],
                     "tps": None,
-                    "pinned": False,
+                    "pinned": bool((_img_prefs.get(im["id"]) or {}).get("pinned")),
+                    "pin_armed": pin_armed("img:" + im["id"]),
+                    "pin_note": _pin_status.get("img:" + im["id"]),
                     "error": None,
                     "load_eta": None,
                     "ctx": None,
@@ -4736,6 +5001,8 @@ class Handler(BaseHTTPRequestHandler):
                     "ctx_pool": None,
                     "kind": im.get("kind", "image"),
                     "need_mb": im.get("need_mb"),
+                    "ram_mb": {n: im["need_mb"] for n in COMFY_ENDPOINTS} if im.get("need_mb") else None,
+                    "ram_basis": "footprint the admission gate reserves on the node while it renders",
                     "note": im.get("note"),
                     # Our own record of the last warm-up, not something ComfyUI can be
                     # asked: it exposes no loaded-model list, and memcheck.sh may call
@@ -4903,7 +5170,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, json.dumps(res), "application/json")
         if self.path == "/api/speech/pin":
             try:
-                res = speech.set_pin(body.get("id"), body.get("node"), bool(body.get("pin")), key)
+                res = speech.set_pin(body.get("id"), body.get("node"), bool(body.get("pin")), key, arm=bool(body.get("arm")))
             except urllib.error.HTTPError as e:
                 return self._send(403, json.dumps({"error": _err_text(e)}), "application/json")
             except PermissionError as e:
@@ -4933,8 +5200,26 @@ class Handler(BaseHTTPRequestHandler):
         if not model or (known and model not in known and model not in img_ids):
             return self._send(400, '{"error":"unknown model"}', "application/json")
 
+        if self.path == "/api/load":          # Load without pinning: the Load / Unload toggle; same key rule as Pin
+            with LOCK:
+                resident = any(r.get("model") == model for r in STATE["running"])
+            if not resident and not key_ok(model, key):
+                return self._send(403, json.dumps({"error": POLICY}), "application/json")
+            if model in img_ids:
+                return self._send(400, '{"error":"image models load through /api/imgnode"}', "application/json")
+            return self._send(200, json.dumps({"ok": True, "queued": 0 if resident else request_load(model, key)}), "application/json")
+
         if self.path == "/api/pin":
             pins = set(load_pins())
+            if body.get("arm"):                    # the page offers its key for a pin Fleet holds none for (after a restart): no load, no pin change
+                if model not in pins:
+                    return self._send(200, '{"ok":true,"armed":false}', "application/json")
+                try:
+                    key_check(key)
+                except urllib.error.HTTPError as e:
+                    return self._send(403, json.dumps({"error": _err_text(e)}), "application/json")
+                arm_pin(model, key)
+                return self._send(200, '{"ok":true,"armed":true}', "application/json")
             if body.get("pin"):
                 with LOCK:
                     resident = any(r.get("model") == model for r in STATE["running"])
@@ -4947,9 +5232,11 @@ class Handler(BaseHTTPRequestHandler):
                 pins -= {s for s in pins if s != model and _same_family(s, model)}
                 pins.add(model)
                 save_pins(pins)
+                arm_pin(model, key)                # in memory only: lets keepalive load it again if it is evicted
                 request_load(model, key)
             else:
                 pins.discard(model)
+                forget_pin_key(model)
                 dequeue(model)
                 save_pins(pins)
             return self._send(200, '{"ok":true}', "application/json")
@@ -5003,6 +5290,7 @@ class Handler(BaseHTTPRequestHandler):
             pins = set(load_pins())
             pins.discard(model)          # unpin too, else keepalive reloads it
             save_pins(pins)
+            forget_pin_key(model)
             with LOCK:
                 resident = any(r.get("model") == model for r in STATE["running"])
             with _loading_lock:
@@ -5062,8 +5350,35 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, json.dumps({"ok": True, "node": node, "queued": pos or 0}),
                               "application/json")
 
+        if self.path == "/api/imgpin":                  # Pin / Unpin an image or video model (loads it now if it is not warm)
+            if model not in img_ids:
+                return self._send(400, '{"error":"unknown image model"}', "application/json")
+            if not body.get("pin"):
+                set_img_pin(model, False)
+                forget_pin_key("img:" + model)
+                dequeue(model)
+                return self._send(200, '{"ok":true,"pinned":false}', "application/json")
+            try:
+                key_check(key)
+            except urllib.error.HTTPError as e:
+                return self._send(403, json.dumps({"error": _err_text(e)}), "application/json")
+            if body.get("arm"):                    # the page offers its key for a pin Fleet holds none for (after a restart)
+                if (load_img_nodes().get(model) or {}).get("pinned"):
+                    arm_pin("img:" + model, key)
+                return self._send(200, '{"ok":true,"armed":true}', "application/json")
+            set_img_pin(model, True)
+            arm_pin("img:" + model, key)
+            prefs = load_img_nodes()
+            if (prefs.get(model) or {}).get("loaded_at"):
+                return self._send(200, '{"ok":true,"pinned":true}', "application/json")
+            node = img_node(model, prefs)
+            pos = enqueue_light(model, key, lambda m, k, n=node: _warm_job(m, k, n))
+            return self._send(200, json.dumps({"ok": True, "pinned": True, "queued": pos or 0}), "application/json")
+
         if self.path == "/api/imgunload":
             if dequeue(model):
+                set_img_pin(model, False)
+                forget_pin_key("img:" + model)
                 return self._send(200, '{"ok":true}', "application/json")
             prefs = load_img_nodes()
             node = img_node(model, prefs)
@@ -5074,6 +5389,7 @@ class Handler(BaseHTTPRequestHandler):
                 for mid, e in prefs.items():
                     if e.get("node", DEFAULT_IMG_NODE) == node:
                         e.pop("loaded_at", None)
+                        e.pop("pinned", None)      # nothing stays pinned on a node that was just emptied
                 save_img_nodes(prefs)
             return self._send(200 if ok else 502,
                               json.dumps({"ok": ok, "node": node, "message": msg}),
@@ -5390,6 +5706,37 @@ def _ev_selfcheck():
 def selfcheck():
     global _q_current, AUTODESTRUCT_CODE
     _ct_selfcheck()
+    # a pin reloads an evicted model, but never over something it would unload
+    G = {"big": {"name": "spark-big", "swap": True, "exclusive": True, "persistent": False},
+         "small": {"name": "spark-small", "swap": False, "exclusive": True, "persistent": False},
+         "sf1": {"name": "starfleet", "swap": True, "exclusive": False, "persistent": False},
+         "sf2": {"name": "starfleet", "swap": True, "exclusive": False, "persistent": False},
+         "emb": {"name": "embeddings", "swap": False, "exclusive": False, "persistent": False},
+         "rr": {"name": "rerankers", "swap": True, "exclusive": False, "persistent": False}}
+    assert load_evicts("sf1", "sf2", G) and not load_evicts("sf1", "emb", G) and not load_evicts("emb", "sf1", G), "same swap group evicts; a free group does not"
+    assert load_evicts("small", "sf1", G) and load_evicts("big", "small", G) and not load_evicts("small", "small", G), "an exclusive group evicts other groups"
+    assert load_evicts("sf1", "unknown", G) and load_evicts("unknown", "sf1", G), "unknown members fail closed"
+    M = {"sf1", "sf2", "emb", "rr"}
+    go, why = pin_plan(["sf1"], set(), set(), {"sf1"}, G, {}, 100, M)
+    assert go == ["sf1"] and not why, "an evicted, armed pin with nothing in the way reloads"
+    go, why = pin_plan(["sf1"], {"sf2"}, set(), {"sf1"}, G, {}, 100, M)
+    assert go == [] and "sf2" in why["sf1"].replace("sf2", "sf2") and "Waiting" in why["sf1"], "a pin waits while another model of its swap group is loaded"
+    go, why = pin_plan(["sf1", "sf2"], {"sf2"}, set(), {"sf1", "sf2"}, G, {}, 100, M)
+    assert go == [] and "sf2" not in why, "the running pin is left alone and its sibling does not fight it"
+    go, why = pin_plan(["sf1"], set(), set(), set(), G, {}, 100, M)
+    assert go == [] and why["sf1"].startswith("Not armed"), "no key in memory: say so, load nothing"
+    go, why = pin_plan(["sf1"], set(), {"sf1"}, {"sf1"}, G, {}, 100, M)
+    assert go == [] and why["sf1"] == "loading now", "a load in flight is not started twice"
+    go, why = pin_plan(["sf1"], set(), set(), {"sf1"}, G, {"sf1": {"at": 400, "n": 1}}, 100, M)
+    assert go == [] and "next try" in why["sf1"], "a failed load backs off"
+    go, why = pin_plan(["sf1"], {"emb"}, set(), {"sf1"}, G, {}, 100, M)
+    assert go == ["sf1"], "a model in a free group does not block it"
+    assert pin_plan(["gone"], set(), set(), {"gone"}, G, {}, 100, M) == ([], {}), "a pin the config no longer knows is left to the pin-unknown alert"
+    r = {}
+    assert [_backoff(r, "x", 0), _backoff(r, "x", 0), _backoff(r, "x", 0)] == [0, 1, 2] and r["x"]["at"] == PIN_RETRY_S * 4, "backoff doubles"
+    assert _backoff({"x": {"n": 20}}, "x", 0) == 20, "n counts failures"
+    arm_pin("selfcheck-pin", "k"); assert pin_armed("selfcheck-pin"); forget_pin_key("selfcheck-pin"); assert not pin_armed("selfcheck-pin")
+    assert not any("k" == v for v in json.dumps(ram_fields("x"))), "keys never travel in state fields"
     # Qwen tool calls left as text in content (seen with Qwen3.8 on sglang, 2026-11-19)
     _sp = [{"type": "function", "function": {"name": "wiki_search", "parameters": {"properties": {
         "query": {"type": "string"}, "limit": {"type": "integer"}}}}}]

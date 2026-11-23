@@ -568,15 +568,22 @@ function modelTag(m, st, w){
   if(st === "ready") return m.pinned ? ["Pinned", "pinned"] : [isImg(m) ? "Loaded" : "Ready", "ready"];
   return [st, "warn"];           /* starting, stopping, ... */
 }
+/* RAM the model claims on the machine in its row (fleet.py ram_fields): "108 GB RAM each" for a TP=2 member, which claims it on both Sparks */
+function ramText(m){
+  const r = m.ram_mb, v = r && (r[(m.nodes || [])[0]] != null ? r[m.nodes[0]] : Object.values(r).find(x => x != null));
+  if(v == null) return "";
+  const g = v / 1024;
+  return (g >= 10 ? Math.round(g) : g.toFixed(1)) + " GB RAM" + ((m.nodes || []).length > 1 ? " each" : "");
+}
 function modelRow(m, w){
   const st = w.stOf(m), r = w.run[m.id], [tag, tagc] = modelTag(m, st, w);
   if(isImg(m)) return H.row({act: "model", arg: m.id, c: edgeOf(m, st), t: m.id, tag, tagc,
-    s: [KINDLBL[m.kind] || m.kind, m.need_mb ? (m.need_mb / 1024).toFixed(1) + " GB" : "", place(m)].filter(Boolean).join(" · "), e: m.error});
+    s: [KINDLBL[m.kind] || m.kind, ramText(m), place(m)].filter(Boolean).join(" · "), e: m.error});
   const ctx = m.ctx || m.ctx_deployed;
   const both = m._family && (w.s.models || []).some(x => x.id !== m.id && familyBase(x) === m._base && w.run[x.id]);
   return H.row({act: "model", arg: m._base || m.id, c: edgeOf(m, st), t: modelName(m.id), tag, tagc, e: m.error,
     badge: isEmbed(m) ? (m.vision === "on" ? "Multimodal" : "Text") : m.vision ? (m.vision === "on" ? "IMG" : "IMG off") : "",
-    s: [both ? "Jean-Luc + Kathryn" : place(m, st !== "stopped"), m.tps ? m.tps + " t/s" : "", ctx ? kfmt(ctx) : "", r && r.ttl ? "Unloads in " + Math.round(r.ttl / 60) + " min" : ""].filter(Boolean).join(" · ")});
+    s: [both ? "Jean-Luc + Kathryn" : place(m, st !== "stopped"), m.tps ? m.tps + " t/s" : "", ramText(m), ctx ? kfmt(ctx) : "", r && r.ttl ? "Unloads in " + Math.round(r.ttl / 60) + " min" : ""].filter(Boolean).join(" · ")});
 }
 function nodeCard(name, n){
   if(!n || n.error) return `<button class="p-node" type="button" data-act="status" style="--c:var(--red)"><h3>${esc(TAG[name] || name)}</h3>
@@ -696,9 +703,9 @@ function drawModel(){
   else if(q && !live){ acts = `<button class="p-btn red" type="button" data-act="unload"${dis}>Dequeue</button>`; note = `Number ${q} in the load queue.`; }
   else if(live){ acts = `<button class="p-btn red" type="button" data-act="unload"${dis}>Unload</button>` + (m.pinned
       ? `<button class="p-btn ghost" type="button" data-act="pin" data-arg="0"${dis}>Unpin</button>` : `<button class="p-btn" type="button" data-act="pin" data-arg="1"${dis}>Pin</button>`);
-    note = m.pinned ? "Pinned: Fleet keeps it resident. Unload also drops the pin." : "Not pinned: it unloads by itself when its time is up."; }
+    note = m.pinned ? "Pinned: Fleet keeps it resident and loads it again if it is evicted. Unload also drops the pin." : "Not pinned: it unloads by itself when its time is up."; }
   else if(m.pinned){ acts = `<button class="p-btn ghost" type="button" data-act="pin" data-arg="0"${dis}>Unpin</button><button class="p-btn" type="button" data-act="pin" data-arg="1"${dis}>Load</button>`;
-    note = "Pinned but not running. Fleet loads it only when you press Load."; }
+    note = "Pinned but not running. " + (m.pin_note || "Fleet loads it again by itself, or press Load."); }
   else { acts = `<button class="p-btn" type="button" data-act="pin" data-arg="1"${dis}>Load and pin</button>`;
     note = `Loads on ${m.nodes.length > 1 ? "both Sparks" : esc(TAG[m.nodes[0]] || m.nodes[0])} and keeps it resident until you unpin it.`; }
   html += `<div class="p-pair p-acts">${acts}</div>${note ? `<p class="p-note">${note}</p>` : ""}`;
