@@ -23,6 +23,9 @@ struct DesktopWidgetView: View {
         .frame(width: 230, alignment: .leading)
         .fixedSize(horizontal: false, vertical: true)
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
+        // Without a view that answers mouseDownCanMoveWindow, SwiftUI content makes the
+        // panel undraggable despite isMovableByWindowBackground (same fix as the Fleet window).
+        .background(WindowDragStrip())
         .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(.white.opacity(0.12)))
     }
 }

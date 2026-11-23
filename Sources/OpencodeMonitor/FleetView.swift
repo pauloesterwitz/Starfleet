@@ -174,7 +174,7 @@ struct HotKeyBridge: View {
 /// -- nothing in the page needs clicks up there. The traffic lights sit in the
 /// window's own title bar, which stays above the content view, so they keep
 /// working through this.
-private struct WindowDragStrip: NSViewRepresentable {
+struct WindowDragStrip: NSViewRepresentable {
     final class DragView: NSView {
         override var mouseDownCanMoveWindow: Bool { true }
     }
