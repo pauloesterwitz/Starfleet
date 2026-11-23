@@ -19,7 +19,7 @@ final class DesktopWidgetController: ObservableObject {
     private let jeanLuc: StatusPoller
     private let kathryn: StatusPoller
     private var panel: NSPanel?
-    private var hosting: NSHostingView<DesktopWidgetView>?
+    private var hosting: DraggableHostingView<DesktopWidgetView>?
 
     init(jeanLuc: StatusPoller, kathryn: StatusPoller) {
         self.jeanLuc = jeanLuc
@@ -47,7 +47,7 @@ final class DesktopWidgetController: ObservableObject {
             panel.isReleasedWhenClosed = false
             panel.hidesOnDeactivate = false
 
-            let hosting = NSHostingView(rootView: DesktopWidgetView(jeanLuc: jeanLuc, kathryn: kathryn))
+            let hosting = DraggableHostingView(rootView: DesktopWidgetView(jeanLuc: jeanLuc, kathryn: kathryn))
             // .preferredContentSize alone reports fittingSize/intrinsicContentSize as a
             // degenerate (0, 0) -- verified in isolation. .intrinsicContentSize is what
             // actually makes those properties reflect the real SwiftUI content size.
@@ -109,4 +109,11 @@ final class DesktopWidgetController: ObservableObject {
         // rather than forcing an immediate synchronous layout pass.
         panel.setFrame(frame, display: false)
     }
+}
+
+/// NSHostingView answers mouseDownCanMoveWindow = false, so isMovableByWindowBackground
+/// never fires on the panel. A background NSView behind the content did not help (the
+/// hosting view still takes the hit), so the hosting view itself says yes.
+final class DraggableHostingView<Content: View>: NSHostingView<Content> {
+    override var mouseDownCanMoveWindow: Bool { true }
 }
