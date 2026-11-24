@@ -401,7 +401,7 @@ P.on("comp-del", id => P.run(async () => {
 
 /* ---------------------------------------------------------------- the screen */
 P.sources.cmodels = {url: "/api/computer/models", key: true};
-const HX = `<button class="p-hbtn" type="button" data-act="comp-new">New</button><button class="p-hbtn" type="button" data-act="comp-chats">Chats</button>`;
+const HX = `<button class="p-hbtn" type="button" data-act="comp-new">New</button><button class="p-hbtn" type="button" data-act="comp-chats">Chats</button><button class="p-hbtn" type="button" data-act="go" data-arg="#/computer/sessions">Sessions</button>`;
 P.screens.computer = { tab: "computer", title: "Computer", color: "magenta", stage: true, needs: {cmodels: 10000},
   mount(el, arg){
     el.append(gate, log, comp); mounted = true; grow(); log.scrollTop = stuck ? log.scrollHeight : top;

@@ -269,6 +269,8 @@ body.comp .main:not(#compview), body:not(.comp) #compview{display:none}
 #compview{display:flex;flex-direction:column;height:calc(100vh - 12px);min-width:0}
 body.fs #compview{height:calc(100vh - 36px)}
 #comp{display:grid;grid-template-columns:230px 1fr;gap:8px;flex:1;min-height:0;margin-top:8px}
+#comptabs{display:flex;gap:6px;margin-top:6px} #comptabs .tpill{min-height:26px}
+#ocroot{flex:1;min-height:0;margin-top:8px} #ocroot[hidden]{display:none} body.ocs #comp{display:none}
 #compchats{overflow:auto;display:flex;flex-direction:column;gap:4px;padding-right:2px}
 #compchats .new{background:var(--orange);color:#000;border:0;border-radius:0 16px 16px 0;padding:8px 12px;font:inherit;
   font-weight:700;letter-spacing:.1em;text-transform:uppercase;text-align:left;cursor:pointer}
@@ -658,6 +660,7 @@ html.fs{scrollbar-width:none} html.fs::-webkit-scrollbar{display:none}
       <div class="bar"><span id="compmeta">--</span></div>
     </div>
     <div class="vmsg" id="compmsg"></div>
+    <div id="comptabs"><button class="tpill on" id="ctabchat" type="button">Chats</button><button class="tpill" id="ctabsess" type="button" title="OpenCode sessions on Jean-Luc and Kathryn: read them, prompt them, pick models and see MCP servers">Sessions</button></div>
     <div id="comp">
       <div id="compchats"></div>
       <div id="compmain">
@@ -684,6 +687,7 @@ html.fs{scrollbar-width:none} html.fs::-webkit-scrollbar{display:none}
         </div>
       </div>
     </div>
+    <div id="ocroot" hidden></div>
   </div>
 </div>
 
@@ -2477,4 +2481,20 @@ if(wantView) setView(wantView);
   poll();
 })();
 </script>
-<script src="/vendor/memcore.js"></script></body></html>
+<script src="/vendor/ocsess.js"></script>
+<script>
+/* Computer > Sessions: OpenCode sessions on both Sparks (vendor/ocsess.js, ocbridge.py). Mounted on first use. */
+(()=>{
+  const root=document.getElementById("ocroot"), tc=document.getElementById("ctabchat"), ts=document.getElementById("ctabsess");
+  let oc=null;
+  function show(on){
+    document.body.classList.toggle("ocs",on); root.hidden=!on; tc.classList.toggle("on",!on); ts.classList.toggle("on",on);
+    if(on&&!oc) oc=OC.mount(root,{api:{get:u=>compJSON(u),post:(u,b)=>compJSON(u,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b||{})})}});
+    try{ localStorage.setItem("ocTab",on?"sess":"chat"); }catch(e){}
+  }
+  tc.addEventListener("click",()=>show(false)); ts.addEventListener("click",()=>show(true));
+  setInterval(()=>{ const n=window.OC?OC.waiting():0; const t="Sessions"+(n?" ("+n+" waiting)":""); if(ts.textContent!==t) ts.textContent=t; ts.style.background=n&&!ts.classList.contains("on")?"var(--amber)":""; ts.style.color=n&&!ts.classList.contains("on")?"#000":""; },3000);
+  try{ if(localStorage.getItem("ocTab")==="sess") show(true); }catch(e){}
+})();
+</script>
+</body></html>

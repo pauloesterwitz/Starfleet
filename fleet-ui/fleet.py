@@ -41,6 +41,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import wikicore      # Memory Core view: wiki graph + Computer's wiki trails (read-only)
+import ocbridge      # OpenCode sessions on every node (Computer: Sessions), behind the Starfleet key
 import modelram      # RAM each model claims per machine, from its launcher's DRYRUN (modelram.py)
 import speech        # Shuttle Bay's Speech family: speech-to-text servers Fleet starts itself (speech.py)
 import clusterupdate  # "Install updates on Starfleet Cluster": NVIDIA Sync's Update, on both Sparks (clusterupdate.py)
@@ -57,6 +58,7 @@ POLICY = "Only Shuttle Bay may load models, with the Starfleet key. Agents may n
 # Use the *.fritz.box name, never the bare tailnet name: the latter hits
 # Tailscale SSH, which wants a browser and breaks BatchMode.
 NODES = {"jean-luc": None, "kathryn": "10.100.0.1"}
+ocbridge.HOSTS = NODES
 
 PIN_FILE = os.path.expanduser("~/.config/fleet-ui/pins.json")
 LOAD_TIMES_FILE = os.path.expanduser("~/.config/fleet-ui/load-times.json")
@@ -3671,7 +3673,7 @@ try:                  # optional override file, same shape as COMPUTER_MCP
         COMPUTER_MCP = {k: dict(v, tools=set(v["tools"]) if v.get("tools") else None) for k, v in json.load(_f).items()}
 except (OSError, ValueError):
     pass
-COMPUTER_ROUNDS = 8           # model <-> tool round trips per message
+COMPUTER_ROUNDS = 24          # model <-> tool round trips per message; the last one is a forced answer without tools
 TOOL_TEXT_CAP = 12000         # characters of one tool result passed to the model
 HISTORY_CHARS = 240000        # characters of history sent with a request (oldest turns drop first)
 _NOT_CHAT = re.compile(r"embed|rerank|imagegen", re.I)
@@ -4035,7 +4037,8 @@ COMPUTER_SYSTEM = (
     "private or customer information from the conversation or the wiki into a web query: no customer, company "
     "or people names, no internal project names, no secrets, no copied text. Search for the generic, public "
     "topic instead. A guard refuses such queries and says why; then rephrase generically. "
-    "Say which sources you used. "
+    "Say which sources you used. Work economically: a broad question gets at most about 10 tool calls, so "
+    "read the most relevant pages first, then answer; you can always offer to dig deeper in a follow-up. "
     "If you do not know, say so instead of guessing.")
 
 
@@ -4169,7 +4172,7 @@ def _text_tool_calls(reply, specs):
     return (_TEXT_CALL.sub("", reply).strip() if calls else reply), calls
 
 
-COMPUTER_TOOLS_PER_ROUND = 4      # tool calls run per model response; the rest are answered "skipped"
+COMPUTER_TOOLS_PER_ROUND = 6      # tool calls run per model response; the rest are answered "skipped"
 COMPUTER_DEADLINE = 1200           # seconds per message, all rounds and tools included
 
 
@@ -4226,15 +4229,19 @@ def _computer_turn(chat, model, vision, text, images, enabled, emit):
     emit({"type": "chat", "id": chat["id"], "title": chat["title"], "wiki_used": bool(chat.get("wiki_used"))})
     reg = computer_tools()
     deadline = time.time() + COMPUTER_DEADLINE
-    for _ in range(COMPUTER_ROUNDS):
-        if time.time() > deadline:
-            raise OSError("stopped: this message took longer than %d minutes" % (COMPUTER_DEADLINE // 60))
+    for rnd in range(COMPUTER_ROUNDS):
+        # Out of rounds or time: never abort. The last round has no tools and asks for the answer from what was found.
+        final = rnd == COMPUTER_ROUNDS - 1 or time.time() > deadline
         if model not in {m["id"] for m in computer_models()}:
             raise PermissionError("The model was unloaded during the answer; Computer never reloads it.")
-        specs = [spec for name, (srv, spec) in reg["tools"].items()
-                 if srv in enabled]
-        reply, reasoning, calls = _stream_completion(model, _history(chat, vision), specs, emit)
-        if not calls and "<tool_call>" in reply:
+        specs = [] if final else [spec for name, (srv, spec) in reg["tools"].items() if srv in enabled]
+        hist = _history(chat, vision)
+        if final:
+            hist.append({"role": "user", "content": "(System note: the tool budget for this message is used up. Do not call "
+                         "any more tools. Answer now from what you have already read, say briefly what you did not get "
+                         "to, and offer to continue in a follow-up message.)"})
+        reply, reasoning, calls = _stream_completion(model, hist, specs, emit)
+        if not calls and "<tool_call>" in reply and not final:
             reply, calls = _text_tool_calls(reply, specs)
         msg = {"role": "assistant", "content": reply, "at": time.time()}
         if reasoning:
@@ -4279,7 +4286,6 @@ def _computer_turn(chat, model, vision, text, images, enabled, emit):
                   "guarded": guarded})
             chat["messages"].append({"role": "tool", "tool_call_id": tc["id"], "name": name, "content": result,
                                      "images": images_out[:4], "at": time.time()})
-    emit({"type": "error", "text": f"Stopped after {COMPUTER_ROUNDS} tool rounds."})
 
 
 def computer_transcribe(wav):
@@ -5009,6 +5015,18 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(("data: " + json.dumps(obj) + "\n\n").encode())
         self.wfile.flush()
 
+    def _oc(self, method, q, body):
+        """One OpenCode request for the page; the allow-list and the body checks live in ocbridge.route."""
+        try:
+            node, path = (q.get("node") or [""])[0], (q.get("path") or [""])[0]
+            rest = [(k, v) for k, vs in q.items() if k not in ("node", "path") for v in vs]
+            out = ocbridge.route(node, method, path, rest, body)
+            return self._send(200, json.dumps(out, ensure_ascii=False), "application/json; charset=utf-8")
+        except ocbridge.OcError as e:
+            return self._send(e.status if 400 <= e.status < 600 else 502, json.dumps({"error": str(e)[:300]}), "application/json")
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            return self._send(502, json.dumps({"error": f"{type(e).__name__}: {str(e)[:200]}"}), "application/json")
+
     def _computer_post(self, n):
         try:
             computer_auth(self.headers.get(KEY_HDR))
@@ -5045,6 +5063,8 @@ class Handler(BaseHTTPRequestHandler):
             except OSError as e:                          # URLError is an OSError too
                 return self._send(502, json.dumps({"error": "voice server: " + str(e)[:160]}), "application/json")
             return self._send(200, wav, "audio/wav")
+        if self.path.startswith("/api/computer/oc?"):   # OpenCode sessions: prompts, stop, model, permission answers
+            return self._oc("POST", urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query), body)
         if self.path == "/api/computer/wiki/edit":     # Memory Core's Edit button: save / rename one page (wikiedit.py)
             try:
                 out = wikicore.page_edit(body)
@@ -5157,6 +5177,8 @@ class Handler(BaseHTTPRequestHandler):
                                       "application/json; charset=utf-8")
                 if u.path == "/api/computer/push":              # push: is the sender set up, how many phones
                     return self._send(200, json.dumps(push_status()), "application/json")
+                if u.path == "/api/computer/oc":               # OpenCode sessions (ocbridge.py): ?node=&path=@overview|@detail|/api/...
+                    return self._oc("GET", q, None)
                 if u.path == "/api/computer/sessions":         # coding-agent sessions, for the phone interface
                     return self._send(200, json.dumps(sessions_state()), "application/json")
                 if u.path == "/api/computer/sessions/tail":
