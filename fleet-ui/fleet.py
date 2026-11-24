@@ -4018,6 +4018,21 @@ def _tool_call(name, args):
     return text[:TOOL_TEXT_CAP] + (" [truncated]" if len(text) > TOOL_TEXT_CAP else ""), images
 
 
+def wiki_raw(ingest=False, limit=5):
+    """Memory Core's Raw button: memory-core's own wiki_ingest_raw on the Knowledge DB's .raw folder. Without ingest the report
+    (counts and the files not done yet); with ingest up to `limit` new files are queued as proposals, one after the other. Nothing is
+    written to the wiki before a human clicks Apply on each review page."""
+    args = {"path": "pending", "limit": max(1, min(int(limit or 5), 20))} if ingest else {}
+    res = _mcp("wiki").call("tools/call", {"name": "wiki_ingest_raw", "arguments": args}, 180)
+    text = "\n".join(p.get("text") or "" for p in res.get("content") or [] if p.get("type") == "text")
+    link = COMPUTER_MCP["wiki"].get("link_rewrite")     # review links: an address the browser can open
+    if link and link[1]:
+        text = text.replace(link[0], link[1])
+    m = re.search(r"new (\d+), changed (\d+), review (\d+), done (\d+)", text)
+    return {"text": text[:20000], "error": bool(res.get("isError")),
+            "counts": dict(zip(("new", "changed", "review", "done"), map(int, m.groups()))) if m else None}
+
+
 def computer_models():
     """Resident models that can chat (no embedder, reranker or image stack), with their vision flag."""
     with LOCK:
@@ -5065,6 +5080,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, wav, "audio/wav")
         if self.path.startswith("/api/computer/oc?"):   # OpenCode sessions: prompts, stop, model, permission answers
             return self._oc("POST", urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query), body)
+        if self.path == "/api/computer/wiki/ingest":   # Memory Core's Raw button: queue new .raw files as proposals (memory-core)
+            try:
+                out = wiki_raw(True, body.get("limit") or 5)
+            except (OSError, ValueError, TypeError, KeyError) as e:
+                return self._send(502, json.dumps({"error": str(e)[:300]}), "application/json")
+            return self._send(200, json.dumps(out, ensure_ascii=False), "application/json; charset=utf-8")
         if self.path == "/api/computer/wiki/edit":     # Memory Core's Edit button: save / rename one page (wikiedit.py)
             try:
                 out = wikicore.page_edit(body)
@@ -5170,6 +5191,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(200, wikicore.graph_json(), "application/json")
                 if u.path == "/api/computer/wiki/trails":
                     return self._send(200, json.dumps({"trails": wikicore.trails(COMPUTER_DIR)}), "application/json")
+                if u.path == "/api/computer/wiki/raw":        # Memory Core's Raw button: what waits in .raw (memory-core)
+                    return self._send(200, json.dumps(wiki_raw(), ensure_ascii=False), "application/json; charset=utf-8")
                 if u.path == "/api/computer/wiki/page":       # Memory Core's Open button: one page's markdown, read-only
                     p = (q.get("p") or [""])[0]
                     md_text, md_sha = wikicore.page_md(p)

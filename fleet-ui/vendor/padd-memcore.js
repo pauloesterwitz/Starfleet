@@ -18,6 +18,9 @@ window.compJSON = async url => {
   catch(e){ if(e.status === 403 && /Starfleet (Command|key)/i.test(e.message) && !/Cannot verify/i.test(e.message)){ refused = P.key.get(); P.paint(); } throw e; }
 };
 
+/* memcore.js's Raw button posts through this: keyed, never asking for the key itself */
+window.compPost = (url, body) => P.api.post(url, body, {prompt: false});
+
 function setView(v){
   if(v === vw) return;
   vw = wv.dataset.v = v;
@@ -219,34 +222,35 @@ html.kb .p-mcbar{display:none}
 #wikiview .mcs>span small,#wikiview .mcs>span u,#wikiview .mcs>em{font-size:11px}
 
 /* Open: the page's markdown over the whole screen, below the status bar */
-#wikiview #mcdoc{position:fixed;z-index:30;left:var(--sal);right:var(--sar);top:calc(var(--vvt) + var(--sat) + 4px);bottom:auto;width:auto;
+#wikiview :is(#mcdoc,#mcraw){position:fixed;z-index:30;left:var(--sal);right:var(--sar);top:calc(var(--vvt) + var(--sat) + 4px);bottom:auto;width:auto;
   height:calc(var(--vvh) - var(--sat) - 4px);background:var(--ink);box-shadow:none}
-#wikiview #mcdoc .hd{align-items:center;padding:10px 10px 0 12px}
-#wikiview #mcdoc .hd b{font-size:22px;line-height:1.1;letter-spacing:.06em;-webkit-user-select:text;user-select:text}
-#wikiview #mcdoc .hd button{flex:none;height:44px;padding:0 18px;border-radius:22px;background:var(--grid);color:var(--text);font-size:13px;letter-spacing:.1em}
-#wikiview #mcdoc .pth{padding:6px 12px 8px;font-size:12px;-webkit-user-select:text;user-select:text}
-#wikiview #mcdoc .cm{margin:0;max-width:none;padding:0 12px calc(var(--sab) + 20px);overscroll-behavior:contain;-webkit-overflow-scrolling:touch}
-#wikiview #mcdoc .body{padding:0;background:none;color:#f3e6d8;font:400 16px/1.5 var(--body);letter-spacing:0;overflow-wrap:anywhere;
+#wikiview :is(#mcdoc,#mcraw) .hd{align-items:center;padding:10px 10px 0 12px}
+#wikiview #mcraw .hd{flex-wrap:wrap;row-gap:8px} #wikiview #mcraw .hd b{flex:1 1 100%}   /* the title on its own line, the three buttons under it */
+#wikiview :is(#mcdoc,#mcraw) .hd b{font-size:22px;line-height:1.1;letter-spacing:.06em;-webkit-user-select:text;user-select:text}
+#wikiview :is(#mcdoc,#mcraw) .hd button{flex:none;height:44px;padding:0 18px;border-radius:22px;background:var(--grid);color:var(--text);font-size:13px;letter-spacing:.1em}
+#wikiview :is(#mcdoc,#mcraw) .pth{padding:6px 12px 8px;font-size:12px;-webkit-user-select:text;user-select:text}
+#wikiview :is(#mcdoc,#mcraw) .cm{margin:0;max-width:none;padding:0 12px calc(var(--sab) + 20px);overscroll-behavior:contain;-webkit-overflow-scrolling:touch}
+#wikiview :is(#mcdoc,#mcraw) .body{padding:0;background:none;color:#f3e6d8;font:400 16px/1.5 var(--body);letter-spacing:0;overflow-wrap:anywhere;
   -webkit-user-select:text;user-select:text;-webkit-touch-callout:default}
-#wikiview #mcdoc .body h1,#wikiview #mcdoc .body h2,#wikiview #mcdoc .body h3{margin:14px 0 4px;color:var(--orange);font:700 20px/1.2 var(--lcars);letter-spacing:.06em}
-#wikiview #mcdoc .body h1{font-size:24px} #wikiview #mcdoc .body h3{font-size:17px}
-#wikiview #mcdoc .body p{margin:4px 0 10px}
-#wikiview #mcdoc .body ul,#wikiview #mcdoc .body ol{padding-left:22px}
+#wikiview :is(#mcdoc,#mcraw) .body h1,#wikiview :is(#mcdoc,#mcraw) .body h2,#wikiview :is(#mcdoc,#mcraw) .body h3{margin:14px 0 4px;color:var(--orange);font:700 20px/1.2 var(--lcars);letter-spacing:.06em}
+#wikiview :is(#mcdoc,#mcraw) .body h1{font-size:24px} #wikiview :is(#mcdoc,#mcraw) .body h3{font-size:17px}
+#wikiview :is(#mcdoc,#mcraw) .body p{margin:4px 0 10px}
+#wikiview :is(#mcdoc,#mcraw) .body ul,#wikiview :is(#mcdoc,#mcraw) .body ol{padding-left:22px}
 /* a link in running text: 44 px to hit, the line keeps its height */
-#wikiview #mcdoc .body a{display:inline-block;min-width:44px;margin:-13px 0;padding:13px 0;color:var(--blue);text-align:center}
-#wikiview #mcdoc .body a.dead{color:var(--dim)}
-#wikiview #mcdoc .body img{display:block;max-width:100%;margin:6px 0;border-radius:6px}
-#wikiview #mcdoc .body pre{overflow:auto;padding:10px 12px;border-radius:8px;background:#0f1117;font-size:13px}
-#wikiview #mcdoc .body pre code.hljs{padding:0;background:none}
-#wikiview #mcdoc .body code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.92em}
-#wikiview #mcdoc .body :not(pre)>code{padding:1px 5px;border-radius:4px;background:#1d160d;color:var(--amber)}
-#wikiview #mcdoc .body table{display:block;overflow-x:auto;margin:6px 0;border-collapse:collapse}
-#wikiview #mcdoc .body th,#wikiview #mcdoc .body td{padding:4px 9px;border:1px solid #3a2c18;font-size:14px}
-#wikiview #mcdoc .body th{color:var(--amber)}
-#wikiview #mcdoc .fm{margin:0 0 4px;font:400 12px var(--lcars);letter-spacing:.08em}
-#wikiview #mcdoc .fm summary{line-height:44px}
-#wikiview #mcdoc .fm pre{margin:0 0 8px;white-space:pre-wrap;background:var(--card);color:var(--dim)}
-#wikiview #mcdoc .st{color:var(--peach);font:600 13px var(--lcars);letter-spacing:.08em;text-transform:uppercase}
-#wikiview #mcdoc .err{color:#f0a9a9}
+#wikiview :is(#mcdoc,#mcraw) .body a{display:inline-block;min-width:44px;margin:-13px 0;padding:13px 0;color:var(--blue);text-align:center}
+#wikiview :is(#mcdoc,#mcraw) .body a.dead{color:var(--dim)}
+#wikiview :is(#mcdoc,#mcraw) .body img{display:block;max-width:100%;margin:6px 0;border-radius:6px}
+#wikiview :is(#mcdoc,#mcraw) .body pre{overflow:auto;padding:10px 12px;border-radius:8px;background:#0f1117;font-size:13px}
+#wikiview :is(#mcdoc,#mcraw) .body pre code.hljs{padding:0;background:none}
+#wikiview :is(#mcdoc,#mcraw) .body code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.92em}
+#wikiview :is(#mcdoc,#mcraw) .body :not(pre)>code{padding:1px 5px;border-radius:4px;background:#1d160d;color:var(--amber)}
+#wikiview :is(#mcdoc,#mcraw) .body table{display:block;overflow-x:auto;margin:6px 0;border-collapse:collapse}
+#wikiview :is(#mcdoc,#mcraw) .body th,#wikiview :is(#mcdoc,#mcraw) .body td{padding:4px 9px;border:1px solid #3a2c18;font-size:14px}
+#wikiview :is(#mcdoc,#mcraw) .body th{color:var(--amber)}
+#wikiview :is(#mcdoc,#mcraw) .fm{margin:0 0 4px;font:400 12px var(--lcars);letter-spacing:.08em}
+#wikiview :is(#mcdoc,#mcraw) .fm summary{line-height:44px}
+#wikiview :is(#mcdoc,#mcraw) .fm pre{margin:0 0 8px;white-space:pre-wrap;background:var(--card);color:var(--dim)}
+#wikiview :is(#mcdoc,#mcraw) .st{color:var(--peach);font:600 13px var(--lcars);letter-spacing:.08em;text-transform:uppercase}
+#wikiview :is(#mcdoc,#mcraw) .err{color:#f0a9a9}
 `);
 })();

@@ -57,6 +57,8 @@ function build(){
           <span class="sep"></span>
           <button class="pill" id="mclinks" type="button" title="Draw every link of the wiki">Links</button>
           <button class="pill" id="mcheat" type="button" title="Colour pages by how often Computer consulted them, over all sessions">Heat</button>
+          <span class="sep"></span>
+          <button class="pill" id="mcrawb" type="button" title="Sources waiting in the Knowledge DB's .raw folder: see them and ingest the new ones">Raw</button>
           <span class="grow"></span><span id="mcnos" title="Ask Computer about your notes. Its search then shows here: sessions, search terms, an access log and a replay bar.">No Computer session yet</span><span id="mcnote"></span></div>
         <div id="mcbox"><canvas id="mccv"></canvas><canvas id="mcov"></canvas><div id="mccap"></div><div id="mctip"></div>
           <div id="mclegend"></div>
@@ -75,6 +77,7 @@ function build(){
   $("mclinks").title="Related links always show; plain links appear as you zoom in";
   $("mclinks").onclick=()=>{ showLinks=!showLinks; LS.set("mcLinks",showLinks); pills(); touch(); };
   $("mcnosel").onclick=()=>pickChat("");
+  $("mcrawb").onclick=()=>$("mcraw")?closeRaw():openRaw();
   $("mcheat").onclick=()=>{ showHeat=!showHeat; pills(); touch(); };
   pills();
   $("mczi").onclick=()=>zoomBy(1.5); $("mczo").onclick=()=>zoomBy(1/1.5);
@@ -696,6 +699,38 @@ async function saveDoc(){
   }catch(e){ if($("mces")){ st.textContent=e.message; st.className="err"; $("mcev").disabled=false; } }
 }
 addEventListener("keydown",e=>{ if(e.key==="Escape"&&docN&&view==="wiki"&&!/^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName)) closeDoc(); });
+
+/* Raw: the Knowledge DB's .raw folder through memory-core's wiki_ingest_raw (/api/computer/wiki/raw and /ingest). An ingest only
+   PROPOSES: each new file becomes a change that is applied on its review page; the local model handles one file at a time. */
+let rawRes="", rawBusy=false;
+const rawPost=(u,b)=>window.compPost?window.compPost(u,b):compJSON(u,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b)});
+function closeRaw(){ const d=$("mcraw"); if(d) d.remove(); $("mcrawb").classList.remove("on"); }
+async function openRaw(){
+  let d=$("mcraw");
+  if(!d){ d=document.createElement("div"); d.id="mcraw"; d.style.borderLeftColor="var(--orange)"; $("mcbox").appendChild(d); }
+  $("mcrawb").classList.add("on");
+  d.innerHTML=`<div class="hd"><b style="color:var(--orange)">Raw sources</b><button type="button" id="mcrwi" disabled>${rawBusy?"Ingesting...":"Ingest"}</button><button
+      type="button" id="mcrwr">Refresh</button><button type="button" id="mcrwx" title="Close (Esc)">Close</button></div>
+    <div class="pth">Knowledge DB · .raw · an ingest only proposes: apply each file on its review page</div>
+    <div class="cm"><div class="body">${rawRes?md(rawRes)+"<hr>":""}<span class="st loading">reading .raw...</span></div></div>`;
+  $("mcrwx").onclick=closeRaw; $("mcrwr").onclick=openRaw;
+  let j;
+  try{ j=await compJSON("/api/computer/wiki/raw"); }
+  catch(e){ if($("mcraw")) d.querySelector(".body").innerHTML=`<span class="err">${esc(e.message||String(e))}</span>`; return; }
+  if(!$("mcraw")) return;
+  const n=j.counts?j.counts.new:0, b=$("mcrwi");
+  b.disabled=rawBusy||!n||j.error; b.textContent=rawBusy?"Ingesting...":n?`Ingest ${Math.min(n,5)} new`:"Nothing new";
+  b.title=n?"Queue up to 5 new files; each becomes a proposal with a review link":""; b.onclick=ingestRaw;
+  d.querySelector(".body").innerHTML=(rawRes?md(rawRes)+"<hr>":"")+(j.error?`<span class="err">${esc(j.text)}</span>`:md(j.text));
+}
+async function ingestRaw(){
+  if(rawBusy) return;
+  rawBusy=true; const b=$("mcrwi"); if(b){ b.disabled=true; b.textContent="Ingesting..."; }
+  try{ const r=await rawPost("/api/computer/wiki/ingest",{limit:5}); rawRes=r.text||""; }
+  catch(e){ rawRes="**Ingest failed:** "+(e.message||String(e)); }
+  rawBusy=false; if($("mcraw")) openRaw();
+}
+addEventListener("keydown",e=>{ if(e.key==="Escape"&&$("mcraw")&&view==="wiki"&&!/^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName)) closeRaw(); });
 
 function funnel(t){
   const S=t.steps, u=a=>new Set(a.filter(Boolean)).size;

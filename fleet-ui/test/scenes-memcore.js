@@ -1,6 +1,6 @@
 /* Memory Core on the phone (vendor/padd-memcore.js hosting vendor/memcore.js): fixtures for the three wiki
    routes and the scenes. The wiki is generated from a seed: about 60 made-up pages, 150 links, two
-   Computer sessions. The screen only reads, so no scene may send a POST. */
+   Computer sessions. The screen only reads, except the Raw panel's Ingest, which its scenes declare. */
 "use strict";
 const { keyOk, denied, now } = require("./scenes-core.js").fixtures;
 
@@ -77,6 +77,22 @@ function pageMd(p){
     "It repeats itself on purpose. ".repeat(12) + "\n";
 }
 
+/* the Raw panel: memory-core's report on .raw (made-up file names), and what an ingest of up to 5 new files answers */
+function rawReport(n){
+  const files = ["articles/warp-trial-12.md", "articles/plasma-conduit-notes.pdf", "articles/deflector-memo.docx", "articles/sensor-sheet.md",
+    "articles/refit-checklist.md", "articles/hull-log.md", "articles/power-table.md"].slice(0, n);
+  return {error: false, counts: {new: n, changed: 1, review: 0, done: 31},
+    text: `Raw sources (.raw/): ${n + 32} supported files: new ${n}, changed 1, review 0, done 31. Orphan pages in the wiki: 2.\n` +
+      (n ? `Not done (${n + 1} of ${n + 1} shown):\n` + files.map(f => `- \`${f}\` | 12 KB | new: not ingested yet`).join("\n") + "\n" : "") +
+      "- `articles/survey-example.md` | 8 KB | changed: changed since its ingest"};
+}
+exports.post = (p, body, variant, h) => {
+  if(p !== "/api/computer/wiki/ingest") return;
+  if(!keyOk(h)) return denied;
+  return {error: false, counts: null, text: "Queued 5 ingest jobs, one after the other (the local LLM handles one at a time):\n" +
+    ["warp-trial-12.md", "plasma-conduit-notes.pdf", "deflector-memo.docx", "sensor-sheet.md", "refit-checklist.md"].map((f, i) =>
+      `- \`articles/${f}\`: cs-${i + 1} running. Review: [open](https://wiki.example/review/cs-${i + 1})`).join("\n")};
+};
 exports.get = (p, variant, q, h) => {
   if(!p.startsWith("/api/computer/wiki/")) return;
   if(!keyOk(h)) return denied;
@@ -84,6 +100,7 @@ exports.get = (p, variant, q, h) => {
     error: variant === "mc-error" ? "wiki graph from memory-core: export failed Showing the last saved map." : null,
     note: variant === "mc-note" ? "memory-core is stopped: Computer cannot use the wiki until it runs again." : null};
   if(p === "/api/computer/wiki/trails") return {trails: variant === "mc-empty" ? [] : trails()};
+  if(p === "/api/computer/wiki/raw") return rawReport(variant === "mc-raw-none" ? 0 : 7);
   if(p === "/api/computer/wiki/page"){ const md = pageMd(q.get("p")); return md == null ? {__status: 404, body: {error: "not a wiki page"}} : {p: q.get("p"), md}; }
 };
 
@@ -208,6 +225,18 @@ exports.scenes = [
   {name: "mc-session-clear-kept", hash: H, settle: S, run: async (page, t) => {
     await page.evaluate(() => { localStorage.setItem("mcNoChat", "true"); location.reload(); }); await t.wait(S + 1500);
     await expect(page, "no session after a reload once cleared", () => !document.querySelector("#mcchats .mci.on") && !document.getElementById("mctl").offsetHeight);
+    await check(page); }},
+  /* Raw: what waits in the Knowledge DB's .raw folder, and Ingest queues up to 5 new files as proposals */
+  {name: "mc-raw", hash: H, settle: S, posts: [["/api/computer/wiki/ingest", {limit: 5}]], run: async (page, t) => {
+    await t.tap("#mcrawb"); await t.wait(700);
+    await expect(page, "the raw report with an Ingest button", () => /new 7/.test(document.getElementById("mcraw").textContent) && /Ingest 5 new/.test(document.getElementById("mcrwi").textContent) && !document.getElementById("mcrwi").disabled);
+    await check(page); await t.tap("#mcrwi"); await t.wait(900);
+    await expect(page, "the queued jobs above the report", () => /Queued 5 ingest jobs/.test(document.getElementById("mcraw").textContent));
+    await t.shot("queued"); await t.tap("#mcrwx"); await t.wait(300);
+    await expect(page, "the panel closed", () => !document.getElementById("mcraw")); }},
+  {name: "mc-raw-none", hash: H, variant: "mc-raw-none", settle: S, run: async (page, t) => {
+    await t.tap("#mcrawb"); await t.wait(700);
+    await expect(page, "Nothing new, and no ingest possible", () => document.getElementById("mcrwi").disabled && /Nothing new/.test(document.getElementById("mcrwi").textContent));
     await check(page); }},
   {name: "mc-replay-playing", hash: H, settle: S, run: async (page, t) => { await t.tap("#mcplay"); await t.wait(4200); await check(page);
     await expect(page, "the replay to be running", () => document.getElementById("mcplay").textContent === "Pause" && document.querySelectorAll("#mcsegs i.fut").length > 0); }},

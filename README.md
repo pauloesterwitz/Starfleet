@@ -835,6 +835,10 @@ chat has used the wiki, the side panels and the replay bar stay hidden.
 - **Open.** The page card's **Open** button shows that page's markdown in a panel over
   the map, with the frontmatter folded into "Properties". Wiki links in the text select
   the linked page, and the open panel follows the selection. Esc closes it.
+- **Raw.** Shows what waits in the wiki's `.raw` folder (new, changed, in review, done)
+  and **Ingest 5 new** queues up to five new files with the wiki MCP server's own
+  `wiki_ingest_raw`. The local model handles one file at a time, and an ingest only
+  proposes: nothing is written until you apply each file on its review page.
 - **Term probe.** Type terms: each becomes a pill wired to the pages whose title, tags
   or summary contain it. Pages that several terms share are the bridges between them.
 - **Computer.** A chat that used the wiki is drawn as a summary: its search terms, the
@@ -860,6 +864,8 @@ Both calls need the Starfleet key, like the rest of Computer.
 | --- | --- | --- |
 | `GET /api/computer/wiki/graph` | | the wiki's pages and links |
 | `GET /api/computer/wiki/trails` | | every wiki call of the recent Computer chats, with what it returned and what the answer cited |
+| `GET /api/computer/wiki/raw` | | what waits in `.raw`: counts and the files not done yet (memory-core's `wiki_ingest_raw` report) |
+| `POST /api/computer/wiki/ingest` | `{limit}` | queue up to `limit` (default 5, at most 20) new `.raw` files as proposals |
 | `GET /api/computer/wiki/page?p=wiki/….md` | | one page's markdown, read from disk; only `.md` files inside the wiki folder (`FLEET_WIKI_ROOT`, default `~/llm-wiki`) |
 
 ### Full screen

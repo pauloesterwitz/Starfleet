@@ -107,31 +107,31 @@ body.wiki #wikiview{display:flex;flex-direction:column;height:calc(100vh - 12px)
 #mcr h3 button:hover,#mcr h3 button.on{background:var(--orange);color:#000}
 #mcpage .pth{font-size:11px;color:var(--dim);letter-spacing:.04em;margin:3px 0 6px;word-break:break-all}
 /* Open: one page's markdown over the right of the map */
-#mcdoc{position:absolute;top:8px;right:8px;bottom:8px;width:min(760px,calc(100% - 16px));z-index:6;display:flex;flex-direction:column;
+:is(#mcdoc,#mcraw){position:absolute;top:8px;right:8px;bottom:8px;width:min(760px,calc(100% - 16px));z-index:6;display:flex;flex-direction:column;
   background:#0b0803f5;border-left:8px solid var(--blue);box-shadow:0 0 0 2px #000,0 8px 30px #000a}
-#mcdoc .hd{display:flex;align-items:flex-start;gap:10px;padding:8px 12px 0}
-#mcdoc .hd b{flex:1;min-width:0;font-size:20px;font-weight:700;text-transform:uppercase;line-height:1.05;overflow-wrap:anywhere}
-#mcdoc .hd button{font:inherit;font-size:11px;font-weight:700;background:var(--grid);color:var(--text);border:0;border-radius:9px;
+:is(#mcdoc,#mcraw) .hd{display:flex;align-items:flex-start;gap:10px;padding:8px 12px 0}
+:is(#mcdoc,#mcraw) .hd b{flex:1;min-width:0;font-size:20px;font-weight:700;text-transform:uppercase;line-height:1.05;overflow-wrap:anywhere}
+:is(#mcdoc,#mcraw) .hd button{font:inherit;font-size:11px;font-weight:700;background:var(--grid);color:var(--text);border:0;border-radius:9px;
   padding:2px 9px;cursor:pointer;letter-spacing:.08em;text-transform:uppercase}
-#mcdoc .hd button:hover{background:var(--orange);color:#000}
-#mcdoc .hd button:disabled{opacity:.4;cursor:default} #mcdoc .hd button[hidden]{display:none}
-#mcdoc .ed{display:flex;flex-direction:column;gap:6px;height:100%}
-#mcdoc .ed label{display:flex;align-items:center;gap:4px;font-size:12px;color:var(--dim);letter-spacing:.06em;text-transform:uppercase;flex-wrap:wrap}
-#mcdoc .ed .dir{text-transform:none;letter-spacing:0}
-#mcdoc .ed input{flex:1;min-width:160px;font:14px/1.3 ui-monospace,Menlo,monospace;background:#000;color:var(--text);border:1px solid var(--grid);border-radius:6px;padding:4px 6px}
-#mcdoc .ed small{font-size:11px;color:var(--dim)} #mcdoc .ed code{font-size:11px}
-#mcdoc .ed textarea{flex:1;min-height:240px;resize:none;font:13px/1.45 ui-monospace,Menlo,monospace;background:#000;color:var(--text);
+:is(#mcdoc,#mcraw) .hd button:hover{background:var(--orange);color:#000}
+:is(#mcdoc,#mcraw) .hd button:disabled{opacity:.4;cursor:default} :is(#mcdoc,#mcraw) .hd button[hidden]{display:none}
+:is(#mcdoc,#mcraw) .ed{display:flex;flex-direction:column;gap:6px;height:100%}
+:is(#mcdoc,#mcraw) .ed label{display:flex;align-items:center;gap:4px;font-size:12px;color:var(--dim);letter-spacing:.06em;text-transform:uppercase;flex-wrap:wrap}
+:is(#mcdoc,#mcraw) .ed .dir{text-transform:none;letter-spacing:0}
+:is(#mcdoc,#mcraw) .ed input{flex:1;min-width:160px;font:14px/1.3 ui-monospace,Menlo,monospace;background:#000;color:var(--text);border:1px solid var(--grid);border-radius:6px;padding:4px 6px}
+:is(#mcdoc,#mcraw) .ed small{font-size:11px;color:var(--dim)} :is(#mcdoc,#mcraw) .ed code{font-size:11px}
+:is(#mcdoc,#mcraw) .ed textarea{flex:1;min-height:240px;resize:none;font:13px/1.45 ui-monospace,Menlo,monospace;background:#000;color:var(--text);
   border:1px solid var(--grid);border-radius:6px;padding:8px;tab-size:2}
-#mcdoc .ed input:focus,#mcdoc .ed textarea:focus{outline:none;border-color:var(--orange)}
-#mcdoc .eb{display:flex;align-items:center;gap:8px} #mcdoc .eb span{flex:1;font-size:12px;color:var(--dim)} #mcdoc .eb .err{color:var(--red,#f66)}
-#mcdoc .eb button{font:inherit;font-size:12px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;border:0;border-radius:9px;
-  padding:4px 14px;cursor:pointer;background:var(--grid);color:var(--text)} #mcdoc .eb button.go{background:var(--orange);color:#000}
-#mcdoc .eb button:disabled{opacity:.5;cursor:default}
-#mcdoc .pth{font-size:11px;color:var(--dim);letter-spacing:.04em;padding:3px 12px 8px;word-break:break-all}
-#mcdoc .cm{flex:1;min-height:0;overflow:auto;padding:0 12px 12px}
-#mcdoc .cm .body{border-left:0;padding:4px 4px 8px;letter-spacing:normal}
-#mcdoc .fm{margin:0 0 8px;font-size:12px;color:var(--dim)} #mcdoc .fm summary{cursor:pointer;text-transform:uppercase;letter-spacing:.08em}
-#mcdoc a[href^="#wiki:"]{color:var(--blue);cursor:pointer} #mcdoc a.dead{color:var(--dim);cursor:default;text-decoration:line-through}
+:is(#mcdoc,#mcraw) .ed input:focus,:is(#mcdoc,#mcraw) .ed textarea:focus{outline:none;border-color:var(--orange)}
+:is(#mcdoc,#mcraw) .eb{display:flex;align-items:center;gap:8px} :is(#mcdoc,#mcraw) .eb span{flex:1;font-size:12px;color:var(--dim)} :is(#mcdoc,#mcraw) .eb .err{color:var(--red,#f66)}
+:is(#mcdoc,#mcraw) .eb button{font:inherit;font-size:12px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;border:0;border-radius:9px;
+  padding:4px 14px;cursor:pointer;background:var(--grid);color:var(--text)} :is(#mcdoc,#mcraw) .eb button.go{background:var(--orange);color:#000}
+:is(#mcdoc,#mcraw) .eb button:disabled{opacity:.5;cursor:default}
+:is(#mcdoc,#mcraw) .pth{font-size:11px;color:var(--dim);letter-spacing:.04em;padding:3px 12px 8px;word-break:break-all}
+:is(#mcdoc,#mcraw) .cm{flex:1;min-height:0;overflow:auto;padding:0 12px 12px}
+:is(#mcdoc,#mcraw) .cm .body{border-left:0;padding:4px 4px 8px;letter-spacing:normal}
+:is(#mcdoc,#mcraw) .fm{margin:0 0 8px;font-size:12px;color:var(--dim)} :is(#mcdoc,#mcraw) .fm summary{cursor:pointer;text-transform:uppercase;letter-spacing:.08em}
+:is(#mcdoc,#mcraw) a[href^="#wiki:"]{color:var(--blue);cursor:pointer} :is(#mcdoc,#mcraw) a.dead{color:var(--dim);cursor:default;text-decoration:line-through}
 #mcpage p,#mcprobe p{margin:0 0 6px;color:var(--text);font-size:13px;line-height:1.35;letter-spacing:.03em}
 #mcprobe p.d{color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.06em;margin-top:4px}
 #mcpage .tg{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:6px}
@@ -149,3 +149,4 @@ body.wiki #wikiview{display:flex;flex-direction:column;height:calc(100vh - 12px)
 .nb.path a{border-left-color:#fff}
 @media (max-width:1100px){ body.wiki #wikiview{height:auto} #mc{grid-template-columns:1fr;flex:none} #mcbox{height:70vh;flex:none} #mcchats,#mcterms{max-height:none}
   #mclegend,#mchint.on{display:none} }
+#mcraw .pth{word-break:normal}   /* Raw: a sentence, not a path */
