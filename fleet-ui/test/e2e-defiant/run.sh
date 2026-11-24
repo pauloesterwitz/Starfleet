@@ -3,7 +3,7 @@
 # phone pages in WebKit. Starts what it needs on free random ports, prints one line per check, always tears
 # everything down and exits 0 only when every check passed. Nothing real is touched (see README.md).
 #
-#   ./run.sh              every story, about 6 minutes
+#   ./run.sh              every story, about 17 minutes
 #   ./run.sh install      only the stories whose name contains "install" (the names are in e2e.py)
 #   PW=<folder of the playwright package>   needed for the page stories (page-desktop, page-phone)
 #   OUT=<folder>          the pictures of the page stories (default: ./out)

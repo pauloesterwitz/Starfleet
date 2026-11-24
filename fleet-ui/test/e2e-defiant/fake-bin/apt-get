@@ -2,7 +2,8 @@
 # Stands in for apt-get on the made-up host. The simulation prints apt-sim.txt (the test swaps it between steps).
 # update takes scan-delay seconds and fails like a lock held by the nightly run while apt-lock exists. The real
 # upgrade, which runs inside the unit, follows job.conf: RC (how it ends), DELAY (seconds), PER (lines a second),
-# REBOOT (1 leaves a reboot pending), NOTE (a line printed every second); on success apt-sim-after.txt, if there is one, becomes the new apt-sim.txt.
+# REBOOT (1 leaves a reboot pending), LOCK (1: the nightly run takes the apt lock the moment the upgrade ends), NOTE (a line printed every
+# second); on success apt-sim-after.txt, if there is one, becomes the new apt-sim.txt.
 # --no-remove: when the simulation lists a removal (a Remv line), a real upgrade (and a simulation of one) refuses the way
 # apt does, exit 100, and changes nothing. Every upgrade that goes through leaves a line in applied.log (with its arguments), so a test can tell
 # an upgrade that changed the host from one that was refused.
@@ -23,7 +24,7 @@ case " $* " in
     fi
     cat "$H/apt-sim.txt" ;;
   *" full-upgrade "*)
-    RC=0 DELAY=3 PER=2 REBOOT=0 NOTE=; . "$H/job.conf" 2>/dev/null
+    RC=0 DELAY=3 PER=2 REBOOT=0 LOCK=0 NOTE=; . "$H/job.conf" 2>/dev/null
     printf 'Reading package lists...\nCalculating upgrade...\n'
     grep -m1 -E '^[0-9]+ upgraded, [0-9]+ newly installed' "$H/apt-sim.txt"
     if [[ " $* " == *" --no-remove "* ]] && grep -q '^Remv ' "$H/apt-sim.txt"; then
@@ -38,6 +39,7 @@ case " $* " in
     if [ "$RC" != 0 ]; then echo "E: Sub-process /usr/bin/dpkg returned an error code (1)"; exit "$RC"; fi
     echo "$(date +%s.%N) applied $*" >> "$H/applied.log"
     [ -e "$H/apt-sim-after.txt" ] && cp "$H/apt-sim-after.txt" "$H/apt-sim.txt"
+    [ "$LOCK" = 1 ] && touch "$H/apt-lock"
     if [ "$REBOOT" = 1 ]; then touch "$H/var/run/reboot-required"; printf 'linux-image-6.8.0-99-generic\nlibc6\n' > "$H/var/run/reboot-required.pkgs"; fi
     echo "Processing triggers for libc-bin (2.39-0ubuntu8.12) ..." ;;
   *) exit 1 ;;

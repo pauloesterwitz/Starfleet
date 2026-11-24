@@ -4,8 +4,8 @@ dedupe, the install job, the saved state, the worker and the endpoints.
 
 Plain asserts, standard library only:   python3 test/test_defiant_updates.py
 
-Nothing here touches a real host, a real chat, llama-swap or a model: ssh, the Telegram sender and the Starfleet
-key check are replaced, the made-up host is defiant.example, and the key is the string fixture-key. Any real
+Nothing here touches a real host, a real chat, llama-swap or a model: ssh, the Telegram sender, the Messages list and
+the Starfleet key check are replaced, the made-up host is defiant.example, and the key is the string fixture-key. Any real
 subprocess call that slips through fails the run. The shell scripts are only ever run locally against stub
 functions (bash) or parsed with `sh -n`; they never reach a package manager or systemd.
 
@@ -107,16 +107,22 @@ def fake_key_check(key):
     return {"ok": True}
 
 
+AUDIT = []         # what the made-up ev_audit recorded since fleet_state() began: (title, text, go, whether _UPD_LOCK was free inside the call)
+
+
 @contextmanager
 def fleet_state(host="defiant.example"):
-    """A clean state with Defiant configured, the saved file in a temp dir and the key check replaced (the install
-    uses computer_auth, which fails closed; key_check, which does not, must never be what protects it)."""
+    """A clean state with Defiant configured, the saved file in a temp dir, the key check replaced (the install
+    uses computer_auth, which fails closed; key_check, which does not, must never be what protects it) and the Messages
+    list replaced by a recorder (AUDIT): a test never writes the real list."""
     fleet._UPD_WAKE.clear()
+    AUDIT.clear()
     with tempfile.TemporaryDirectory(prefix="fleet-upd-") as d, \
             mock.patch.object(fleet, "DEFIANT_HOST", host), \
             mock.patch.object(fleet, "UPD_FILE", os.path.join(d, "sub", "defiant-updates.json")), \
             mock.patch.object(fleet, "_UPD", fleet._upd_fresh()), \
             mock.patch.object(fleet, "computer_auth", fake_key_check), \
+            mock.patch.object(fleet, "ev_audit", lambda title, text, go="": AUDIT.append((title, text, go, lock_is_free()))), \
             mock.patch.object(fleet, "key_check", side_effect=AssertionError("the install must not rely on the fail-open key_check")):
         yield d
 
@@ -341,9 +347,25 @@ def test_alert_detail_lines():
                           "linux-image-7 -> 7.0-20 (resolute-security)"]          # a new install has no old version
     assert "tailscale" not in t and "curl" not in t                             # only security packages are listed ...
     assert "Other updates: 6" in lines                                           # ... the rest is a count (9 - 3)
-    assert "Reboot required: linux-image-7, libc6" in lines and lines[-1] == "Install: Starfleet, Systems, Defiant, Install updates"
+    assert "Reboot required: linux-image-7, libc6" in lines and lines[-2:] == ["Install: Starfleet, Systems, Defiant, Install updates",
+                                                                               "Reboot: Starfleet, Systems, Defiant, Reboot Defiant"]
     assert not any(l.startswith("+") for l in lines)
     assert "Other updates" not in fleet.upd_alert_text(S([P("a", security=True)]))
+
+
+def test_alert_says_where_to_act():
+    """The way the alert ends depends on what the person can do: Install is off when nothing is left to install, and a pending reboot is
+    the Reboot Defiant button's, not Install updates'."""
+    install, reboot = "Install: Starfleet, Systems, Defiant, Install updates", "Reboot: Starfleet, Systems, Defiant, Reboot Defiant"
+    only_reboot = fleet.upd_alert_text(S(reboot=True, reboot_pkgs=["linux-image-7.0.0-14-generic"])).splitlines()
+    assert only_reboot[-1] == reboot and install not in only_reboot and "Reboot required: linux-image-7.0.0-14-generic" in only_reboot      # nothing to install: no dead end
+    assert only_reboot[0] == "Defiant: reboot required"
+    only_updates = fleet.upd_alert_text(S([P("a", security=True)])).splitlines()
+    assert only_updates[-1] == install and reboot not in only_updates                       # no reboot waiting: no mention of the button
+    both = fleet.upd_alert_text(S([P("a", security=True), P("b")], reboot=True, reboot_pkgs=["linux-image-7"])).splitlines()
+    assert both[-2:] == [install, reboot]
+    for text in (install, reboot):
+        assert len(text) < 110 and "\u2014" not in text
 
 
 def test_alert_text_limits():
@@ -667,7 +689,7 @@ def test_poll_flow_success_and_failure():
             fleet._UPD["job"] = running_job(1000.0)
             assert fleet._upd_poll(1200.0) is False                                       # done: no Telegram, a rescan is due at once
             j = fleet._UPD["job"]
-            assert j["state"] == "done" and j["installed"] == 2 and j["reboot_required"] is True and sent == []
+            assert j["state"] == "done" and j["installed"] == 2 and j["reboot_required"] is True and sent == []       # a job that no click of this Fleet started is never rebooted after
             assert fleet._UPD["want"] is True and fleet._UPD["next_at"] == 1200.0
             assert seen == [(fleet.UPD_POLL, 30, True)]                                   # polled over ssh, lock free meanwhile
             with open(fleet.UPD_FILE) as f:
@@ -1181,15 +1203,17 @@ def test_persistence_round_trip():
     with fleet_state() as d:
         scan = S([P("a", security=True), P("b")], at=1234.5, remove=["old"], deferred=["held"], reboot=True, reboot_pkgs=["linux-image-7"], error="x", error_at=1300.0)
         job = running_job(1000.0, contact=1100.0, log=["l1", "l2"])
-        fleet._UPD.update(scan=scan, alerted={"sig": "a=2", "at": 1200.0}, job=job, busy=True, want=True, started=5.0, next_at=9.0)
+        fleet._UPD.update(scan=scan, alerted={"sig": "a=2", "at": 1200.0}, job=job, busy=True, want=True, started=5.0, next_at=9.0, reboot_unsure=1500.5)
         with fleet._UPD_LOCK:
             fleet._upd_save_locked()
         assert os.listdir(os.path.dirname(fleet.UPD_FILE)) == ["defiant-updates.json"]                # tmp + rename: nothing left over
         with open(fleet.UPD_FILE) as f:
-            assert set(json.load(f)) == {"scan", "alerted", "job"}
+            saved = json.load(f)
+        assert set(saved) == {"scan", "alerted", "job", "reboot", "reboot_unsure"} and saved["reboot_unsure"] == 1500.5
         fleet._UPD.update(fleet._upd_fresh())
         before = time.time()
         fleet.defiant_updates_load()
+        assert fleet._UPD["reboot_unsure"] == 1500.5                                                      # the hold after a start that got no answer comes back
         assert fleet._UPD["scan"] == scan and fleet._UPD["alerted"] == {"sig": "a=2", "at": 1200.0}
         assert fleet._UPD["job"] == dict(job, contact_at=fleet._UPD["job"]["contact_at"]) and fleet._UPD["job"]["contact_at"] >= before
         assert (fleet._UPD["busy"], fleet._UPD["want"], fleet._UPD["started"], fleet._UPD["next_at"]) == (False, False, 0.0, 0.0)
@@ -1264,6 +1288,36 @@ def test_a_save_that_cannot_write_does_not_raise():
         assert "not saved" in log.getvalue()
 
 
+def test_a_save_that_fails_in_any_other_way_does_not_raise_either():
+    """A value that cannot be written (a type the writer rejects, a circular one, an overflow) is as harmless as a full disk: the
+    saved file stays as it was, one journal line says so, and nothing is raised into the request or the worker."""
+    for exc in (TypeError("not serializable"), ValueError("Circular reference detected"), OverflowError("int too large"), RecursionError("deep")):
+        with fleet_state():
+            with fleet._UPD_LOCK:
+                fleet._upd_save_locked()                                             # a good file first
+            with open(fleet.UPD_FILE) as f:
+                before = f.read()
+            fleet._UPD["scan"] = S([P("a")])
+            with mock.patch.object(fleet.json, "dump", side_effect=exc), redirect_stdout(io.StringIO()) as log:
+                with fleet._UPD_LOCK:
+                    fleet._upd_save_locked()
+            assert "not saved" in log.getvalue() and exc.__class__.__name__ in log.getvalue(), log.getvalue()
+            with open(fleet.UPD_FILE) as f:
+                assert f.read() == before                                            # the old file is untouched
+
+
+def test_a_saved_file_nested_too_deep_is_ignored():
+    """The parser gives up on such a file with a RecursionError, which is no ValueError: it must not stop Fleet at start."""
+    for text in ("[" * 60000, '{"scan": ' + "[" * 60000, '{"a":' * 60000):
+        with fleet_state():
+            os.makedirs(os.path.dirname(fleet.UPD_FILE))
+            with open(fleet.UPD_FILE, "w") as f:
+                f.write(text)
+            fleet.defiant_updates_load()
+            assert fleet._UPD["scan"] is None and fleet._UPD["job"] == fleet._upd_job_idle() and fleet._UPD["reboot"] == fleet._upd_reboot_idle()
+            assert fleet._UPD["reboot_unsure"] == 0.0 and fleet._UPD["alerted"] == {}
+
+
 # ---------------------------------------------------------------- views
 
 SCAN_KEYS = {"at", "next_at", "busy", "error", "error_at", "count", "security", "packages", "remove", "deferred", "reboot_required", "reboot_pkgs"}
@@ -1275,8 +1329,9 @@ def test_view_shape():
         assert fleet.defiant_updates_view() == {"configured": False}
     with fleet_state():
         v = fleet.defiant_updates_view()
-        assert set(v) == {"configured", "now", "scan", "critical", "job"} and v["configured"] is True and v["scan"] is None and v["critical"] is False
+        assert set(v) == {"configured", "now", "scan", "critical", "job", "reboot"} and v["configured"] is True and v["scan"] is None and v["critical"] is False
         assert abs(v["now"] - time.time()) < 5
+        assert v["reboot"] == {"state": "idle", "started_at": None, "ended_at": None, "down_at": None, "back_after": None, "error": None, "auto": False}
         assert v["job"] == {"state": "idle", "started_at": None, "ended_at": None, "exit": None, "log": [], "lost": False,
                             "installed": None, "reboot_required": None}
         fleet._UPD["scan"], fleet._UPD["next_at"] = S([P("a", security=True), P("b")], reboot=True, reboot_pkgs=["k"]), 4600.0
@@ -1289,7 +1344,8 @@ def test_view_shape():
         for scan, critical in ((S([P("a", security=True)]), True), (S(reboot=True), True), (S([P("a")]), False)):
             fleet._UPD["scan"] = scan
             assert fleet.defiant_updates_view()["critical"] is critical
-        assert fleet.defiant_updates_summary() == {"count": 1, "security": 0, "deferred": 0, "remove": 0, "scan_at": 1000.0, "job_state": "running"}
+        assert fleet.defiant_updates_summary() == {"count": 1, "security": 0, "deferred": 0, "remove": 0, "scan_at": 1000.0, "job_state": "running",
+                                                   "reboot_state": "idle"}
 
 
 def test_defiant_state_hook():
@@ -1302,7 +1358,7 @@ def test_defiant_state_hook():
         assert d["upd"] is None and d["problems"] == [] and d["status"] == "ok" and d["updates"] == 5 and d["reboot_required"] is False
         fleet._UPD["scan"] = S([P("a", security=True), P("b")], at=77.0, remove=["x"], deferred=["h1", "h2"])
         d = fleet.defiant_state(force=True)
-        assert d["upd"] == {"count": 2, "security": 1, "deferred": 2, "remove": 1, "scan_at": 77.0, "job_state": "idle"}
+        assert d["upd"] == {"count": 2, "security": 1, "deferred": 2, "remove": 1, "scan_at": 77.0, "job_state": "idle", "reboot_state": "idle"}
         assert d["problems"] == ["1 security update pending"] and d["status"] == "warn" and d["updates"] == 5 and d["reboot_required"] is False
         fleet._UPD["scan"] = S([P("a", security=True), P("b", security=True), P("c")])
         assert fleet.defiant_state(force=True)["problems"] == ["2 security updates pending"]
@@ -1363,9 +1419,10 @@ def test_security_updates_rule_gets_its_summary_through_the_real_flow():
 
 # ---------------------------------------------------------------- endpoints
 
-def call(port, method, path, body=None, key=None):
+def call(port, method, path, body=None, key=None, raw_body=None):
+    """raw_body: the request body as bytes, sent as it is (json that is no object, or that is not json at all)."""
     c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
-    c.request(method, path, body=None if body is None else json.dumps(body), headers={"X-Starfleet-Key": key} if key else {})
+    c.request(method, path, body=raw_body if raw_body is not None else None if body is None else json.dumps(body), headers={"X-Starfleet-Key": key} if key else {})
     r = c.getresponse()
     raw = r.read()
     c.close()
@@ -1394,7 +1451,8 @@ def test_http_endpoints():
         with mock.patch.object(fleet, "_def_ssh", ssh), server() as port, redirect_stdout(io.StringIO()):
             st, h, v = call(port, "GET", "/api/defiant/updates")
             assert st == 200 and h["cache-control"] == "no-store" and h["content-type"] == "application/json"
-            assert set(v) == {"configured", "now", "scan", "critical", "job"} and v["scan"] is None and v["job"]["state"] == "idle"
+            assert set(v) == {"configured", "now", "scan", "critical", "job", "reboot"} and v["scan"] is None and v["job"]["state"] == "idle"
+            assert v["reboot"]["state"] == "idle" and "boot" not in v["reboot"]
             fleet._UPD["scan"] = S([P("a", security=True)])
             st, h, v = call(port, "GET", "/api/defiant/updates")
             assert st == 200 and v["scan"]["count"] == 1 and v["critical"] is True and set(v["scan"]) == SCAN_KEYS
@@ -1566,10 +1624,21 @@ def _forbidden(*a, **kw):
     raise AssertionError("a test reached a real subprocess: %r" % (a[:1],))
 
 
-def main():
-    # safety nets: no real subprocess, and never the real saved-state file, whatever a test forgets to patch
-    tmp = tempfile.mkdtemp(prefix="fleet-upd-run-")
+def point_unpatched_files_away(tmp):
+    """Safety net: whatever a test forgets to patch is written under tmp, never to the real saved state or the real Messages list."""
     fleet.UPD_FILE = os.path.join(tmp, "unpatched", "defiant-updates.json")
+    fleet.EV_DIR = os.path.join(tmp, "unpatched-events")
+    fleet.EV_FILE, fleet.EV_STATE = os.path.join(fleet.EV_DIR, "events.jsonl"), os.path.join(fleet.EV_DIR, "events-state.json")
+
+
+def unpatched_files_written():
+    return os.path.exists(os.path.dirname(fleet.UPD_FILE)) or os.path.exists(fleet.EV_DIR)
+
+
+def main():
+    # safety nets: no real subprocess, and never the real saved-state file or Messages list, whatever a test forgets to patch
+    tmp = tempfile.mkdtemp(prefix="fleet-upd-run-")
+    point_unpatched_files_away(tmp)
     tests = [(n, f) for n, f in list(globals().items()) if n.startswith("test_") and callable(f)]
     failed = []
     with mock.patch.object(subprocess, "run", _forbidden), mock.patch.object(subprocess, "Popen", _forbidden):
@@ -1581,8 +1650,8 @@ def main():
                 failed.append(name)
                 print("FAIL  " + name)
                 traceback.print_exc()
-    if os.path.exists(os.path.dirname(fleet.UPD_FILE)):
-        failed.append("(a test wrote the unpatched state file)")
+    if unpatched_files_written():
+        failed.append("(a test wrote the unpatched state file or Messages list)")
     shutil.rmtree(tmp, ignore_errors=True)
     print("\n%d tests, %d failed%s" % (len(tests), len(failed), ": " + ", ".join(failed) if failed else ""))
     return 1 if failed else 0

@@ -1,8 +1,9 @@
 /* Fixtures and scenes for the Systems screens (vendor/padd-systems.js): Sessions, Main Engineering,
    Deep Space NAS, Memory Alpha, Defiant. All names and numbers are made up. This file answers only
    /api/containers, /api/nas, /api/nas/stats, the session tail and the POSTs; sessions, Memory Alpha,
-   Defiant and its package updates come from scenes-core.js, and a scene that needs another answer from
-   one of those swaps it in with over(). */
+   Defiant and its package updates and reboot come from scenes-core.js (variant "upd-<state>[-<twist>]";
+   the twists "rb..." change how POST /api/defiant/reboot answers), and a scene that needs another answer
+   from one of those swaps it in with over(). */
 "use strict";
 const F = require("./scenes-core.js").fixtures, { keyOk, denied, now } = F;
 const KB = 1048576, SSH = "ssh: connect to host demo-host port 22: Connection timed out";
@@ -96,13 +97,25 @@ exports.post = (p, body, variant, h) => {
   if(p === "/api/memoryalpha/backup") return !keyOk(h) ? denied : variant === "refuse" ? {__status: 409, body: {error: "A snapshot is already running."}} : {ok: true};
   if(p === "/api/defiant/updates/scan"){                        /* takes no key, so none may be sent; "recent" is the 60 s limit */
     if(h["x-starfleet-key"]) return {__status: 400, body: {error: "fixture: the Starfleet key was sent to a route that takes none"}};
-    return /-recent$/.test(variant) ? {ok: true, started: false, reason: "recent"} : /-busy$/.test(variant) ? {ok: true, started: false, reason: "busy"} : {ok: true, started: true};
+    return /-recent$/.test(variant) ? {ok: true, started: false, reason: "recent"} : /-busy$/.test(variant) ? {ok: true, started: false, reason: "busy"}
+      : /-scanreb$/.test(variant) ? {ok: true, started: false, reason: "rebooting"} : {ok: true, started: true};
   }
   if(p === "/api/defiant/updates/install"){
     if(!keyOk(h)) return denied;
     if(/-conflict$/.test(variant)) return {__status: 409, body: {error: "an install is already running"}};
     if(/-sshfail$/.test(variant)) return {__status: 502, body: {error: SSH}};
     F.begun.set(variant, now());                                 /* from here on Fleet answers "running" */
+    return {ok: true, started_at: now()};
+  }
+  if(p === "/api/defiant/reboot"){                              /* a variant "upd-<state>-rb<twist>" picks the refusal; none: Fleet accepts */
+    if(/-rbgate$/.test(variant)) return {__status: 403, body: {error: "Cannot verify the Starfleet key right now (gate not answering); try again in a moment."}};
+    if(!keyOk(h)) return denied;
+    const no = {rbrun: "A reboot is already running.", rbinstall: "An install is running. Wait until it is done.", rbscan: "A scan is running. Try again in a moment.",
+      rbgap: "A reboot was requested a moment ago. Try again in a few minutes.", rbapt: "apt is busy on Defiant, an upgrade may be running. Try again in a few minutes."}[(/-(rb[a-z]+)$/.exec(variant) || [])[1]];
+    if(no) return {__status: 409, body: {error: no}};
+    if(/-rbnak$/.test(variant)) return {__status: 502, body: {error: "Defiant did not accept the reboot request."}};
+    if(/-rbtime$/.test(variant)) return {__status: 502, body: {error: "No answer from Defiant. It may still reboot."}};
+    F.rbegun.set(variant, now());                                /* from here on Fleet answers "rebooting" */
     return {ok: true, started_at: now()};
   }
 };
@@ -145,11 +158,50 @@ const YES = '[data-k="yes"]', NO = '[data-k="no"]', STOP = '[data-act="sys.cstop
 const enterKey = async t => { await t.type("#p-keyin", "fixture-key"); await t.tap("#p-keygo"); await t.wait(600); };
 const ENG = "#/systems/engineering", NAS = "#/systems/nas", SES = "#/systems/sessions", ALPHA = "#/systems/alpha", DEF = "#/systems/defiant";
 const stopPost = ["/api/containers/stop", {node: "jean-luc", name: "mcp-scrape-1"}], nasPost = (target, action) => ["/api/nas/control", {target, action}];
-const INSTALL = '[data-act="sys.install"]', SCAN = '[data-act="sys.scan"]', instPost = ["/api/defiant/updates/install", {}], scanPost = ["/api/defiant/updates/scan", {}];
+const INSTALL = '[data-act="sys.install"]', SCAN = '[data-act="sys.scan"]', instPost = ["/api/defiant/updates/install", {reboot_ok: true}], scanPost = ["/api/defiant/updates/scan", {}];      /* a confirmed install sends the flag that lets Fleet reboot afterwards */
 /* the Updates block sits under the Server block: scroll one of its sections up to the sticky header */
 const toSec = title => page => page.evaluate(t => { const h = [...document.querySelectorAll("#p-view .p-sec h2")].find(x => x.textContent === t);
   scrollTo(0, h.getBoundingClientRect().top + scrollY - document.getElementById("p-hd").offsetHeight - 6); }, title);
-const toUpd = toSec("Updates"), toPkgs = toSec("Packages");
+const toUpd = toSec("Updates"), toPkgs = toSec("Packages"), toSrv = toSec("Server");
+/* the Reboot button, in the Server panel (the card with the Reboot figure), and what stands around it. want: label, disabled, bg, line (regexp, "" for none), kind
+   ("" amber, "ok" blue, "err" red), hint (the sentence under the button shown or not), seconds (the figure in "(NN s)": from, to) */
+const ORANGE = "rgb(255, 153, 0)", AMBER = "rgb(255, 204, 102)", BLUE = "rgb(153, 204, 255)", RB_HINT = "Reboots the whole server. All sites are unreachable for about a minute. Needs the Starfleet key.";
+const rbExpect = async (page, want) => {
+  const s = await page.evaluate(() => { const b = document.querySelector('[data-act="sys.reboot"]'); if(!b) return null; const card = b.closest(".p-card"), m = card.querySelector(".p-msg");
+    return {label: b.textContent, disabled: b.disabled, bg: getComputedStyle(b).backgroundColor, line: m ? m.textContent : "", kind: m ? (m.classList.contains("err") ? "err" : m.classList.contains("p-sy-ok") ? "ok" : "") : null,
+      lineColor: m ? getComputedStyle(m).color : null, text: card.textContent, inUpdates: !!b.closest(".p-sy-up"), inPanel: !!card.querySelector(".p-kv") }; });
+  if(!s) throw new Error("no Reboot button on the screen");
+  const bad = [];
+  if(want.label !== undefined && s.label !== want.label) bad.push(`label ${JSON.stringify(s.label)}, expected ${JSON.stringify(want.label)}`);
+  if(want.disabled !== undefined && s.disabled !== want.disabled) bad.push(`disabled ${s.disabled}, expected ${want.disabled}`);
+  if(want.bg !== undefined && s.bg !== want.bg) bad.push(`colour ${s.bg}, expected ${want.bg}`);
+  if(want.line !== undefined && (want.line === "" ? s.line !== "" : !want.line.test(s.line))) bad.push(`line ${JSON.stringify(s.line)}, expected ${want.line === "" ? "none" : want.line}`);
+  if(want.kind !== undefined && s.kind !== want.kind) bad.push(`line kind ${JSON.stringify(s.kind)}, expected ${JSON.stringify(want.kind)}`);
+  if(want.kind === "ok" && s.lineColor !== BLUE) bad.push(`the line is ${s.lineColor}, not the ok colour`);
+  if(want.hint !== undefined && s.text.includes(RB_HINT) !== want.hint) bad.push(`the hint is ${want.hint ? "missing" : "shown"}`);
+  if(want.panel !== false && (!s.inPanel || s.inUpdates)) bad.push("the button is not in the Server panel");
+  if(bad.length) throw new Error("Reboot button: " + bad.join("; "));
+};
+const REBOOT = '[data-act="sys.reboot"]', rebootPost = ["/api/defiant/reboot", {}];
+const esc = s => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const freshRb = async (page, t) => { F.rbegun.clear(); await page.evaluate(() => PADD.refresh(["updates", "defiant"])); await t.wait(400); };      /* no reboot accepted yet, whatever an earlier scene did */
+const HOSTILE_RB = '<img src=x onerror="window.__pwned=1"> <b id="evil">boom</b>';
+/* the line directly under the "Install finished" card: its text, its kind ("" amber, "ok" blue, "err" red) and whether the card says a reboot is waiting */
+const autoLine = (page, re, kind, hint) => page.evaluate(([src, kind, hint]) => {
+  const card = [...document.querySelectorAll("#p-view .p-sy-up .p-card")].find(c => c.querySelector("h3").textContent === "Install finished"), m = card && card.nextElementSibling;
+  if(!card) throw new Error("no Install finished card");
+  if(!m || !m.classList.contains("p-msg")) throw new Error("no reboot line directly under the finished install");
+  if(!new RegExp(src).test(m.textContent)) throw new Error("the line under the install says " + JSON.stringify(m.textContent));
+  const k = m.classList.contains("err") ? "err" : m.classList.contains("p-sy-ok") ? "ok" : "";
+  if(k !== kind) throw new Error(`the line under the install is "${k}", expected "${kind}"`);
+  if(/A reboot is waiting\. Use Reboot Defiant when it suits you\./.test(card.textContent) !== hint) throw new Error(`the hint to reboot by hand is ${hint ? "missing" : "shown"}`);
+}, [re.source, kind, hint]);
+const gone = page => page.evaluate(() => !document.querySelector('[data-k="yes"]') && !document.querySelector(".p-sheet.on"));
+const noAutoLine = (page, what) => must(page, () => { const card = [...document.querySelectorAll("#p-view .p-sy-up .p-card")].find(c => c.querySelector("h3").textContent === "Install finished");
+  return card && !(card.nextElementSibling && card.nextElementSibling.classList.contains("p-msg")); }, "nothing under the finished install for " + what);
+/* Install updates and Scan now: off or on, and the note under them */
+const upBtns = page => page.evaluate(() => ({installOff: document.querySelector('[data-act="sys.install"]').disabled, scanOff: document.querySelector('[data-act="sys.scan"]').disabled,
+  note: document.querySelector(".p-sy-up .p-note").textContent}));
 const toast = async (page, re, what) => { await page.waitForTimeout(200); const t = await page.evaluate(() => document.querySelector("#p-toast").textContent); if(!re.test(t)) throw new Error(`expected the toast to ${what}, it says ${JSON.stringify(t)}`); };
 const upHits = async (page, ms) => { F.hits.upd = 0; await page.waitForTimeout(ms); return F.hits.upd; };
 const fresh = async (page, t) => { F.begun.clear(); await page.evaluate(() => PADD.refresh(["updates", "defiant"])); await t.wait(400); };      /* no install accepted yet, whatever an earlier scene did */
@@ -296,8 +348,9 @@ exports.scenes = [
         && /third party \(UbuntuESMApps\)/.test(rows[1].textContent) && /third party \(Docker\)/.test(txt) && /new 7\.0\.0-1031\.31/.test(txt)
         && /The install removes 2 packages: libnsl-compat1, python3-legacy-shim/.test(txt) && /4 held back by Ubuntu's staged rollout/.test(txt) && /Reboot needed for linux-image-7\.0\.0-1025-generic/.test(txt)
         && /Last scan \d\d:\d\d \(5 min ago\) · next \d\d:\d\d/.test(txt) && !document.querySelector('[data-act="sys.install"]').disabled && !document.querySelector('[data-act="sys.scan"]').disabled
-        && document.querySelector('[data-act="sys.install"]').textContent === "Install updates" && /Fleet scans every hour and sends security updates and a pending reboot once to Telegram\./.test(txt);
-    }, "12 package rows with the four security ones first, +12 more, removals, held back, reboot, scan times, both buttons on, the note on where the alerts go");
+        && document.querySelector('[data-act="sys.install"]').textContent === "Install updates" && /Fleet scans every hour and sends security updates and a pending reboot once to Telegram\./.test(txt)
+        && /Install needs the Starfleet key\. If a reboot is needed afterwards, Fleet reboots Defiant\./.test(txt) && !/never reboots/i.test(txt);
+    }, "12 package rows with the four security ones first, +12 more, removals, held back, reboot, scan times, both buttons on, the note on where the alerts go and on the reboot");
     await toPkgs(page); await t.shot("list"); }},
   {name: "sys-defiant-upd-pending-old", hash: DEF, variant: "upd-pending", shell: "old", run: async (page, t) => { await toUpd(page); await t.shot("top"); await toPkgs(page); }},
   {name: "sys-defiant-upd-pending-small", hash: DEF, variant: "upd-pending", shell: "small", run: async (page, t) => { await toUpd(page); await t.shot("top"); await toPkgs(page); }},
@@ -313,14 +366,16 @@ exports.scenes = [
     await must(page, () => /Lost contact with Defiant, retrying\. The install keeps running there/.test(document.querySelector("#p-view").textContent) && document.querySelector("#p-view .p-sy-log"), "the lost contact line over the log"); }},
   {name: "sys-defiant-upd-done", hash: DEF, variant: "upd-done", run: async (page, t) => { await toUpd(page);
     await must(page, () => { const txt = document.querySelector("#p-view").textContent;
-      return /Install finished/.test(txt) && /24\s*installed/.test(txt) && /reboot required afterwards: yes/.test(txt) && /Reboot Defiant when it suits you/.test(txt) && /0\s*to install/.test(txt) && !document.querySelector("#p-view .p-sy-log"); }, "the result line: 24 installed, reboot required"); }},
+      return /Install finished/.test(txt) && /24\s*installed/.test(txt) && /reboot required afterwards: yes/.test(txt) && /A reboot is waiting\. Use Reboot Defiant when it suits you\./.test(txt) && !/never reboots/i.test(txt) && /0\s*to install/.test(txt) && !document.querySelector("#p-view .p-sy-log"); }, "the result line: 24 installed, reboot required, the hint to use Reboot Defiant");
+    await rbExpect(page, {label: "Reboot Defiant", disabled: false, bg: AMBER, line: "", hint: true}); }},
   {name: "sys-defiant-upd-done-rebooted", hash: DEF, variant: "upd-done", run: async (page, t) => {       /* Defiant was rebooted since: the latest scan wants none, the old result says what it was */
     const b = F.updates("upd-done"); b.scan = Object.assign({}, b.scan, {reboot_required: false, reboot_pkgs: []}); b.critical = false;
     await over("/api/defiant/updates", "updates", () => Object.assign({}, b, {now: now() + .5}))(page); await toUpd(page);
     await must(page, () => { const txt = document.querySelector("#p-view").textContent;
       const chip = [...document.querySelectorAll(".p-sy-up .p-kv > div")].find(d => d.querySelector("span").textContent === "Reboot");
-      return /Install finished/.test(txt) && /24\s*installed/.test(txt) && /reboot required afterwards: yes/.test(txt) && !/Reboot Defiant when it suits you/.test(txt) && chip && chip.querySelector("b").textContent === "No"; },
-      "the old result as it was, no hint to reboot once the latest scan says none is pending"); }},
+      return /Install finished/.test(txt) && /24\s*installed/.test(txt) && /reboot required afterwards: yes/.test(txt) && !/A reboot is waiting/.test(txt) && chip && chip.querySelector("b").textContent === "No"; },
+      "the old result as it was, no hint to reboot once the latest scan says none is pending");
+    await rbExpect(page, {label: "Reboot Defiant", disabled: false, bg: ORANGE, line: "", hint: true}); }},
   {name: "sys-defiant-upd-server-count", hash: DEF, variant: "upd-pending", run: async (page, t) => {       /* the probe counts 28 (it holds back what phasing holds back); the scan, the Systems row and the desktop say 24 */
     const n = await serverUpdates(page); if(n !== "24") throw new Error(`the Server panel says ${n} updates, the scan says 24`);
     await must(page, () => /Reboot required\. 24 updates are pending\./.test(document.querySelector("#p-view").textContent), "the reboot message to carry the scan's count"); }},
@@ -354,7 +409,7 @@ exports.scenes = [
   {name: "sys-defiant-upd-unreachable", hash: DEF, variant: "upd-down", run: async (page, t) => { await toUpd(page);       /* only the updates source fails: the rest of the screen is still there */
     await must(page, () => /upstream down/.test(document.querySelector("#p-view").textContent) && /Server/.test(document.querySelector("#p-view").textContent) && !document.querySelector('[data-act="sys.install"]'), "the error in place of the block"); }},
   {name: "sys-defiant-upd-notset", hash: DEF, variant: "upd-pending", run: async (page, t) => { await over("/api/defiant/updates", "updates", () => ({configured: false}))(page);       /* Fleet says it has no Defiant: no block, no buttons, no polling */
-    await must(page, () => !document.querySelector('[data-act="sys.install"]') && ![...document.querySelectorAll("#p-view .p-sec h2")].some(h => h.textContent === "Updates"), "no Updates block");
+    await must(page, () => !document.querySelector('[data-act="sys.install"]') && !document.querySelector('[data-act="sys.reboot"]') && ![...document.querySelectorAll("#p-view .p-sec h2")].some(h => h.textContent === "Updates"), "no Updates block and no Reboot button");
     const n = await upHits(page, 3600); if(n !== 0) throw new Error(`expected no read after "configured: false", saw ${n}`); }},
   {name: "sys-defiant-upd-lost-sync", hash: DEF, variant: "upd-pending", run: async (page, t) => { await down("/api/defiant/updates", "updates")(page); await toUpd(page);
     await must(page, () => /Showing the last answer, from \d\d:\d\d:\d\d/.test(document.querySelector("#p-view").textContent) && /24\s*to install/.test(document.querySelector("#p-view").textContent), "Sync lost over the last answer"); }},
@@ -377,6 +432,9 @@ exports.scenes = [
     await toast(page, /A scan ran a moment ago\./, "say a scan just ran");
     await must(page, () => !document.querySelector('[data-act="sys.scan"]').disabled && document.querySelector('[data-act="sys.scan"]').textContent === "Scan now", "Scan now back on"); }},
   {name: "sys-defiant-scan-busy", hash: DEF, variant: "upd-pending-busy", posts: [scanPost], run: async (page, t) => { await toUpd(page); await t.tap(SCAN); await toast(page, /A scan is already running\./, "say a scan is running"); }},
+  {name: "sys-defiant-scan-rebooting", hash: DEF, variant: "upd-pending-scanreb", posts: [scanPost], run: async (page, t) => { await toUpd(page); await t.tap(SCAN);       /* another device started a reboot a moment ago: Fleet refuses the scan and says why */
+    await toast(page, /^A reboot is running\.$/, "say a reboot is running");
+    await must(page, () => !document.querySelector('[data-act="sys.scan"]').disabled && document.querySelector('[data-act="sys.scan"]').textContent === "Scan now" && !/Scanning\.\.\./.test(document.querySelector("#p-view").textContent), "Scan now back on, nothing pretends to scan"); }},
   {name: "sys-defiant-scan-nokey", hash: DEF, variant: "upd-pending", key: false, posts: [scanPost], run: async (page, t) => { await toUpd(page); await t.tap(SCAN);       /* a scan needs no key: no key sheet */
     await toast(page, /Scan started\./, "say the scan started"); await must(page, () => !document.querySelector("#p-keyin") && !document.querySelector(".p-sheet.on"), "no key sheet"); }},
   {name: "sys-defiant-scan-off", hash: DEF, variant: "upd-running", run: async (page, t) => { await toUpd(page);       /* an install is running: Scan now is off and sends nothing */
@@ -386,15 +444,28 @@ exports.scenes = [
   {name: "sys-defiant-install", hash: DEF, variant: "upd-pending-install", posts: [instPost], run: async (page, t) => { await fresh(page, t); await toUpd(page); await t.tap(INSTALL); await t.shot("asked");
     await must(page, () => { const x = document.querySelector(".p-sheet .p-text").textContent;
       return document.querySelector(".p-sheet h3").textContent === "Install updates?" && /^24 packages will be upgraded, 4 of them security updates\./.test(x) && /It removes 2 packages: libnsl-compat1, python3-legacy-shim\./.test(x)
-        && /It restarts services \(containerd, docker, tailscale\): the sites can be unreachable for a few seconds\./.test(x) && /It needs a reboot afterwards \(libc6, linux-image\), and this button never reboots\./.test(x); },
-      "the count, the removals and both warnings in the confirm text");
+        && /It restarts services \(containerd, docker, tailscale\): the sites can be unreachable for a few seconds\./.test(x) && /It needs a reboot afterwards \(libc6, linux-image\)\./.test(x)
+        && x.endsWith(" A reboot is already waiting, so Defiant reboots by itself right after this install, and the sites are unreachable for about a minute.") && !/If a reboot is needed afterwards/.test(x) && !/never reboots/i.test(x); },
+      "the count, the removals, both warnings and, as the scan already says a reboot is waiting, the definite sentence that Defiant reboots by itself right after the install, in the confirm text");
     await t.tap(YES); await toast(page, /Install started\./, "say the install started");
     await must(page, () => /Installing updates/.test(document.querySelector("#p-view").textContent) && document.querySelector('[data-act="sys.install"]').disabled && document.querySelector("#p-view .p-sy-log"),
       "Fleet's own refresh to show the running install"); await t.shot("running"); }},
   {name: "sys-defiant-install-small", hash: DEF, variant: "upd-pending-small", shell: "small", run: async (page, t) => { await toUpd(page); await t.tap(INSTALL); await t.shot("asked");
     await must(page, () => { const r = document.querySelector('.p-sheet [data-k="yes"]').getBoundingClientRect(); return r.top > 0 && r.bottom <= innerHeight; }, "the confirm button on screen without scrolling the sheet"); await t.tap(NO); }},
-  {name: "sys-defiant-install-quiet", hash: DEF, variant: "upd-few", run: async (page, t) => { await toUpd(page); await t.tap(INSTALL);       /* no service, no reboot, no removal: only the count */
-    await must(page, () => document.querySelector(".p-sheet .p-text").textContent === "5 packages will be upgraded, 2 of them security updates.", "a confirm text with the count alone"); await t.shot("asked"); await t.tap(NO); }},
+  {name: "sys-defiant-install-quiet", hash: DEF, variant: "upd-few", run: async (page, t) => { await toUpd(page); await t.tap(INSTALL);       /* no service, no reboot, no removal, and no reboot waiting: only the count, and the conditional sentence on the automatic reboot */
+    await must(page, () => document.querySelector(".p-sheet .p-text").textContent === "5 packages will be upgraded, 2 of them security updates. If a reboot is needed afterwards, Defiant reboots by itself and the sites are unreachable for about a minute.",
+      "a confirm text with the count alone and the conditional sentence that Defiant reboots by itself when a reboot is needed"); await t.shot("asked"); await t.tap(NO); }},
+  {name: "sys-defiant-install-reboot-waiting", hash: DEF, variant: "upd-few", run: async (page, t) => {       /* the latest scan already says a reboot is waiting: the sentence on the automatic reboot is definite, and the sheet follows the latest scan */
+    await toUpd(page); await t.tap(INSTALL);
+    await must(page, () => document.querySelector(".p-sheet .p-text").textContent === "5 packages will be upgraded, 2 of them security updates. If a reboot is needed afterwards, Defiant reboots by itself and the sites are unreachable for about a minute.",
+      "the conditional sentence while no reboot is waiting"); await t.tap(NO);
+    await over("/api/defiant/updates", "updates", () => { const u = F.updates("upd-few"); Object.assign(u.scan, {reboot_required: true, reboot_pkgs: ["linux-image-7.0.0-1025-generic"]}); u.critical = true; return u; })(page);       /* a scan finds one waiting */
+    await t.tap(INSTALL); await t.shot("asked");
+    await must(page, () => document.querySelector(".p-sheet .p-text").textContent === "5 packages will be upgraded, 2 of them security updates. A reboot is already waiting, so Defiant reboots by itself right after this install, and the sites are unreachable for about a minute.",
+      "the count alone and the definite sentence that Defiant reboots by itself right after the install, when the scan says a reboot is waiting"); await t.tap(NO);
+    await over("/api/defiant/updates", "updates", () => F.updates("upd-few"))(page);       /* a rescan after a reboot finds none: the conditional sentence again */
+    await t.tap(INSTALL);
+    await must(page, () => /^5 packages will be upgraded, 2 of them security updates\. If a reboot is needed afterwards, Defiant reboots by itself/.test(document.querySelector(".p-sheet .p-text").textContent), "the conditional sentence again once no reboot is waiting"); await t.tap(NO); }},
   {name: "sys-defiant-install-cancel", hash: DEF, variant: "upd-pending", run: async (page, t) => { await toUpd(page); await t.tap(INSTALL); await t.tap(NO); await t.wait(300);
     await must(page, () => !document.querySelector('[data-k="yes"]') && !document.querySelector('[data-act="sys.install"]').disabled, "the sheet closed and Install still on"); }},
   {name: "sys-defiant-install-double-tap", hash: DEF, variant: "upd-pending", run: async (page, t) => { await toUpd(page); await t.tap(INSTALL);
@@ -417,7 +488,195 @@ exports.scenes = [
     await page.locator(INSTALL).tap({force: true}).catch(() => {}); await t.wait(300);
     await must(page, () => !document.querySelector('[data-k="yes"]') && /No scan yet: scan first\./.test(document.querySelector("#p-view").textContent), "no sheet before the first scan"); }},
 
-  /* Defiant: how often the screen asks (3 s while a scan or an install is on its way or none has run, else every 30 s) and who asks at all */
+  /* Defiant: Reboot Defiant (Starfleet key, confirm sheet). The button sits in the Server panel next to the Reboot figure; Fleet's "reboot" is idle, running, done or failed */
+  {name: "sys-defiant-reboot-idle", hash: DEF, variant: "upd-pending", run: async (page, t) => { await toSrv(page); await t.shot("top");
+    await rbExpect(page, {label: "Reboot Defiant", disabled: false, bg: AMBER, line: "", hint: true});       /* a reboot is waiting: the amber of the Reboot figure, not red */
+    await must(page, () => { const b = document.querySelector('[data-act="sys.reboot"]'), card = b.closest(".p-card"), kv = [...card.querySelectorAll(".p-kv > div")].map(d => d.querySelector("span").textContent);
+      return card.querySelector("h3").textContent === "defiant" && kv.includes("Reboot") && kv.includes("Updates") && b.closest(".p-sy-pans") && !/never reboots/i.test(document.querySelector("#p-view").textContent); },
+      "the button in the card of the host, under its Reboot figure"); }},
+  {name: "sys-defiant-reboot-idle-plain", hash: DEF, variant: "upd-clean", run: async (page, t) => { await toSrv(page); await t.shot("top");
+    await rbExpect(page, {label: "Reboot Defiant", disabled: false, bg: ORANGE, line: "", hint: true}); }},       /* nothing is waiting: the ordinary button */
+  {name: "sys-defiant-reboot-idle-old", hash: DEF, variant: "upd-pending", shell: "old", run: async (page, t) => { await toSrv(page); await t.shot("top"); await rbExpect(page, {label: "Reboot Defiant", disabled: false}); }},
+  {name: "sys-defiant-reboot-idle-small", hash: DEF, variant: "upd-pending", shell: "small", run: async (page, t) => { await toSrv(page); await t.shot("top"); await rbExpect(page, {label: "Reboot Defiant", disabled: false}); }},
+  {name: "sys-defiant-reboot-flow", hash: DEF, variant: "upd-pending-rbstart", posts: [rebootPost], run: async (page, t) => { await freshRb(page, t); await toSrv(page); await t.tap(REBOOT); await t.shot("asked");
+    await must(page, () => { const x = document.querySelector(".p-sheet .p-text").textContent;
+      return document.querySelector(".p-sheet h3").textContent === "Reboot Defiant?" && document.querySelector('.p-sheet [data-k="yes"]').textContent === "Reboot"
+        && x === "This reboots the whole Defiant server. 2 sites and all containers are unreachable for about a minute, and Fleet cannot reach Defiant until it is back. A reboot is waiting for: linux-image-7.0.0-1025-generic."; },
+      "the confirm text: the site count, what stays down, the package a reboot is waiting for");
+    await t.tap(YES); await toast(page, /Reboot started\./, "say the reboot started");
+    await rbExpect(page, {label: "Rebooting", disabled: true, line: /^Rebooting\. Waiting for Defiant to go down\.$/, kind: "", hint: false});
+    let b = await upBtns(page); if(!b.installOff || !b.scanOff || !/A reboot is running, progress above\./.test(b.note)) throw new Error("Install updates and Scan now must be off while the reboot runs: " + JSON.stringify(b));
+    await t.shot("running");
+    await over("/api/defiant/updates", "updates", () => F.updates("upd-rebootdown"))(page);       /* Fleet saw Defiant go down */
+    await rbExpect(page, {label: "Rebooting", disabled: true, line: /^Rebooting\. Defiant has been down since \d\d:\d\d:\d\d \(\d+ s\)\.$/, kind: "", hint: false}); await t.shot("down");
+    await over("/api/defiant/updates", "updates", () => F.updates("upd-rebooted"))(page);          /* and come back, the rescan found nothing */
+    await rbExpect(page, {label: "Reboot Defiant", disabled: false, bg: ORANGE, line: /^Defiant rebooted and answered again after 115 s\.$/, kind: "ok", hint: true});
+    b = await upBtns(page); if(b.scanOff) throw new Error("Scan now must be back on after the reboot"); await t.shot("done"); }},
+  {name: "sys-defiant-reboot-small", hash: DEF, variant: "upd-pending-rbsmall", shell: "small", posts: [rebootPost], run: async (page, t) => { await freshRb(page, t); await toSrv(page); await t.tap(REBOOT); await t.shot("asked");
+    await must(page, () => { const r = document.querySelector('.p-sheet [data-k="yes"]').getBoundingClientRect(); return r.top > 0 && r.bottom <= innerHeight; }, "the confirm button on screen without scrolling the sheet");
+    await t.tap(YES); await toast(page, /Reboot started\./, "say the reboot started"); await toSrv(page); await t.shot("running"); }},
+  {name: "sys-defiant-reboot-sending", hash: DEF, variant: "upd-pending-rbsend", posts: [rebootPost], run: async (page, t) => { await freshRb(page, t); await toSrv(page);
+    await page.route(u => u.pathname === "/api/defiant/reboot", async r => { await new Promise(res => setTimeout(res, 2000)); await r.fallback(); });       /* Fleet asks Defiant over ssh before it answers */
+    await t.tap(REBOOT); await t.tap(YES);
+    await rbExpect(page, {label: "Starting", disabled: true, line: ""}); await t.shot("sending");       /* the request is out: the button says so */
+    await page.locator(REBOOT).tap({force: true}).catch(() => {}); await t.wait(300);
+    if(!await gone(page)) throw new Error("a second sheet opened while the request is out");
+    await toUpd(page); const b = await upBtns(page); if(!b.installOff || !/A reboot is running, progress above\./.test(b.note)) throw new Error("Install updates must be off while the reboot request is out: " + JSON.stringify(b));       /* Fleet answers 409 to an install then */
+    await toSrv(page);
+    await t.wait(2300); await rbExpect(page, {label: "Rebooting", disabled: true, line: /^Rebooting\. Waiting for Defiant to go down\.$/}); }},
+  {name: "sys-defiant-reboot-cancel", hash: DEF, variant: "upd-pending", run: async (page, t) => { await toSrv(page); await t.tap(REBOOT); await t.tap(NO); await t.wait(300);
+    if(!await gone(page)) throw new Error("the sheet is still open"); await rbExpect(page, {label: "Reboot Defiant", disabled: false}); }},
+  {name: "sys-defiant-reboot-double-tap", hash: DEF, variant: "upd-pending", run: async (page, t) => { await toSrv(page); await t.tap(REBOOT);
+    await page.evaluate(() => document.querySelector('[data-k="yes"]').click()); await page.waitForTimeout(150);
+    await must(page, () => !!document.querySelector('[data-k="yes"]'), "the confirm sheet to ignore a tap in its first moments"); await t.tap(NO); }},
+  {name: "sys-defiant-reboot-quiet", hash: DEF, variant: "upd-clean", run: async (page, t) => { await toSrv(page); await t.tap(REBOOT);       /* nothing waits for a reboot: the first two sentences alone */
+    await must(page, () => document.querySelector(".p-sheet .p-text").textContent === "This reboots the whole Defiant server. 2 sites and all containers are unreachable for about a minute, and Fleet cannot reach Defiant until it is back.",
+      "the confirm text without the packages a reboot waits for"); await t.shot("asked"); await t.tap(NO); }},
+  {name: "sys-defiant-reboot-many", hash: DEF, variant: "upd-pending", run: async (page, t) => {       /* seven packages wait: four names, then "and 3 more" */
+    await over("/api/defiant/updates", "updates", () => { const u = F.updates("upd-pending"); u.scan.reboot_pkgs = ["linux-image-a", "linux-modules-a", "libc6", "systemd", "dbus", "udev", "openssl"]; return u; })(page);
+    await toSrv(page); await t.tap(REBOOT);
+    await must(page, () => document.querySelector(".p-sheet .p-text").textContent.endsWith(" A reboot is waiting for: linux-image-a, linux-modules-a, libc6, systemd and 3 more."), "four names and the rest counted"); await t.shot("asked"); await t.tap(NO); }},
+  {name: "sys-defiant-reboot-sites-unknown", hash: DEF, variant: "upd-pending", run: async (page, t) => {       /* the site list is empty: no count */
+    await over("/api/defiant", "defiant", () => Object.assign(F.defiant("upd-pending"), {sites: []}))(page); await toSrv(page); await t.tap(REBOOT);
+    await must(page, () => document.querySelector(".p-sheet .p-text").textContent.startsWith("This reboots the whole Defiant server. The sites and all containers are unreachable for about a minute,"), "no site count when the list is not known"); await t.tap(NO); }},
+  {name: "sys-defiant-reboot-one-site", hash: DEF, variant: "upd-pending", run: async (page, t) => {
+    await over("/api/defiant", "defiant", () => { const d = F.defiant("upd-pending"); d.sites = d.sites.slice(0, 1); return d; })(page); await toSrv(page); await t.tap(REBOOT);
+    await must(page, () => document.querySelector(".p-sheet .p-text").textContent.startsWith("This reboots the whole Defiant server. 1 site and all containers are unreachable"), "1 site, singular"); await t.tap(NO); }},
+  {name: "sys-defiant-reboot-nokey", hash: DEF, variant: "upd-pending-rbkey", key: false, posts: [rebootPost, rebootPost], run: async (page, t) => { await freshRb(page, t); await toSrv(page);
+    await t.tap(REBOOT); await t.tap(YES); await t.shot("key"); await enterKey(t);       /* the first request is refused for the key; the key sheet asks, the second one goes through */
+    await rbExpect(page, {label: "Rebooting", disabled: true, line: /^Rebooting\. Waiting for Defiant to go down\.$/}); }},
+  {name: "sys-defiant-reboot-wrongkey", hash: DEF, variant: "upd-pending-rbkey", posts: [rebootPost, rebootPost], run: async (page, t) => { await freshRb(page, t); await toSrv(page);
+    await page.evaluate(() => localStorage.setItem("starfleetKey", "stale-key"));       /* a key is stored, but Fleet does not take it: the key sheet says so, and the second request goes through */
+    await t.tap(REBOOT); await t.tap(YES); await t.shot("key");
+    await must(page, () => { const k = document.querySelector("#p-keyin"), s = k && k.closest(".p-sheet"); return !!s && /Fleet did not accept the stored key\./.test(s.textContent); }, "the key sheet to say that the stored key was not accepted");
+    await enterKey(t);
+    await rbExpect(page, {label: "Rebooting", disabled: true, line: /^Rebooting\. Waiting for Defiant to go down\.$/}); }},
+  {name: "sys-defiant-reboot-gate", hash: DEF, variant: "upd-pending-rbgate", posts: [rebootPost], run: async (page, t) => { await toSrv(page); await t.tap(REBOOT); await t.tap(YES);       /* the gate does not answer: Fleet's own words, the key is not blamed */
+    await toast(page, /^Reboot failed: Cannot verify the Starfleet key right now \(gate not answering\); try again in a moment\.$/, "carry Fleet's own words");
+    await must(page, () => document.querySelector("#p-toast .p-toast").classList.contains("err") && !document.querySelector("#p-keyin"), "a red toast and no key sheet");
+    await rbExpect(page, {label: "Reboot Defiant", disabled: false}); }},
+  ...[["run", "rbrun", "A reboot is already running."], ["install", "rbinstall", "An install is running. Wait until it is done."], ["scan", "rbscan", "A scan is running. Try again in a moment."],
+    ["gap", "rbgap", "A reboot was requested a moment ago. Try again in a few minutes."], ["apt", "rbapt", "apt is busy on Defiant, an upgrade may be running. Try again in a few minutes."]].map(([name, twist, sentence]) =>
+    ({name: "sys-defiant-reboot-409-" + name, hash: DEF, variant: "upd-pending-" + twist, posts: [rebootPost], run: async (page, t) => { await toSrv(page); await t.tap(REBOOT); await t.tap(YES);       /* Fleet's reason, in the neutral toast: not a failure */
+      await toast(page, new RegExp("^" + esc(sentence) + "$"), `say exactly ${JSON.stringify(sentence)}`);
+      await must(page, () => !document.querySelector("#p-toast .p-toast").classList.contains("err"), "a plain toast, not the red one");
+      await rbExpect(page, {label: "Reboot Defiant", disabled: false}); await t.shot("refused"); }})),
+  {name: "sys-defiant-reboot-during-install", hash: DEF, variant: "upd-running", run: async (page, t) => { await toSrv(page); await t.shot("top");       /* Fleet would answer 409: the button is off and says why */
+    await rbExpect(page, {label: "Reboot Defiant", disabled: true, hint: false});
+    await must(page, () => document.querySelector('[data-act="sys.reboot"]').closest(".p-card").textContent.includes("An install is running, progress below."), "the reason under the button");
+    await page.locator(REBOOT).tap({force: true}).catch(() => {}); await t.wait(300); if(!await gone(page)) throw new Error("a sheet opened for a reboot during an install"); }},
+  {name: "sys-defiant-reboot-during-install-request", hash: DEF, variant: "upd-pending-install", posts: [instPost], run: async (page, t) => { await fresh(page, t);
+    let go; const held = new Promise(res => { go = res; });
+    await page.route(u => u.pathname === "/api/defiant/updates/install", async r => { await held; await r.fallback(); });       /* Fleet asks Defiant over ssh before it answers: the request stays out until the scene lets it go */
+    const hint = () => page.evaluate(() => [...document.querySelector('[data-act="sys.reboot"]').closest(".p-card").querySelectorAll("p")].map(p => p.textContent).join("|"));
+    const same = async (want, when) => { const b = await upBtns(page), h = await hint();       /* the note under Install updates and the hint under Reboot Defiant: the same words */
+      if(!b.installOff || b.note !== want || h !== want) throw new Error(`${when}: expected both the Install note and the Reboot hint to say ${JSON.stringify(want)}, saw ${JSON.stringify({installOff: b.installOff, note: b.note, hint: h})}`); };
+    await toUpd(page); await t.tap(INSTALL); await t.tap(YES);       /* the install request is out and Fleet shows no job yet */
+    await same("Starting the install...", "while the install request is out");
+    await toSrv(page); await rbExpect(page, {label: "Reboot Defiant", disabled: true, hint: false}); await t.shot("request-out");
+    await page.locator(REBOOT).tap({force: true}).catch(() => {}); await t.wait(300); if(!await gone(page)) throw new Error("a sheet opened for a reboot while the install request is out");       /* Fleet would answer 409 */
+    go(); await t.wait(800);       /* Fleet accepted it and shows the job */
+    await same("An install is running, progress below.", "once the install runs");
+    await rbExpect(page, {label: "Reboot Defiant", disabled: true, hint: false}); }},
+  {name: "sys-defiant-reboot-during-scan", hash: DEF, variant: "upd-scanning", run: async (page, t) => { await toSrv(page);
+    await rbExpect(page, {label: "Reboot Defiant", disabled: true, hint: false});
+    await must(page, () => document.querySelector('[data-act="sys.reboot"]').closest(".p-card").textContent.includes("A scan is running, try again in a minute."), "the reason under the button");
+    await page.locator(REBOOT).tap({force: true}).catch(() => {}); await t.wait(300); if(!await gone(page)) throw new Error("a sheet opened for a reboot during a scan");
+    await over("/api/defiant/updates", "updates", () => F.updates("upd-pending"))(page); await toSrv(page);       /* the scan ended */
+    await rbExpect(page, {label: "Reboot Defiant", disabled: false, hint: true}); }},
+  {name: "sys-defiant-reboot-refused", hash: DEF, variant: "upd-pending-rbnak", posts: [rebootPost], run: async (page, t) => { await toSrv(page); await t.tap(REBOOT); await t.tap(YES);
+    await toast(page, /^Reboot failed: Defiant did not accept the reboot request\.$/, "say that Defiant did not accept the request");
+    await must(page, () => document.querySelector("#p-toast .p-toast").classList.contains("err"), "a red toast"); await rbExpect(page, {label: "Reboot Defiant", disabled: false}); }},
+  {name: "sys-defiant-reboot-timeout", hash: DEF, variant: "upd-pending-rbtime", posts: [rebootPost], run: async (page, t) => { await toSrv(page); await t.tap(REBOOT); await t.tap(YES);
+    await toast(page, /^Reboot failed: No answer from Defiant\. It may still reboot\.$/, "say that Defiant may still reboot"); }},
+  {name: "sys-defiant-reboot-running", hash: DEF, variant: "upd-rebooting", run: async (page, t) => { await toSrv(page); await t.shot("top");
+    await rbExpect(page, {label: "Rebooting", disabled: true, line: /^Rebooting\. Waiting for Defiant to go down\.$/, kind: "", hint: false});
+    const b = await upBtns(page); if(!b.installOff || !b.scanOff || !/A reboot is running, progress above\./.test(b.note)) throw new Error("Install updates and Scan now must be off: " + JSON.stringify(b));
+    await page.locator(REBOOT).tap({force: true}).catch(() => {}); await t.wait(300); if(!await gone(page)) throw new Error("a sheet opened for a reboot that is running");
+    await toUpd(page); await t.shot("updates"); }},
+  {name: "sys-defiant-reboot-running-small", hash: DEF, variant: "upd-rebootdown", shell: "small", run: async (page, t) => { await toSrv(page); await t.shot("top"); await toUpd(page); await t.shot("updates"); }},
+  {name: "sys-defiant-reboot-down", hash: DEF, variant: "upd-rebootdown", run: async (page, t) => { await toSrv(page); await t.shot("top");
+    await rbExpect(page, {label: "Rebooting", disabled: true, line: /^Rebooting\. Defiant has been down since \d\d:\d\d:\d\d \((6\d|7\d) s\)\.$/, kind: "", hint: false}); }},
+  {name: "sys-defiant-reboot-live", hash: DEF, variant: "upd-rebootdown", run: async (page, t) => {       /* the answer does not change: the seconds come from the page's clock, every poll */
+    const same = F.updates("upd-rebootdown"); await over("/api/defiant/updates", "updates", () => same)(page); await toSrv(page);
+    const secs = () => page.evaluate(() => +/\((\d+) s\)/.exec(document.querySelector(".p-card .p-msg").textContent)[1]);
+    const a = await secs(); await t.wait(7200); const b = await secs();
+    if(b - a < 3 || b - a > 9) throw new Error(`the seconds went from ${a} to ${b} in 7 s`); }},
+  {name: "sys-defiant-reboot-done", hash: DEF, variant: "upd-rebooted", run: async (page, t) => { await toSrv(page); await t.shot("top");
+    await rbExpect(page, {label: "Reboot Defiant", disabled: false, bg: ORANGE, line: /^Defiant rebooted and answered again after 115 s\.$/, kind: "ok", hint: true});
+    const b = await upBtns(page); if(b.scanOff) throw new Error("Scan now must be on after a reboot"); }},
+  {name: "sys-defiant-reboot-done-late", hash: DEF, variant: "upd-rebootlate", run: async (page, t) => { await toSrv(page);       /* the result is shown for 10 minutes; this one is older */
+    await rbExpect(page, {label: "Reboot Defiant", disabled: false, line: "", hint: true}); }},
+  {name: "sys-defiant-reboot-failed", hash: DEF, variant: "upd-rebootfail", run: async (page, t) => { await toSrv(page); await t.shot("top");
+    await rbExpect(page, {label: "Reboot Defiant", disabled: false, bg: AMBER, line: /^Defiant did not answer again within 15 minutes\. Check it in your hosting provider's console\.$/, kind: "err", hint: true});       /* red, and the button can be used again */
+    await must(page, () => getComputedStyle(document.querySelector('[data-act="sys.reboot"]').closest(".p-card").querySelector(".p-msg")).borderLeftColor === "rgb(204, 102, 102)", "a red line"); }},
+  {name: "sys-defiant-reboot-failed-same", hash: DEF, variant: "upd-rebootsame", run: async (page, t) => { await toSrv(page); await t.shot("top");
+    await rbExpect(page, {label: "Reboot Defiant", disabled: false, line: /^Defiant is still on the same boot three minutes after the request\. It may still reboot\. If it does not, check it in your hosting provider's console\.$/, kind: "err", hint: true}); }},
+  {name: "sys-defiant-reboot-failed-same-small", hash: DEF, variant: "upd-rebootsame", shell: "small", run: async (page, t) => { await toSrv(page); await t.shot("top");      /* the longest failure line, on the narrowest phone: all of it wraps inside the card */
+    await rbExpect(page, {label: "Reboot Defiant", disabled: false, line: /^Defiant is still on the same boot three minutes after the request\. It may still reboot\. If it does not, check it in your hosting provider's console\.$/, kind: "err", hint: true});
+    await must(page, () => { const m = document.querySelector('[data-act="sys.reboot"]').closest(".p-card").querySelector(".p-msg"), c = m.closest(".p-card").getBoundingClientRect(), r = m.getBoundingClientRect(); return m.scrollWidth <= m.clientWidth + 1 && r.left >= c.left && r.right <= c.right + 1; }, "the whole line inside its card"); }},
+  {name: "sys-defiant-reboot-failed-small", hash: DEF, variant: "upd-rebootfail", shell: "small", run: async (page, t) => { await toSrv(page); await t.shot("top"); }},
+  {name: "sys-defiant-reboot-no-scan", hash: DEF, variant: "upd-never", run: async (page, t) => { await toSrv(page); await t.shot("top");       /* no scan yet: Install is off, a reboot does not depend on a scan */
+    await rbExpect(page, {label: "Reboot Defiant", disabled: false, bg: ORANGE, line: "", hint: true}); await t.tap(REBOOT);
+    await must(page, () => document.querySelector(".p-sheet .p-text").textContent === "This reboots the whole Defiant server. 2 sites and all containers are unreachable for about a minute, and Fleet cannot reach Defiant until it is back.", "the confirm text without a package list"); await t.tap(NO); }},
+  {name: "sys-defiant-reboot-none", hash: DEF, variant: "upd-noreboot", run: async (page, t) => {       /* an older Fleet sends no "reboot": no button, and nothing else changes */
+    await must(page, () => { const btns = [...document.querySelectorAll("#p-view button")].map(b => b.textContent);
+      return !document.querySelector('[data-act="sys.reboot"]') && !btns.some(x => /Reboot/.test(x)) && !document.querySelector("#p-view .p-msg.p-sy-ok") && [...document.querySelectorAll("#p-view .p-sec h2")].some(h => h.textContent === "Server")
+        && !document.querySelector('[data-act="sys.install"]').disabled && !document.querySelector('[data-act="sys.scan"]').disabled; }, "no Reboot button, Install updates and Scan now as before");
+    await toSrv(page); await t.shot("top"); }},
+  {name: "sys-defiant-reboot-probe-down", hash: DEF, variant: "upd-rebootdown", run: async (page, t) => { await defDown(page); await toSrv(page); await t.shot("top");       /* the probe fails while Defiant is down: the reboot stays in view, over the Updates block */
+    await rbExpect(page, {label: "Rebooting", disabled: true, line: /^Rebooting\. Defiant has been down since \d\d:\d\d:\d\d \(\d+ s\)\.$/, kind: "", hint: false, panel: false});
+    await must(page, () => { const h = [...document.querySelectorAll("#p-view .p-sec h2")].map(x => x.textContent); return h.indexOf("Server") >= 0 && h.indexOf("Server") < h.indexOf("Updates") && /ssh: connect to host/.test(document.querySelector("#p-view").textContent); },
+      "the probe's error, the Server section with the reboot and the Updates block after it"); }},
+  {name: "sys-defiant-reboot-probe-down-idle", hash: DEF, variant: "upd-pending", run: async (page, t) => { await defDown(page); await toSrv(page);       /* no reboot running: the button stays (the install and the scan do too) */
+    await rbExpect(page, {label: "Reboot Defiant", disabled: false, line: "", hint: true, panel: false}); }},
+
+  /* Defiant: an install that needs a reboot starts one by itself (reboot.auto): its lines show under the install result, and in the Server panel */
+  {name: "sys-defiant-auto-running", hash: DEF, variant: "upd-autorun", run: async (page, t) => { await toSrv(page); await t.shot("top"); await toUpd(page); await t.shot("updates");
+    await autoLine(page, /^Rebooting\. Waiting for Defiant to go down\.$/, "", false);
+    await rbExpect(page, {label: "Rebooting", disabled: true, line: /^Rebooting\. Waiting for Defiant to go down\.$/, kind: "", hint: false}); }},
+  {name: "sys-defiant-auto-down", hash: DEF, variant: "upd-autodown", run: async (page, t) => { await toUpd(page); await t.shot("updates");
+    await autoLine(page, /^Rebooting\. Defiant has been down since \d\d:\d\d:\d\d \(\d+ s\)\.$/, "", false); }},
+  {name: "sys-defiant-auto-done", hash: DEF, variant: "upd-autodone", run: async (page, t) => { await toUpd(page); await t.shot("updates");
+    await autoLine(page, /^Defiant rebooted and answered again after 115 s\.$/, "ok", false);
+    await rbExpect(page, {label: "Reboot Defiant", disabled: false, line: /^Defiant rebooted and answered again after 115 s\.$/, kind: "ok", hint: true}); }},
+  {name: "sys-defiant-auto-failed", hash: DEF, variant: "upd-autofail", run: async (page, t) => { await toUpd(page); await t.shot("updates");
+    await autoLine(page, /^The reboot after the install did not start: apt is busy on Defiant, an upgrade may be running\. Try again in a few minutes\. Reboot Defiant when apt is idle\.$/, "err", true);       /* red, and the waiting reboot can be done by hand */
+    await rbExpect(page, {label: "Reboot Defiant", disabled: false, bg: AMBER, kind: "err", line: /^The reboot after the install did not start/}); }},
+  {name: "sys-defiant-auto-small", hash: DEF, variant: "upd-autofail", shell: "small", run: async (page, t) => { await toUpd(page); await t.shot("updates"); }},
+  {name: "sys-defiant-auto-by-hand", hash: DEF, variant: "upd-automan", run: async (page, t) => { await toUpd(page);       /* a reboot a person started after the install: no lines under the install result, the Server panel has it */
+    await must(page, () => { const card = [...document.querySelectorAll("#p-view .p-sy-up .p-card")].find(c => c.querySelector("h3").textContent === "Install finished"); return card && !(card.nextElementSibling && card.nextElementSibling.classList.contains("p-msg")); },
+      "nothing under the finished install for a reboot that was not started by it");
+    await rbExpect(page, {label: "Reboot Defiant", disabled: false, line: /^Defiant rebooted and answered again after 115 s\.$/, kind: "ok"}); }},
+  {name: "sys-defiant-auto-old-failed", hash: DEF, variant: "upd-autoold", run: async (page, t) => { await toUpd(page); await t.shot("updates");       /* a day-old failure of an earlier install's reboot, then an install that needs none */
+    await noAutoLine(page, "an old failure of an earlier install's reboot");
+    await rbExpect(page, {label: "Reboot Defiant", disabled: false, line: /^The reboot after the install did not start/, kind: "err"}); }},
+  {name: "sys-defiant-auto-old-done", hash: DEF, variant: "upd-autooldok", run: async (page, t) => { await toUpd(page);       /* an automatic reboot that finished 5 minutes ago, then an install that needs none */
+    await noAutoLine(page, "an automatic reboot that finished before this install");
+    await rbExpect(page, {label: "Reboot Defiant", disabled: false, line: /^Defiant rebooted and answered again after 120 s\.$/, kind: "ok"}); }},
+  {name: "sys-defiant-auto-just-after", hash: DEF, variant: "upd-autonext", run: async (page, t) => { await toUpd(page);       /* the reboot that came right after this install does show under it */
+    await autoLine(page, /^The reboot after the install did not start/, "err", true); }},
+  {name: "sys-defiant-auto-story", hash: DEF, variant: "upd-running", run: async (page, t) => {       /* the install ends with a reboot needed, Fleet reboots by itself, Defiant goes down and comes back */
+    const step = async state => { await over("/api/defiant/updates", "updates", () => F.updates(state))(page); await toUpd(page); };
+    await must(page, () => document.querySelector('[data-act="sys.reboot"]') && !/Rebooting\.|answered again/.test(document.querySelector("#p-view").textContent), "an install runs: the button, no reboot line");
+    await step("upd-done");       /* the install ended, a reboot is needed, none has started: the hint, no line */
+    await must(page, () => /A reboot is waiting\. Use Reboot Defiant when it suits you\./.test(document.querySelector("#p-view").textContent), "the hint that a reboot is waiting");
+    await rbExpect(page, {label: "Reboot Defiant", disabled: false, bg: AMBER, line: "", hint: true});
+    await step("upd-autorun"); await t.shot("running");
+    await autoLine(page, /^Rebooting\. Waiting for Defiant to go down\.$/, "", false);       /* the hint is gone: Fleet is doing it */
+    await rbExpect(page, {label: "Rebooting", disabled: true, line: /^Rebooting\. Waiting for Defiant to go down\.$/, kind: "", hint: false});
+    let b = await upBtns(page); if(!b.installOff || !b.scanOff) throw new Error("Install updates and Scan now must be off while the reboot runs");
+    await step("upd-autodown"); await autoLine(page, /^Rebooting\. Defiant has been down since \d\d:\d\d:\d\d \(\d+ s\)\.$/, "", false);
+    await step("upd-autodone"); await t.shot("done");       /* back, and the rescan found no reboot waiting */
+    await autoLine(page, /^Defiant rebooted and answered again after 115 s\.$/, "ok", false);
+    await rbExpect(page, {label: "Reboot Defiant", disabled: false, bg: ORANGE, line: /^Defiant rebooted and answered again after 115 s\.$/, kind: "ok", hint: true});
+    b = await upBtns(page); if(b.scanOff) throw new Error("Scan now must be back on"); }},
+  {name: "sys-defiant-reboot-hostile", hash: DEF, variant: "upd-rebootfail", run: async (page, t) => {       /* the error text is the remote host's: shown as text */
+    await over("/api/defiant/updates", "updates", () => { const u = F.updates("upd-rebootfail"); u.reboot.error = HOSTILE_RB; u.scan.reboot_pkgs = [HOSTILE_RB]; return u; })(page); await toSrv(page);
+    await must(page, () => { const v = document.querySelector("#p-view"); return !window.__pwned && !v.querySelector("img, script, #evil") && v.textContent.includes('<img src=x onerror="window.__pwned=1">') && v.textContent.includes('<b id="evil">boom</b>'); }, "the error shown as text");
+    await t.tap(REBOOT); await must(page, () => { const x = document.querySelector(".p-sheet"); return x && !x.querySelector("img, script") && x.textContent.includes("<img src=x onerror"); }, "the confirm text escaped too"); await t.tap(NO); }},
+
+  /* Defiant: how often the screen asks (3 s while a scan, an install or a reboot is on its way or none has run, else every 30 s) and who asks at all */
   {name: "sys-defiant-upd-poll-running", hash: DEF, variant: "upd-running", run: async (page, t) => { const n = await upHits(page, 9500);
     if(n < 2 || n > 4) throw new Error(`expected 2 to 4 reads of the updates in 9.5 s while an install runs, saw ${n}`); }},
   {name: "sys-defiant-upd-poll-noscan", hash: DEF, variant: "upd-never", run: async (page, t) => { const n = await upHits(page, 9500);
@@ -430,6 +689,29 @@ exports.scenes = [
     if(n !== 0) throw new Error(`expected no read in 9.5 s while nothing runs, saw ${n}`); }},
   {name: "sys-defiant-upd-poll-leave", hash: DEF, variant: "upd-running", run: async (page, t) => { await t.tap('[data-act="back"]'); await t.wait(400);       /* back to Systems: the 3 s timer is gone with the screen */
     const n = await upHits(page, 4500); if(n !== 0) throw new Error(`expected no read after leaving the Defiant screen, saw ${n}`); }},
+  {name: "sys-defiant-reboot-poll-running", hash: DEF, variant: "upd-rebooting", run: async (page, t) => { const n = await upHits(page, 9500);
+    if(n < 2 || n > 4) throw new Error(`expected 2 to 4 reads of the updates in 9.5 s while a reboot runs, saw ${n}`); }},
+  {name: "sys-defiant-reboot-poll-down", hash: DEF, variant: "upd-rebootdown", run: async (page, t) => { const n = await upHits(page, 9500);
+    if(n < 2 || n > 4) throw new Error(`expected 2 to 4 reads in 9.5 s while Defiant is down, saw ${n}`); }},
+  {name: "sys-defiant-reboot-poll-done", hash: DEF, variant: "upd-rebooted", run: async (page, t) => { const n = await upHits(page, 9500);
+    if(n !== 0) throw new Error(`expected no read in 9.5 s after a finished reboot, saw ${n}`); }},
+  {name: "sys-defiant-reboot-poll-failed", hash: DEF, variant: "upd-rebootfail", run: async (page, t) => { const n = await upHits(page, 9500);
+    if(n !== 0) throw new Error(`expected no read in 9.5 s after a failed reboot, saw ${n}`); }},
+  {name: "sys-defiant-reboot-poll-none", hash: DEF, variant: "upd-noreboot", run: async (page, t) => { const n = await upHits(page, 9500);
+    if(n !== 0) throw new Error(`expected no read in 9.5 s from an older Fleet with nothing running, saw ${n}`); }},
+  {name: "sys-defiant-reboot-poll-ends", hash: DEF, variant: "upd-rebooting", run: async (page, t) => {       /* the reboot ends: the 3 s polling ends with it */
+    await over("/api/defiant/updates", "updates", () => F.updates("upd-rebooted"))(page); await t.wait(3300);
+    const n = await upHits(page, 9500); if(n !== 0) throw new Error(`expected no read once the reboot is over, saw ${n}`); }},
+  {name: "sys-defiant-reboot-poll-leave", hash: DEF, variant: "upd-rebooting", run: async (page, t) => { await t.tap('[data-act="back"]'); await t.wait(400);       /* back to Systems: the 3 s timer is gone with the screen */
+    const n = await upHits(page, 4500); if(n !== 0) throw new Error(`expected no read after leaving the Defiant screen with a reboot running, saw ${n}`); }},
+  {name: "sys-defiant-reboot-poll-after-install", hash: DEF, variant: "upd-autowait", run: async (page, t) => {       /* the install ended 10 s ago with a reboot due and Fleet has not started it yet: ask every 3 s until it shows */
+    const n = await upHits(page, 9500); if(n < 2 || n > 4) throw new Error(`expected 2 to 4 reads in 9.5 s right after an install that left a reboot due, saw ${n}`);
+    await over("/api/defiant/updates", "updates", () => F.updates("upd-autorun"))(page);
+    await must(page, () => /Rebooting\. Waiting for Defiant to go down\./.test(document.querySelector("#p-view").textContent) && !/A reboot is waiting/.test(document.querySelector("#p-view").textContent), "Fleet's own reboot in place of the hint"); }},
+  {name: "sys-defiant-reboot-poll-after-old-install", hash: DEF, variant: "upd-done", run: async (page, t) => {       /* the install ended 7 minutes ago and no reboot came: nothing to wait for */
+    const n = await upHits(page, 9500); if(n !== 0) throw new Error(`expected no read in 9.5 s when the install ended 7 minutes ago, saw ${n}`); }},
+  {name: "sys-defiant-reboot-poll-after-start", hash: DEF, variant: "upd-pending-rbpoll", posts: [rebootPost], run: async (page, t) => { await freshRb(page, t); await toSrv(page); await t.tap(REBOOT); await t.tap(YES);
+    const n = await upHits(page, 9500); if(n < 2 || n > 4) throw new Error(`expected 2 to 4 reads in 9.5 s after the reboot was accepted, saw ${n}`); }},
   {name: "sys-root-updates-no-poll", hash: "#/systems", variant: "upd-running", run: async (page, t) => { const n = await upHits(page, 2500); if(n !== 0) throw new Error(`the Systems list read the updates ${n} times`); }},
   {name: "bridge-updates-no-poll", hash: "#/bridge", variant: "upd-running", run: async (page, t) => { const n = await upHits(page, 2500); if(n !== 0) throw new Error(`the Bridge read the updates ${n} times`); }},
 

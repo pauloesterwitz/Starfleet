@@ -71,7 +71,7 @@ const alpha = () => ({containers: [{name: "kopia", state: "running", status: "Up
   policy: {times: ["03:30"], keep: {latest: 10, daily: 7, monthly: 12, annual: 3}}, next_snapshot: now() + 18 * 3600, trigger_ready: true,
   manual: {state: "idle", started: null, exit: null, error: null, snapshot: null}, at: now()});
 
-/* ---- /api/defiant/updates (defiant_updates in fleet.py): the hourly package scan and the install job. A variant
+/* ---- /api/defiant/updates (defiant_updates in fleet.py): the hourly package scan, the install job and the reboot. A variant
    "upd-<state>[-<twist>]" picks the state (the twist only changes how a POST is answered); every other variant gets the
    quiet one that agrees with the Defiant probe below: 7 updates for "busy", none for "nominal". */
 const SSH_DOWN = "ssh: connect to host demo-host port 22: Connection timed out";
@@ -105,7 +105,12 @@ const LOG = ["FLEET-APT-START 1763632000", "Get:1 http://ports.example.org/ubunt
   "Setting up docker-ce (5:29.1.2-1~ubuntu.26.04~resolute) ...", "Setting up tailscale (1.92.5) ...", "Processing triggers for man-db (2.13.1-1) ..."];
 const FAIL_LOG = ["FLEET-APT-START 1763631000", "E: Could not get lock /var/lib/dpkg/lock-frontend. It is held by process 2211 (unattended-upgr)",
   "E: Unable to acquire the dpkg frontend lock (/var/lib/dpkg/lock-frontend), is another process using it?", "FLEET-APT-EXIT 100 1763631660"];
-const body = (s, job) => ({configured: true, now: now() + .5, scan: s, critical: !!s && (s.security > 0 || s.reboot_required), job: Object.assign({}, idleJob, job)});
+const idleReboot = {state: "idle", started_at: null, ended_at: null, down_at: null, back_after: null, error: null, auto: false};      /* "boot" is Fleet's own and not sent */
+const body = (s, job, rb) => ({configured: true, now: now() + .5, scan: s, critical: !!s && (s.security > 0 || s.reboot_required), job: Object.assign({}, idleJob, job), reboot: Object.assign({}, idleReboot, rb)});
+const REBOOT_PKGS = ["linux-image-7.0.0-1031-generic"], doneJob = () => ({state: "done", started_at: now() - 900, ended_at: now() - 200, exit: 0, installed: 24, reboot_required: true, log: LOG});      /* ended before the reboot it started (every auto reboot below starts later) */
+const rbDone = o => ({state: "done", started_at: now() - 160, ended_at: now() - 45, down_at: now() - 140, back_after: 115, ...o});
+const rbFail = (error, o) => ({state: "failed", started_at: now() - 1300, ended_at: now() - 400, down_at: now() - 1250, error, ...o});
+const AUTO_NOSTART = "The reboot after the install did not start: apt is busy on Defiant, an upgrade may be running. Try again in a few minutes. Reboot Defiant when apt is idle.";
 const running = o => ({state: "running", started_at: now() - 260, log: LOG, ...o});
 const HOSTILE = '<img src=x onerror="window.__pwned=1">';
 const STATES = {
@@ -122,19 +127,43 @@ const STATES = {
   done: () => body(scan({deferred: HELD, reboot_required: true, reboot_pkgs: ["linux-image-7.0.0-1031-generic"]}),
     {state: "done", started_at: now() - 900, ended_at: now() - 420, exit: 0, installed: 24, reboot_required: true, log: LOG}),
   failed: () => body(full(), {state: "failed", started_at: now() - 1200, ended_at: now() - 1080, exit: 100, log: FAIL_LOG}),
+  /* the reboot: not yet down, down, back (the rescan found nothing pending), back more than 10 minutes ago, never came back, never started */
+  rebooting: () => body(full(), {}, {state: "running", started_at: now() - 9}),
+  rebootdown: () => body(full(), {}, {state: "running", started_at: now() - 75, down_at: now() - 61}),
+  rebooted: () => body(scan({deferred: HELD}), {}, rbDone()),
+  rebootlate: () => body(scan({deferred: HELD}), {}, rbDone({ended_at: now() - 700})),
+  rebootfail: () => body(full(), {}, rbFail("Defiant did not answer again within 15 minutes. Check it in your hosting provider's console.")),
+  rebootsame: () => body(full(), {}, rbFail("Defiant is still on the same boot three minutes after the request. It may still reboot. If it does not, check it in your hosting provider's console.", {down_at: null})),
+  noreboot: () => { const b = body(full()); delete b.reboot; return b; },                       /* an older Fleet: no "reboot" at all */
+  /* the install rebooted by itself (reboot.auto): running, down, back, refused to start, and one a person started after the install */
+  autorun: () => body(scan({deferred: HELD, reboot_required: true, reboot_pkgs: REBOOT_PKGS}), doneJob(), {state: "running", auto: true, started_at: now() - 12}),
+  autodown: () => body(scan({deferred: HELD, reboot_required: true, reboot_pkgs: REBOOT_PKGS}), doneJob(), {state: "running", auto: true, started_at: now() - 75, down_at: now() - 61}),
+  autodone: () => body(scan({deferred: HELD}), doneJob(), rbDone({auto: true})),
+  autofail: () => body(scan({deferred: HELD, reboot_required: true, reboot_pkgs: REBOOT_PKGS}), doneJob(), rbFail(AUTO_NOSTART, {auto: true, down_at: null, ended_at: now() - 100, started_at: null})),
+  automan: () => body(scan({deferred: HELD}), doneJob(), rbDone()),
+  /* an automatic reboot of an EARLIER install (failed a day ago, or finished 5 minutes ago) and a later install that needs none: it does not belong under that install's result */
+  autoold: () => body(scan({deferred: HELD}), {state: "done", started_at: now() - 200, ended_at: now() - 60, exit: 0, installed: 3, reboot_required: false, log: LOG},
+    rbFail(AUTO_NOSTART, {auto: true, down_at: null, started_at: null, ended_at: now() - 86400})),
+  autooldok: () => body(scan({deferred: HELD}), {state: "done", started_at: now() - 200, ended_at: now() - 60, exit: 0, installed: 3, reboot_required: false, log: LOG},
+    rbDone({auto: true, started_at: now() - 420, ended_at: now() - 300, down_at: now() - 400, back_after: 120})),
+  /* the reboot that came right after this install (the same tick, a few seconds later): it does show under it */
+  autonext: () => body(scan({deferred: HELD, reboot_required: true, reboot_pkgs: REBOOT_PKGS}), {state: "done", started_at: now() - 200, ended_at: now() - 100, exit: 0, installed: 3, reboot_required: true, log: LOG},
+    rbFail(AUTO_NOSTART, {auto: true, down_at: null, started_at: null, ended_at: now() - 97})),
+  autowait: () => body(scan({deferred: HELD, reboot_required: true, reboot_pkgs: REBOOT_PKGS}), Object.assign(doneJob(), {ended_at: now() - 10})),      /* the install ended 10 s ago with a reboot due, Fleet has not started it yet */
   /* every string a remote host sends, with markup in it */
   hostile: () => body(scan({count: 2, security: 1, error: '<b id="evil">boom</b>', error_at: now() - 60, remove: [HOSTILE], reboot_required: true, reboot_pkgs: ["<b>k</b>"],
     packages: [pkg("x" + HOSTILE, "1<b>2", "3<i>4", ["s<u>1-security"]), pkg("y&amp;z", null, "5<s>6", ["<em>stable</em>"], {origin: "<script>window.__pwned=1</script>", third_party: true})]}),
     {state: "failed", started_at: now() - 100, ended_at: now() - 50, exit: 1, log: ["<script>window.__pwned=1</script>", HOSTILE]}),
   quiet: v => body(v === "nominal" ? scan({}) : {...pending(PKGS.filter(p => !p.security).slice(0, 7)), reboot_required: true, reboot_pkgs: ["linux-image-7.0.0-1025-generic"]}),
 };
-const begun = new Map(), hits = {upd: 0};        /* variant -> when its install was accepted; GETs of /api/defiant/updates answered */
+const begun = new Map(), rbegun = new Map(), hits = {upd: 0};        /* variant -> when its install / its reboot was accepted; GETs of /api/defiant/updates answered */
 function updates(variant){
-  const m = /^upd-([a-z]+)/.exec(variant), t = begun.get(variant);
+  const m = /^upd-([a-z]+)/.exec(variant), t = begun.get(variant), rt = rbegun.get(variant);
   if(t) return body(full(), running({started_at: t, log: LOG.slice(0, 2)}));                 /* Fleet says "running" from the moment it accepts the install */
-  return (m && STATES[m[1]] || STATES.quiet)(variant);
+  const u = (m && STATES[m[1]] || STATES.quiet)(variant);
+  return rt && u.reboot ? Object.assign(u, {reboot: Object.assign({}, idleReboot, {state: "running", started_at: rt})}) : u;      /* and "rebooting" from the moment it accepts a reboot */
 }
-const updSummary = u => u.scan && u.scan.at ? {count: u.scan.count, security: u.scan.security, deferred: u.scan.deferred.length, remove: u.scan.remove.length, scan_at: u.scan.at, job_state: u.job.state} : null;
+const updSummary = u => u.scan && u.scan.at ? {count: u.scan.count, security: u.scan.security, deferred: u.scan.deferred.length, remove: u.scan.remove.length, scan_at: u.scan.at, job_state: u.job.state, reboot_state: (u.reboot || idleReboot).state} : null;
 const defiant = variant => { const u = updates(variant), upd = updSummary(u), sec = upd ? upd.security : 0;     /* the probe, and the security count Fleet adds to its problems; the probe's count (apt list) also holds the 4 packages phasing keeps back, so it differs from the scan's: a screen that reads the wrong one shows */
   return {configured: true, host: "defiant", os: "Debian 13", kernel: "6.12", uptime_s: 41 * 86400, load: "0.12 0.08 0.05", cpus: 4, cpu_pct: 3,
     mem_total_kb: 8 * KB, mem_avail_kb: 5.6 * KB, disk_total: 80e9, disk_used: 21e9, disk_avail: 59e9, rx_bps: 18000, tx_bps: 64000,
@@ -142,7 +171,7 @@ const defiant = variant => { const u = updates(variant), upd = updSummary(u), se
     sites: [{domain: "example.org", status: 200, ms: 84, cert_days: 61, error: null, deployed: now() - 86400 * 3}, {domain: "docs.example.org", status: 200, ms: 91, cert_days: 61, error: null, deployed: now() - 86400 * 9}],
     problems: sec ? [`${sec} security update${sec === 1 ? "" : "s"} pending`] : [], errors: [], status: sec ? "warn" : "ok", upd, at: now()}; };
 
-exports.fixtures = {state, sessions, alpha, defiant, updates, begun, hits, models, keyOk, denied, POLICY, now};
+exports.fixtures = {state, sessions, alpha, defiant, updates, begun, rbegun, hits, models, keyOk, denied, POLICY, now};
 exports.get = (p, variant, q, h) => {
   if(variant === "offline") return {__status: 502, body: {error: "upstream down"}};
   if(p === "/api/state") return state(variant);

@@ -130,7 +130,7 @@ about placement.
   backup snapshot, its size, the schedule and the object-lock renewal, with a **Back up
   now** button; *Defiant* shows the web server's health, its sites and certificates, and
   its outstanding system updates (scanned every hour; a critical one goes to Telegram and
-  to the Messages list, with an **Install updates** button).
+  to the Messages list), with an **Install updates** and a **Reboot Defiant** button.
   → [Memory Alpha](#memory-alpha-the-off-site-backup) · [Defiant](#defiant-the-web-server)
 - **Answers from your own knowledge.** *Computer* chats with the model that is already
   resident (it never loads one), with your wiki, vane and Google search as tools, image
@@ -614,9 +614,9 @@ The ssh target comes from the service environment, `FLEET_DEFIANT_HOST` (for exa
 `user@host` in a systemd drop-in), so no address lives in the code; without it the view
 says it is not configured.
 
-The Defiant view shows the package updates that are waiting on the web server, scans for them every hour, tells you
-when one is critical and has a button that installs them. It works the same on the Mac and on the iPhone, because Fleet
-serves both pages. It is on only when `FLEET_DEFIANT_HOST` is set.
+The Defiant view shows the package updates that are waiting on the web server, scans for them every hour, tells you when
+one is critical and has a button that installs them and a button that reboots the server. It works the same on the Mac
+and on the iPhone, because Fleet serves both pages. It is on only when `FLEET_DEFIANT_HOST` is set.
 
 **Scan.** About 45 seconds after Fleet starts (unless the saved scan is younger than 55 minutes), then every hour,
 Fleet runs `apt-get update` and a simulated `apt-get full-upgrade` on Defiant over ssh, and reads whether a reboot is
@@ -630,12 +630,16 @@ updates are pending or a reboot is waiting.
 
 **Install.** Install updates needs the Starfleet key, which the gate checks (it fails closed). Fleet starts one detached
 systemd unit on Defiant, so a Tailscale or Docker restart in the middle of the upgrade cannot kill it. The unit runs
-`apt-get update` and `apt-get full-upgrade` and keeps the old configuration files. It never removes unused packages
-and never reboots: a reboot stays your decision. Fleet follows the unit every 5 seconds, also after a Fleet restart, and
-treats a lost connection as "retrying" until 30 minutes have passed. When the unit ends, a rescan follows at once. The
-confirm step names the number of updates and any removals, and warns when the list holds Docker, containerd or Tailscale
-(services restart, sites can be unreachable for a few seconds) or the kernel or the C library (a reboot is needed
-afterwards).
+`apt-get update` and `apt-get full-upgrade` and keeps the old configuration files. It never removes unused packages, and
+the unit itself never reboots. When the run ended well and a reboot is waiting, Fleet reboots Defiant afterwards, but
+only for a click from a page that announced it in the request body (`{"reboot_ok": true}`; see **Reboot after an
+install**). Fleet follows the unit every 5 seconds, also after a Fleet restart, and treats a lost connection as
+"retrying" until 30 minutes have passed. When the unit ends, a rescan follows at once, or after the reboot when one
+follows. The confirm step names the number of updates and any removals, and warns when the list holds Docker, containerd
+or Tailscale (services restart, sites can be unreachable for a few seconds) or the kernel or the C library (a reboot is
+needed afterwards). Its last warning says that Defiant reboots by itself and the sites are unreachable for about a
+minute: as a fact when the latest scan already shows a reboot waiting, as "if a reboot is needed afterwards" when it
+does not.
 
 **Install guard.** An upgrade can ask apt to remove a package. Fleet decides from its own latest scan, never from the
 request: the unit runs `full-upgrade` with `--no-remove` unless that scan is good (a later scan attempt did not fail),
@@ -652,13 +656,55 @@ compared), so it protects the case where the scan lists no removals. And it deci
 latest scan, so a scan that lists new removals between the moment the page was drawn and the click lets that install run
 without the flag.
 
+**Reboot.** *Reboot Defiant*, a button in the *Server* block of the Defiant view (on the Mac window and on the iPhone
+page), reboots the whole machine, independently of any update, with a plain `systemctl reboot`. The confirm step says
+how many sites go down, when the list of sites is known. It needs the Starfleet key, checked by ctxproxy's own check,
+which fails closed. The ssh user on
+Defiant must be allowed `sudo -n` for `systemd-run` and `fuser` without a password (the timer runs `systemctl reboot` as
+root). Defiant schedules the reboot three seconds ahead as a transient systemd timer, so that the ssh call returns
+cleanly first, and Fleet follows the machine by its boot id: the reboot is done when Defiant answers again with another
+boot id, and the page then shows for ten minutes how many seconds that took. The sites are unreachable for about a
+minute; they come back by themselves when their containers have a restart policy and Docker starts at boot. While a
+reboot runs, Install updates, Scan now and Reboot Defiant are off and Fleet starts no scan; Reboot Defiant is off while
+an install or a scan runs, too. When the reboot is done, the reboot flag clears at once and a rescan follows. Each
+reboot also leaves one entry in the Messages list, list only and without a push, when it starts (`Defiant reboot
+started`), when it is done (`Defiant rebooted`) and when it fails (`Defiant reboot failed`), each leading to the Defiant
+view. A request from the button that Defiant refuses, or that gets no answer, leaves none, because Fleet never saw that
+reboot run.
+
+**Reboot guard.** A request is refused while a scan, an install or another reboot runs, and for ten minutes after the
+last request that may have taken effect (a reboot that went through, one that was marked failed, or a request that got
+no answer: a slow shutdown can end after the verdict). Those ten minutes survive a restart of Fleet: the state of the
+last reboot is saved, and Fleet saves the time of a request before it asks Defiant, so that even a restart in the middle
+of the request keeps the hold (an answer that shows that nothing was scheduled takes that time back). Defiant itself
+refuses while an install, another reboot or a dpkg or apt lock is held, or when it cannot tell whether one is held (a
+lock check that cannot be made counts as no all-clear), so an upgrade that holds a dpkg or apt lock is not cut off. An
+upgrade that starts in the three seconds before the timer fires is not covered. A reboot that is still on the same boot
+three minutes after the request (it may still happen) or a machine that does not answer again within 15 minutes is
+marked failed. The page shows the error until the next reboot, and Telegram gets the same text once, under the
+headline `Defiant: reboot failed`; both errors point you to your hosting provider's console.
+
+**Reboot after an install.** Only two things start a reboot: a click on Reboot Defiant, and an Install updates click
+from a page that sends the reboot flag (`{"reboot_ok": true}`, as the current pages do), in this Fleet, whose install
+started cleanly and ended well with a reboot waiting. The confirm step of the install says so. A scan, an install that
+was already running when Fleet restarts, an install whose start answer got lost, a request without the flag (an older
+page, a script) and a restart of Fleet start none; the page then says that a reboot is waiting. Whether Defiant's own
+unattended upgrades reboot is up to its configuration. If Defiant refuses the automatic reboot, for example while apt is
+busy, the reboot is marked failed, the same Telegram message goes out, and you reboot when apt is idle (a start that got
+no answer says so instead: Defiant may still reboot, so wait a few minutes). The ten minutes of the guard belong to the
+button: the reboot after an install does not wait for them, because the click on Install updates announced it, and
+Defiant's own refusals still apply to it. A reboot after an install that Defiant refuses replaces the record of the
+reboot before it, so the ten minutes of that earlier reboot end with it. A restart of Fleet in the middle of a reboot
+only picks the saved state up and keeps following it.
+
 **Telegram.** One message goes out when a scan is critical and has an entry the last alert did not name (a security
 package with a new version, a new reason for a reboot). Fewer entries than before, or the same scan an hour later, send
 nothing. The first line is the headline (`Defiant: 3 security updates pending`), then up to 25 packages as
-`name from -> to (suite)`, the number of other updates, the packages that want a reboot, and where the Install button is.
-Telegram carries the long text, with the package names, to the phone and the Mac. A failed send is retried at the next
-scan. A failed install sends one message with the last 25 lines of its log; a successful install sends none, the page
-shows it. The sender is `~/telegram-tool/send_progress.py` (`FLEET_TELEGRAM_SEND` changes it).
+`name from -> to (suite)`, the number of other updates, the packages that want a reboot, and where the Install updates
+and Reboot Defiant buttons are (each only when it applies). Telegram carries the long text, with the package names, to
+the phone and the Mac. A failed send is retried at the next scan. A failed install sends one message with the last 25
+lines of its log, and a failed reboot sends one, `Defiant: reboot failed` and its error; a successful install or reboot
+sends none, the page shows it. The sender is `~/telegram-tool/send_progress.py` (`FLEET_TELEGRAM_SEND` changes it).
 
 **Push.** Security updates also open an entry in the Messages list (rule `updates-security`, level act), and when push is
 set up, one push notification: "Security updates waiting", the count (`3 security updates waiting on Defiant.`) and a link
@@ -673,24 +719,30 @@ still written. A waiting reboot stays an in-app message (rule `reboot-needed`) p
 prefix `updates-security` in the `mute` list of `~/.config/fleet-ui/events.json` turns the rule off.
 
 **Tests.** `python3 test/test_defiant_updates.py` (unit tests of the parser, the alerts, the job, the install guard and
-the push rule; no network, no real command) and the pure self-checks of fleet.py (`_ev_selfcheck` holds the rules of
-the Messages list). `test/e2e-defiant/run.sh` starts the real Fleet against a made-up Defiant (ssh, apt, systemd,
+the push rule; no network, no real command), `python3 test/test_defiant_reboot.py` (unit tests of the reboot, the reboot
+after an install and their Messages entries; no network, no real command, and the two scripts that run on Defiant only
+against stand-ins for sudo, systemctl, systemd-run, fuser and the reboot commands, so that nothing that can reboot a
+machine runs) and the pure self-checks of fleet.py (`_ev_selfcheck` holds the rules of the Messages list).
+`test/e2e-defiant/run.sh` starts the real Fleet against a made-up Defiant (ssh, apt, systemd,
 Docker, Telegram and curl are stand-ins in a sandbox folder) and drives the desktop and phone pages in WebKit. It cannot
 reach a real host, a real Telegram chat or Apple: the events folder, the push device file and the push senders are inside
 or replaced in the sandbox, the shell's push variables are not passed on, and the page stories run WebKit with a dead
 loopback port as proxy, so no connection leaves the machine, not even the font preconnects of the two pages. The stories `security-push` and
 `security-message` shorten the Messages worker's waits in the test wrapper only, and check the push (one, count only, no
 package name), the list entry, that a restart, a Fleet without its saved scan, another count or a failed scan repeat and
-close nothing, and that the install and its rescan resolve the entry without a second push. The page checks are `node test/desktop-defiant.js` and
-`node test/padd-shots.js <scene prefix>` (both need `PW`, the folder of the playwright package, and `OUT`, a folder for
-the pictures).
+close nothing, and that the install and its rescan resolve the entry without a second push. The reboot stories shorten
+the reboot's waits in the test wrapper only; the made-up host goes down and comes back with a new boot id, and its ssh
+refuses every script that names a way to reboot except the one pinned line. The page checks are
+`node test/desktop-defiant.js` and `node test/padd-shots.js <scene prefix>` (both need `PW`, the folder of the
+playwright package, and `OUT`, a folder for the pictures).
 
 | Call | Body | Does |
 | --- | --- | --- |
 | `GET /api/defiant` | | host figures, sites with status, response time, certificate and last deploy, containers, problems, a short `upd` summary of the update scan |
-| `GET /api/defiant/updates` | | the last scan (packages, removals, held back, reboot flag, next scan) and the install job (state, log tail) |
-| `POST /api/defiant/updates/scan` | `{}` | asks for a scan now; no key, one a minute |
-| `POST /api/defiant/updates/install` | `{}` | starts the upgrade; 403 without the key, 409 while a scan or an install runs |
+| `GET /api/defiant/updates` | | the last scan (packages, removals, held back, reboot flag, next scan), the install job (state, log tail) and the reboot (state, times, error) |
+| `POST /api/defiant/updates/scan` | `{}` | asks for a scan now; no key, one a minute; answers `started: false` with the reason `rebooting` while a reboot runs |
+| `POST /api/defiant/updates/install` | `{"reboot_ok": true}` | starts the upgrade; with the flag Fleet reboots Defiant afterwards when the run ended well and a reboot is waiting, without it none follows; 403 without the key, 409 while a scan, an install or a reboot runs |
+| `POST /api/defiant/reboot` | `{}` | reboots the whole machine, three seconds after the call; 403 without the key, 409 while a scan, an install or a reboot runs, for ten minutes after a reboot request that may have taken effect, and while Defiant holds an install, a reboot or an apt lock, 502 when Defiant does not accept it (also when it cannot check the apt lock) or does not answer in time (it may still reboot) |
 
 ### Computer: a chat with the resident model
 
@@ -935,7 +987,7 @@ and `GET /api/events` (no key: node and model names, counts and generic words, n
 | --- | --- | --- |
 | **Act now** | a pinned model is not running and not loading (2 minutes), llama-swap or a node does not answer (2 and 1.5 minutes), a node has under 3 GB of memory free (30 seconds), the off-site backup failed or its last snapshot is over 30 hours old, a web site on Defiant does not answer (about 3 minutes), a coding session has waited 30 minutes to 6 hours | push, and the "Act now" count and app badge |
 | **Note** | network port under 1000 Mb/s, a certificate under 14 days, the web server needs a reboot, containers of idle sessions hold over 3 GB, a node rebooted by itself, a pinned model is not in the configuration, a backup warning | the list and the unread count |
-| **Info** | a load finished or failed, what Red Alert, Auto Destruct, a container stop, a NAS change or a backup start did, a finished backup | the list only |
+| **Info** | a load finished or failed, what Red Alert, Auto Destruct, a container stop, a NAS change or a backup start did, a finished backup, a Defiant reboot that started, ended or failed | the list only |
 
 A pin that another two-node model pushed out of the exclusive group, or a model unloaded because you changed its
 context or effort, is not reported as lost. A rule you do not want can be muted with a file (key prefixes):
@@ -1151,7 +1203,7 @@ the page does not, and the app does not.
    | --- | --- |
    | `FLEET_SWAP` | the llama-swap endpoint; default ctxproxy on `:28081` |
    | `FLEET_DEFIANT_HOST` | the ssh target of the [Defiant](#defiant-the-web-server) view; unset, the view says it is not configured |
-   | `FLEET_DEFIANT_UPDATES_FILE` | where Fleet keeps the update scan, the alert it already sent and the install job; default `~/.local/share/fleet-ui/defiant-updates.json` |
+   | `FLEET_DEFIANT_UPDATES_FILE` | where Fleet keeps the update scan, the alert it already sent, the install job, the last reboot and the hold after a reboot request that got no answer; default `~/.local/share/fleet-ui/defiant-updates.json` |
    | `FLEET_TELEGRAM_SEND` | the script that sends an alert (one message, given as its only argument); default `~/telegram-tool/send_progress.py`, which is private and not in this repo |
    | `STARFLEET_AUTODESTRUCT_CODE` | the Auto Destruct code; unset, Auto Destruct answers 503 |
    | `FLEET_IMAGEGEN_REPO` | the image-generation repo whose `presets.py` lists the image and video models; without it there are no image or video rows |

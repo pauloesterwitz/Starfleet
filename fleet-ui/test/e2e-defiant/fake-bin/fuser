@@ -1,0 +1,7 @@
+#!/bin/bash
+# Stands in for `fuser -s FILE...` and `fuser -V` (run through sudo). With files: exit 0 while a process holds one of them. The nightly run holds
+# the dpkg and apt locks while apt-lock exists, the same flag that makes `apt-get update` fail. With -V (does fuser run at all?): exit 0, unless
+# the flag fuser-broken exists: then sudo cannot run fuser, and sudo says 1, the same word as "no process holds the file".
+echo "$(date +%s.%N) fuser $*" >> "$E2E_HOST/calls.log"
+if [ "$1" = -V ]; then [ ! -e "$E2E_HOST/fuser-broken" ]; exit; fi
+[ -e "$E2E_HOST/apt-lock" ]

@@ -2,10 +2,11 @@
 """End to end test of the Defiant updates: the real fleet.py (started by fleet_e2e.py with short intervals) against a
 made-up Defiant, then the real desktop and phone pages in WebKit against that same server.
 
-Real: fleet.py, the scripts it sends over ssh (scan, poll, install unit, probe), the HTTP API, both pages.
+Real: fleet.py, the scripts it sends over ssh (scan, poll, install unit, reboot, probe), the HTTP API, both pages.
 Made up: the host. fake-bin/ssh runs those scripts in a sandbox with stand-ins for sudo, apt-get, apt, systemctl,
-systemd-run and docker (the apt-sim.txt, job.conf and flag files in the sandbox's host folder are what a step
-changes); telegram.py records the messages; gate.py answers the key check. Fleet runs with a sandbox HOME and a
+systemd-run, fuser and docker (the apt-sim.txt, job.conf, reboot.conf and flag files in the sandbox's host folder are what a step
+changes; a reboot is a host that stops answering for a while and comes back with a new boot id); telegram.py records the
+messages; gate.py answers the key check. Fleet runs with a sandbox HOME and a
 PATH that holds only those stand-ins and harmless tools, so it cannot reach a real host, service or model. The
 Messages system is walled in too: its events folder and device file are in the sandbox, curl is a stand-in, and
 fleet_e2e.py replaces the push senders with recorders (push.jsonl), so no push can leave and no real file is written.
@@ -20,6 +21,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -31,11 +33,27 @@ SIMS = {"many": FIX / "apt-sim-large.txt", "quiet": FIX / "apt-sim-phased.txt", 
         "one": E2E_FIX / "sim-new-security.txt", "removal": E2E_FIX / "sim-removal.txt"}
 KEY, FAKE = "fixture-key", HERE / "fake-bin"
 POLICY = re.search(r'^POLICY = "(.*)"$', (HERE.parent.parent / "fleet.py").read_text(encoding="utf-8"), re.M).group(1)      # Fleet's own wording, whatever it is today
-SCAN, INSTALL = "/api/defiant/updates/scan", "/api/defiant/updates/install"
+SCAN, INSTALL, REBOOT = "/api/defiant/updates/scan", "/api/defiant/updates/install", "/api/defiant/reboot"
 HINT = "Fleet: apt would remove packages, nothing was changed. Rescanning now: check the list, then install again."
+E_SAME_BOOT = "Defiant is still on the same boot three minutes after the request. It may still reboot. If it does not, check it in your hosting provider's console."
+E_GIVEUP = "Defiant did not answer again within 15 minutes. Check it in your hosting provider's console."
+E_APT = "apt is busy on Defiant, an upgrade may be running. Try again in a few minutes."
+E_AUTO_APT = f"The reboot after the install did not start: {E_APT.rstrip('.')}. Reboot Defiant when apt is idle."
+E_INSTALL = "An install is running. Wait until it is done."
+E_UNSURE = "No answer from Defiant. It may still reboot."
+E_GAP = "A reboot was requested a moment ago. Try again in a few minutes."
+# What a reboot leaves in the Messages list: one list-only entry (title, text) when it starts, ends or fails. The seconds of a finished reboot read N (see trail()).
+# An error longer than 140 characters is cut at a word and ends in "...": the two long ones are spelled out here, so a change of the cut shows.
+R_START, R_AUTO = ("Defiant reboot started", "Started with the Reboot Defiant button."), ("Defiant reboot started", "Started by Fleet after the install.")
+R_DONE = ("Defiant rebooted", "Defiant answered again with a new boot after N seconds.")
+R_SAME_BOOT = ("Defiant reboot failed", "Defiant is still on the same boot three minutes after the request. It may still reboot. If it does not, check it in your hosting...")
+R_GIVEUP = ("Defiant reboot failed", E_GIVEUP)
+R_AUTO_APT = ("Defiant reboot failed", "The reboot after the install did not start: apt is busy on Defiant, an upgrade may be running. Try again in a few minutes. Reboot...")
 SAFE_TOOLS = ("awk basename bash cat cp cut date dirname env grep head ip nproc ps rm sed setsid sh sleep stat tail "
               "timeout touch tr uname").split()
-STAND_INS = "ssh sudo apt-get apt systemctl systemd-run docker hostname df curl".split()      # everything that could change a machine or reach out
+STAND_INS = "ssh sudo apt-get apt systemctl systemd-run fuser docker hostname df curl".split()      # everything that could change a machine or reach out
+NO_WAY_OUT = "reboot shutdown poweroff halt kexec".split()      # no way to reboot or power off a machine is on the PATH at all
+BOOT0 = "00000000-0000-4000-8000-000000000000"      # the made-up host's first boot id (the stand-in systemctl makes the next ones)
 
 SBX = Path(tempfile.mkdtemp(prefix="defiant-e2e-"))
 HOST, HOME, STATE, SAFE = SBX / "host", SBX / "home", SBX / "state" / "defiant-updates.json", SBX / "safe-bin"
@@ -45,6 +63,7 @@ PATH = f"{FAKE}:{SAFE}"
 DEFAULTS = dict(FIRST=2, GAP=2, RETRY=3600, EVERY=3600, LOST=20, DEF_TTL=1)      # seconds; a story overrides what it needs
 UPD, procs, results = dict(DEFAULTS), {}, []
 EV = {}      # the events worker's waits (EV_GRACE, EV_HEAVY, EV_REMIND_S, in seconds) when a story shortens them; empty: Fleet's own
+RB = {}      # the same for the reboot's waits (REBOOT_POLL_S, REBOOT_START_WAIT, REBOOT_GIVEUP, REBOOT_GAP), and SCAN_LAG: the pause between the worker's decision to scan and the scan
 
 
 class Abort(Exception):
@@ -100,19 +119,33 @@ def build_sandbox():
     host_reset()
     loose = [n for n in STAND_INS if shutil.which(n, path=PATH) != str(FAKE / n)]
     check("sandbox: every command that could change a machine resolves to a stand-in", not loose, loose)
-    r = subprocess.run([str(FAKE / "ssh"), "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "backup.example", "echo reached"],
-                       env={"PATH": PATH, "E2E_HOST": str(HOST)}, capture_output=True, text=True)
+    found = [n for n in NO_WAY_OUT if shutil.which(n, path=PATH)]
+    check("sandbox: no program that reboots or powers off a machine is on the PATH of Fleet or of the made-up host", not found, found)
+    env = {"PATH": PATH, "E2E_HOST": str(HOST)}
+    run = lambda *argv: subprocess.run([str(FAKE / argv[0]), *argv[1:]], env=env, capture_output=True, text=True)
+    r = run("ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "backup.example", "echo reached")
     check("sandbox: the ssh stand-in refuses every host but the made-up one", r.returncode == 255 and "reached" not in r.stdout, (r.returncode, r.stdout))
+    r = run("ssh", "-o", "BatchMode=yes", "fake@defiant.example", "echo reached")
+    check("sandbox: ... and every script on the made-up host that Fleet is not known to send", r.returncode == 255 and "reached" not in r.stdout, (r.returncode, r.stdout))
+    r = run("ssh", "-o", "BatchMode=yes", "fake@defiant.example", "echo FLEET-BOOT; /bin/systemctl reboot --dry-run")      # a dry run, in case the wall were missing
+    check("sandbox: ... and a script of a known kind that names a way to reboot, apart from the one pinned line", r.returncode == 255 and "refused" in r.stderr and "FLEET-BOOT" not in r.stdout,
+          (r.returncode, r.stdout, r.stderr))
+    refused = [run("sudo", "-n", "/bin/true"), run("sudo", "-n", "true"), run("systemd-run", "--unit=x", "--collect", "/bin/sh", "-c", "systemctl reboot"),
+               run("systemd-run", "--unit=fleet-reboot", "--on-active=3s", "/bin/true")]
+    check("sandbox: sudo runs no path, systemd-run no command that reboots and no timer that is not the reboot's",
+          all(x.returncode == 1 for x in refused) and not (HOST / "unit.pid").exists() and not (HOST / "reboot-timer.pid").exists(), [(x.returncode, x.stderr) for x in refused])
 
 
 def kill_unit():
-    """Stops a unit the fake systemd-run left running, if that pid still is the unit's script (never a recycled pid)."""
-    try:
-        pid = int((HOST / "unit.pid").read_text())
-        if b"FLEET-APT" in Path(f"/proc/{pid}/cmdline").read_bytes():
-            os.killpg(pid, signal.SIGTERM)
-    except (OSError, ValueError):
-        pass
+    """Stops a unit the fake systemd-run left running (the install, or a reboot timer that has not fired), if that pid still is
+    the unit's script (never a recycled pid)."""
+    for name, marker in (("unit.pid", b"FLEET-APT"), ("reboot-timer.pid", b"FLEET-REBOOT")):
+        try:
+            pid = int((HOST / name).read_text())
+            if marker in Path(f"/proc/{pid}/cmdline").read_bytes():
+                os.killpg(pid, signal.SIGTERM)
+        except (OSError, ValueError):
+            pass
 
 
 def host_reset():
@@ -122,8 +155,11 @@ def host_reset():
     shutil.rmtree(EV_DIR, ignore_errors=True)
     for d in ("var/run", "var/log"):
         (HOST / d).mkdir(parents=True)
+    (HOST / "boot-id").write_text(BOOT0 + "\n")
+    (HOST / "boot-at").write_text(f"{int(time.time()) - 3 * 86400}\n")      # up for three days
     sim("quiet")
     job()
+    host_reboot()
     for f in (TG_LOG, TG_FAIL, STATE, PUSH_LOG, PUSH_DEV):
         f.unlink(missing_ok=True)
 
@@ -139,12 +175,24 @@ def sim_without(name, *drop):
     (HOST / "apt-sim.txt").write_text(re.sub(r"^\d+ upgraded, 0 newly", f"{n} upgraded, 0 newly", "\n".join(out) + "\n", flags=re.M))
 
 
-def job(rc=0, delay=3, per=2, reboot=0, after=None):
-    """What the next install does: how it ends, how long it takes, lines a second, a reboot left pending, a new sim afterwards."""
-    (HOST / "job.conf").write_text(f"RC={rc}\nDELAY={delay}\nPER={per}\nREBOOT={reboot}\n")
+def job(rc=0, delay=3, per=2, reboot=0, after=None, lock=0):
+    """What the next install does: how it ends, how long it takes, lines a second, a reboot left pending, a new sim afterwards,
+    the nightly run taking the apt lock the moment it ends."""
+    (HOST / "job.conf").write_text(f"RC={rc}\nDELAY={delay}\nPER={per}\nREBOOT={reboot}\nLOCK={lock}\n")
     (HOST / "apt-sim-after.txt").unlink(missing_ok=True)
     if after:
         shutil.copy(SIMS[after], HOST / "apt-sim-after.txt")
+
+
+def host_reboot(down=6, never=False):
+    """What the made-up host does when its reboot timer fires: no answer for `down` seconds, then a new boot id; or nothing at all (never)."""
+    (HOST / "reboot.conf").write_text(f"DOWN={down}\nNEVER={int(never)}\n")
+
+
+def pending_reboot(on=True):
+    """The host wants a reboot: the flag and the packages that want it, as after an upgrade by the nightly run."""
+    for name, text in (("reboot-required", ""), ("reboot-required.pkgs", "linux-image-6.8.0-99-generic\nlibc6\n")):
+        (HOST / "var/run" / name).write_text(text) if on else (HOST / "var/run" / name).unlink(missing_ok=True)
 
 
 def flag(path, on):
@@ -180,7 +228,7 @@ def start_fleet(push=False):
            "FLEET_EVENTS_DIR": str(EV_DIR), "E2E_PUSH_LOG": str(PUSH_LOG), "E2E_PUSH_DEVICES": str(PUSH_DEV),
            **({"APNS_KEY_FILE": str(APNS_KEY), "APNS_KEY_ID": "FIXTUREKEY1", "APNS_TEAM_ID": "FIXTURETEAM"} if push else {}),
            **{"E2E_" + ("" if k == "DEF_TTL" else "UPD_") + k: str(v) for k, v in UPD.items()},
-           **{"E2E_" + k: str(v) for k, v in EV.items()}}
+           **{"E2E_" + k: str(v) for k, v in {**EV, **RB}.items()}}
     procs["fleet"] = subprocess.Popen([sys.executable, str(HERE / "fleet_e2e.py")], env=env, cwd=SBX,
                                       stdout=open(FLEET_LOG, "a"), stderr=subprocess.STDOUT)
     must(until(lambda: up(PORT), 15), "Fleet did not come up: " + FLEET_LOG.read_text()[-600:])
@@ -203,6 +251,7 @@ def reset(**upd):
     UPD.clear()
     UPD.update(DEFAULTS, **upd)
     EV.clear()
+    RB.clear()
     if "gate" not in procs:
         start_gate()
 
@@ -246,6 +295,10 @@ def failures():
     return [t for t in telegram() if t.startswith("Defiant: update install failed")]
 
 
+def reboot_failures():
+    return [t for t in telegram() if t.startswith("Defiant: reboot failed")]
+
+
 def ssh_times(kind, what="BEGIN"):
     return [float(l.split()[0]) for l in lines(HOST / "ssh.log") if l.split()[1:3] == [what, kind]]
 
@@ -266,6 +319,15 @@ def saved():
 def pushes():
     """What Fleet's push sender was asked to send (the recorders of fleet_e2e.py), one dict per push."""
     return [json.loads(l) for l in lines(PUSH_LOG)]
+
+
+def push_device():
+    """Registers a made-up device through the real endpoint (the push key of start_fleet(push=True) is made up too), so that a push which Fleet
+    sent would be recorded in PUSH_LOG: the sender reads as ready and one device is known."""
+    st, r, _ = call("POST", "/api/computer/push/register", KEY, {"token": "ef" * 32, "env": "development"})
+    must(st == 200 and r["devices"] == 1, f"the made-up device could not register: {st} {r}")
+    st, r, _ = call("GET", "/api/computer/push", KEY)
+    must(st == 200 and r["sender"] == "ready" and r["devices"] == 1, f"the push sender is not ready: {st} {r}")
 
 
 def entries(kind):
@@ -304,13 +366,88 @@ def scan_now():
     return must(until(lambda: (u := view()) and u["scan"] and not u["scan"]["busy"] and stamp(u["scan"]) != before and u, 30), "the scan did not end")
 
 
-def install(key=KEY):
-    return call("POST", INSTALL, key)
+def install(key=KEY, body=None):
+    """The install click as both pages send it: the body {"reboot_ok": true} announces the reboot, and only a click that sent it can be followed by
+    one. body= sends another (an older page and a script send {})."""
+    return call("POST", INSTALL, key, {"reboot_ok": True} if body is None else body)
+
+
+def reboot(key=KEY):
+    return call("POST", REBOOT, key)
+
+
+def rb():
+    """The reboot as the page sees it (no boot id in it)."""
+    return view()["reboot"]
+
+
+def reboot_when_idle():
+    """Presses Reboot until Fleet takes it: a scan that is busy at that moment (some stories scan every few seconds) answers 409."""
+    return must(until(lambda: (a := reboot()) and a[0] == 200 and a, 20, 0.2), "Fleet never took the reboot")
+
+
+def reboot_over(timeout=60):
+    """Waits until the reboot is no longer running and returns it."""
+    return must(until(lambda: (r := rb())["state"] != "running" and r, timeout, 0.5), "the reboot did not end")
+
+
+def boot_id():
+    return (HOST / "boot-id").read_text().strip()
+
+
+def scheduled():
+    """The reboots Fleet scheduled on the host: its systemd-run calls for the reboot timer, as the stand-in logged them."""
+    return [l for l in host_calls("systemd-run") if "--unit=fleet-reboot " in l]
+
+
+def reboots():
+    """What the host did with its timers: one word for each call of `systemctl reboot`, "rebooted" or "ignored" (a host that never reboots)."""
+    return [l.split()[1] for l in lines(HOST / "reboots.log")]
+
+
+def reboot_text(error):
+    """The Telegram message of a failed reboot: the headline, a blank line and the error, nothing after it (the errors carry their own advice)."""
+    return f"Defiant: reboot failed\n\n{error}"
+
+
+def trail_raw():
+    """What reboots left in the Messages list, as (title, text) in the order they were written, read from the sandbox's events file (a reboot writes
+    one list-only entry when it starts, one when it ends and one when it fails; entries of other kinds are not in it)."""
+    rows = []
+    for l in lines(EV_DIR / "events.jsonl"):
+        try:
+            rows.append(json.loads(l))
+        except ValueError:                    # a line that Fleet is still writing
+            pass
+    return [(e["title"], e["text"]) for e in rows if e["kind"] == "audit" and e["title"].startswith(("Defiant reboot", "Defiant rebooted"))]
+
+
+def trail():
+    """trail_raw() with the seconds of a finished reboot read as N."""
+    return [(t, re.sub(r"after \d+ seconds", "after N seconds", x)) for t, x in trail_raw()]
+
+
+def trail_is(*expected, wait=10):
+    """True when the trail becomes exactly `expected` (an entry is written a moment after the state changes, after the Telegram message of a failure)
+    and still is a second later: no entry twice, none more."""
+    ok = until(lambda: trail() == list(expected), wait)
+    time.sleep(1)
+    return bool(ok) and trail() == list(expected)
+
+
+def key_checks():
+    """The key checks the gate stand-in answered (for the whole run: take a count before and after)."""
+    return [l for l in lines(GATE_LOG) if l.split()[1] == "/starfleet/check"]
+
+
+def ssh_kinds(t0, t1):
+    """The kinds of script Fleet sent to the host between two times, answered or not (ssh.log: BEGIN KIND, or down KIND)."""
+    return {l.split()[2] for l in lines(HOST / "ssh.log") if l.split()[1] in ("BEGIN", "down") and t0 <= float(l.split()[0]) <= t1}
 
 
 def tracebacks(log):
     """The tracebacks in Fleet's log, except a browser that went away mid-answer (a page reload cuts requests short)."""
-    found = [b for b in log.split("Traceback (most recent call last):")[1:]]
+    found = [b for b in log.split("Traceback (most recent call last):")[1:] if b.strip()]      # an empty block is a print cut short by a second thread's, or one still being written
     last = lambda b: re.search(r"^[A-Za-z_.]*(?:Error|Exception)\b.*$", b, re.M)
     return [b.strip()[-400:] for b in found if not (last(b) and last(b).group(0).startswith(("BrokenPipeError", "ConnectionResetError")))]
 
@@ -493,7 +630,7 @@ def story_scan_and_alerts():
     time.sleep(1.1)                                   # past the probe cache
     d = call("GET", "/api/defiant")[1]
     check("/api/defiant carries upd and the security problem", d["upd"] == {"count": 5, "security": 3, "deferred": 1, "remove": 0,
-          "scan_at": s["at"], "job_state": "idle"} and "3 security updates pending" in d["problems"] and d["status"] == "warn", d)
+          "scan_at": s["at"], "job_state": "idle", "reboot_state": "idle"} and "3 security updates pending" in d["problems"] and d["status"] == "warn", d)
     check("/api/defiant keeps updates and reboot_required", d["updates"] == 6 and d["reboot_required"] is False
           and d["host"] == "defiant.example", d)
 
@@ -622,7 +759,7 @@ def story_install():
     check("the gate was only asked for the key check and the model lists", {l.split()[:2][1] for l in asked} <= {"/starfleet/check", "/v1/models", "/running"}
           and all(l.startswith("GET ") for l in asked), sorted(set(asked)))
 
-    job(rc=0, delay=16, per=2, reboot=1, after="quiet")
+    job(rc=0, delay=16, per=2, after="quiet")
     t0 = time.time()
     st, r, hdr = install()
     check("install with the key starts the unit and returns", st == 200 and r["ok"] is True and abs(r["started_at"] - t0) < 5
@@ -648,21 +785,20 @@ def story_install():
     first = next((first[0] for n, first, _ in logs if n), "")
     check("the log tail grows while the install runs, from the unit's start line", len(set(sizes)) >= 3 and sizes == sorted(sizes)
           and first.startswith("FLEET-APT-START "), (sizes, first))
-    check("the install ends done, exit 0, 20 installed, a reboot pending", j["state"] == "done" and j["exit"] == 0 and j["installed"] == 20
-          and j["reboot_required"] is True and j["lost"] is False and not any(l for _, _, l in logs), j)
+    check("the install ends done, exit 0, 20 installed, no reboot pending", j["state"] == "done" and j["exit"] == 0 and j["installed"] == 20
+          and j["reboot_required"] is False and j["lost"] is False and not any(l for _, _, l in logs), j)
     check("the job ends after it started and its log ends with the exit line", j["ended_at"] >= j["started_at"]
           and j["log"][-1].startswith("FLEET-APT-EXIT 0 "), (j["started_at"], j["ended_at"], j["log"][-2:]))
     u = must(until(lambda: (v := view()) and v["scan"]["at"] > v["job"]["ended_at"] and not v["scan"]["busy"] and v, 30), "no rescan after the install")
     s = u["scan"]
-    check("a rescan follows at once and reads the reboot flag", s["count"] == 0 and s["reboot_required"] is True
-          and s["reboot_pkgs"] == ["linux-image-6.8.0-99-generic", "libc6"] and u["critical"] is True, s)
-    m = until(lambda: len(telegram()) == alerts + 1 and telegram()[-1], 15)
-    check("the pending reboot is alerted once, the install success is not", m and m.split("\n")[0] == "Defiant: reboot required"
-          and "Reboot required: linux-image-6.8.0-99-generic, libc6" in m, telegram()[alerts:])
-    time.sleep(1.1)
+    check("a rescan follows at once: nothing left to install, no reboot pending", s["count"] == 0 and s["reboot_required"] is False
+          and s["reboot_pkgs"] == [] and u["critical"] is False, s)
+    time.sleep(1.5)
+    check("the install success is not alerted, and an install that needs no reboot is followed by none", len(telegram()) == alerts
+          and view()["reboot"]["state"] == "idle" and ssh_times("reboot") == [], (telegram()[alerts:], view()["reboot"]))
     d = call("GET", "/api/defiant")[1]
-    check("/api/defiant shows the reboot and the finished job", d["reboot_required"] is True and d["upd"]["job_state"] == "done"
-          and d["upd"]["count"] == 0, d)
+    check("/api/defiant shows the finished job", d["reboot_required"] is False and d["upd"]["job_state"] == "done"
+          and d["upd"]["count"] == 0 and d["upd"]["reboot_state"] == "idle", d)
 
     # a short failing run right after a long one: the unit's log must be its own, not the end of the long run's with
     # that run's exit line (a log opened with file: keeps it; the unit truncates it)
@@ -774,7 +910,7 @@ def story_ssh_drop():
 
 def story_restart_mid_job():
     reset(FIRST=3600)
-    job(rc=0, delay=16, per=2)
+    job(rc=0, delay=16, per=2, reboot=1)                 # the install leaves a reboot pending, but Fleet restarts first: it does not reboot Defiant
     start_fleet()
     st, r, _ = install()
     must(st == 200, "install refused")
@@ -786,12 +922,14 @@ def story_restart_mid_job():
     u = must(until(lambda: (v := view()) and v["job"]["state"] != "running" and v, 50, 1), "the resumed job did not end")
     check("Fleet resumes watching and sees the install end", u["job"]["state"] == "done" and u["job"]["log"][-1].startswith("FLEET-APT-EXIT 0 ")
           and failures() == [], u["job"])
-    check("a rescan follows the resumed job", until(lambda: view()["scan"] and view()["scan"]["at"] > u["job"]["ended_at"], 30), view()["scan"])
+    check("a rescan follows the resumed job", until(lambda: ((view()["scan"] or {}).get("at") or 0) > u["job"]["ended_at"], 30), view()["scan"])
+    check("it needs a reboot, and none follows although the click announced one: that click was another Fleet's", u["job"]["reboot_required"] is True
+          and view()["reboot"]["state"] == "idle" and ssh_times("reboot") == [] and scheduled() == [], (u["job"]["reboot_required"], view()["reboot"]))
 
 
 def story_unit_unknown_to_fleet():
     reset(FIRST=3600)
-    job(rc=0, delay=14, per=2)
+    job(rc=0, delay=14, per=2, reboot=1)
     start_fleet()
     st, r, _ = install()
     must(st == 200, f"install refused: {st} {r}")
@@ -808,27 +946,525 @@ def story_unit_unknown_to_fleet():
     u = must(until(lambda: (v := view()) and v["job"]["state"] != "running" and v, 50, 1), "the followed install did not end")
     check("the install it followed ends done from the unit's own exit line, with no failure message", u["job"]["state"] == "done"
           and u["job"]["exit"] == 0 and u["job"]["log"][-1].startswith("FLEET-APT-EXIT 0 ") and failures() == [], u["job"])
-    check("a rescan follows it", until(lambda: view()["scan"] and view()["scan"]["at"] > u["job"]["ended_at"], 30), view()["scan"])
+    check("a rescan follows it", until(lambda: ((view()["scan"] or {}).get("at") or 0) > u["job"]["ended_at"], 30), view()["scan"])
+    check("it needs a reboot, and none follows although the click announced one: Fleet did not start that unit", u["job"]["reboot_required"] is True
+          and view()["reboot"]["state"] == "idle" and ssh_times("reboot") == [] and scheduled() == [], (u["job"]["reboot_required"], view()["reboot"]))
+
+
+def story_reboot():
+    """The button, Reboot Defiant, against a Defiant that wants a reboot: the request and what it asks of the host, the refusals
+    while it runs, the host going down and coming back with another boot id, the rescan that clears the flag, no Telegram message for
+    a reboot that worked, and the gap that refuses the next one."""
+    reset(FIRST=3600)
+    RB.update(REBOOT_POLL_S=1)
+    pending_reboot()
+    host_reboot(down=6)
+    start_fleet(push=True)                              # a ready push sender and a registered device: a push that the reboot caused would be recorded
+    push_device()
+    scan_now()
+    m = must(until(telegram, 10), "no alert for the pending reboot")[0]
+    time.sleep(1.5)
+    check("the scan found the pending reboot and alerted once, and the alert points at Reboot Defiant (nothing is left to install)", len(telegram()) == 1
+          and m.split("\n")[0] == "Defiant: reboot required" and m.split("\n")[-1] == "Reboot: Starfleet, Systems, Defiant, Reboot Defiant"
+          and "Install updates" not in m, telegram())
+    u = view()
+    check("the reboot is idle, and the view carries no boot id", u["reboot"] == {"state": "idle", "started_at": None, "ended_at": None, "down_at": None,
+          "back_after": None, "error": None, "auto": False} and u["scan"]["reboot_required"] is True, u["reboot"])
+
+    old, t0 = boot_id(), time.time()
+    st, r, hdr = reboot()
+    check("Reboot with the key answers 200 and returns at once", st == 200 and r["ok"] is True and abs(r["started_at"] - t0) < 5
+          and hdr["Cache-Control"] == "no-store", (st, r))
+    x = rb()
+    check("the reboot is running, started by the button, and remembers the boot id the host had", x["state"] == "running" and x["started_at"] == r["started_at"]
+          and x["auto"] is False and x["down_at"] is None and "boot" not in x and saved()["reboot"]["boot"] == old, x)
+    s = scheduled()
+    check("the host was told once: a timer three seconds ahead for a plain systemctl reboot, nothing else", len(s) == 1
+          and s[0].endswith(" systemd-run --unit=fleet-reboot --on-active=3s --timer-property=AccuracySec=1s --collect /bin/systemctl reboot") and reboots() == [], s)
+    check("it asked the three lock files first, never a process name, and checked that fuser runs at all", len(host_calls("fuser")) == 2
+          and host_calls("fuser")[0].endswith(" fuser -s /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock")
+          and host_calls("fuser")[1].endswith(" fuser -V"), host_calls("fuser"))
+    st, r2, _ = reboot()
+    check("a second Reboot while it runs answers 409 and schedules nothing", st == 409 and r2["error"] == "A reboot is already running."
+          and len(scheduled()) == 1, (st, r2))
+    st, r2, _ = install()
+    check("an install while it runs answers 409 and starts nothing", st == 409 and r2["error"] == "A reboot is running."
+          and host_calls("systemd-run") == scheduled(), (st, r2))
+    check("a scan request while it runs says rebooting", call("POST", SCAN)[1] == {"ok": True, "started": False, "reason": "rebooting"})
+
+    x = must(until(lambda: (v := rb())["down_at"] and v, 30, 0.5), "Fleet never saw Defiant go down")
+    check("Fleet saw Defiant go down, and the reboot is still running", x["state"] == "running" and x["started_at"] < x["down_at"] and x["ended_at"] is None, x)
+    d = call("GET", "/api/defiant")[1]
+    check("while Defiant is down its probe says that it does not answer, as always", d["status"] == "error" and d["errors"], (d["status"], d["errors"]))
+    done = reboot_over()
+    check("it ends done: Defiant answers with another boot id, the seconds are counted from the request", done["state"] == "done" and done["error"] is None
+          and done["down_at"] < done["ended_at"] and 8 <= done["back_after"] <= 20 and boot_id() != old and reboots() == ["rebooted"], done)
+    u = must(until(lambda: (v := view()) and v["scan"]["at"] > done["ended_at"] and not v["scan"]["busy"] and v, 30), "no rescan after the reboot")
+    check("a rescan follows at once, and the reboot flag went with the reboot", u["scan"]["reboot_required"] is False and u["scan"]["reboot_pkgs"] == []
+          and u["critical"] is False, u["scan"])
+    check("from the request to the end Fleet asked the host for the reboot and the probe only: no scan, no install poll",
+          ssh_kinds(x["started_at"], done["ended_at"]) <= {"reboot", "rpoll", "probe"}, ssh_kinds(x["started_at"], done["ended_at"]))
+    time.sleep(1.5)
+    check("a reboot that worked sends no Telegram message", len(telegram()) == 1 and reboot_failures() == [], telegram())
+    st, r2, _ = reboot()
+    check("a new Reboot a moment after one answers 409 and schedules nothing", st == 409 and r2["error"] == E_GAP
+          and len(scheduled()) == 1, (st, r2))
+    d = call("GET", "/api/defiant")[1]
+    check("/api/defiant says done, the saved file keeps it, and the host no longer wants a reboot", d["upd"]["reboot_state"] == "done"
+          and saved()["reboot"]["state"] == "done" and d["reboot_required"] is False, (d["upd"], saved()["reboot"]))
+    check("the Messages list got one entry when it started (by the button) and one when it ended, with the seconds the page shows, and no entry for the refusals",
+          trail_is(R_START, R_DONE) and trail_raw()[1] == ("Defiant rebooted", f"Defiant answered again with a new boot after {done['back_after']} seconds."), trail_raw())
+    mine = [e for e in entries("audit")[0] if e["title"] in ("Defiant reboot started", "Defiant rebooted")]
+    check("... and GET /api/events lists the same two as list-only entries: audit kind, info level, a point in time, no episode, no node, and they open the Defiant view",
+          [(e["title"], e["text"]) for e in mine] == trail_raw() and all(e["level"] == "info" and e["state"] == "point" and e["episode"] == "" and e["node"] == ""
+          and e["reminder"] == 0 and e["go"] == "#/systems/defiant" for e in mine), mine)
+    check("nothing was pushed to the phone, although the sender was ready and a device was registered: a reboot's entries are list only", pushes() == [], pushes())
+
+
+def story_reboot_refusals():
+    """Everything that refuses a reboot, and what each leaves behind: nothing scheduled, nothing rebooted, the same boot id, the reboot idle.
+    The key is checked before the host is asked anything. Fleet's own refusals (a scan or an install it knows of) come before it asks
+    the host; a host that is busy refuses by its own script."""
+    reset(FIRST=3600)
+    RB.update(REBOOT_POLL_S=1)
+    start_fleet()
+    old = boot_id()
+    for label, key in (("without a key", None), ("with a wrong key", "nope")):
+        st, r, _ = reboot(key)
+        check(f"Reboot {label} answers 403 with the policy text", st == 403 and r["error"] == POLICY, (st, r))
+    stop_gate()
+    st, r, _ = reboot()
+    check("Reboot answers 403 when the gate does not answer (fails closed)", st == 403 and "Cannot verify the Starfleet key" in r["error"], (st, r))
+    start_gate()
+    check("none of the three asked the host anything", ssh_times("reboot") == [] and scheduled() == [] and rb()["state"] == "idle", rb())
+
+    def refused(why, text, asks_host):
+        n = len(ssh_times("reboot"))
+        st, r, _ = reboot()
+        check(f"{why}: 409, and nothing was scheduled, rebooted or changed", st == 409 and r["error"] == text and scheduled() == [] and reboots() == []
+              and boot_id() == old and rb()["state"] == "idle" and len(ssh_times("reboot")) == n + asks_host, (st, r, rb()))
+
+    (HOST / "scan-delay").write_text("4")
+    must(call("POST", SCAN)[1].get("started"), "no scan started")
+    must(until(lambda: (u := view()["scan"]) and u["busy"], 10), "the scan is not busy")
+    refused("a scan is running", "A scan is running. Try again in a moment.", False)
+    must(until(lambda: (u := view()["scan"]) and u["at"] and not u["busy"], 20), "the scan did not end")
+    (HOST / "scan-delay").write_text("0")
+    flag("apt-lock", True)
+    refused("apt holds its lock (the fuser stand-in says so)", E_APT, True)
+    flag("apt-lock", False)
+    flag("fuser-broken", True)                           # sudo cannot run fuser and says 1: the word for "no process holds a lock"
+    st, r, _ = reboot()
+    check("a lock check that cannot be made is no all-clear: 502 with the fixed text, nothing was scheduled, rebooted or changed", st == 502
+          and r["error"] == "Defiant did not accept the reboot request." and scheduled() == [] and reboots() == [] and boot_id() == old and rb()["state"] == "idle", (st, r))
+    flag("fuser-broken", False)
+    flag("active-fleet-reboot.timer", True)
+    refused("a reboot timer is already pending on the host", "A reboot is already running.", True)
+    flag("active-fleet-reboot.timer", False)
+    (HOST / "ssh-down-until").write_text(str(int(time.time()) + 4))
+    st, r, _ = reboot()
+    check("a Defiant that does not answer gets 502 and a fixed text, and nothing was scheduled or changed", st == 502 and r["error"] == "Defiant did not accept the reboot request."
+          and scheduled() == [] and reboots() == [] and rb()["state"] == "idle", (st, r))
+    time.sleep(4.5)
+    job(rc=0, delay=12, per=2)
+    must(install()[0] == 200, "the install was refused")
+    refused("an install is running that Fleet started", E_INSTALL, False)
+    stop_fleet()
+    STATE.unlink(missing_ok=True)
+    start_fleet()
+    check("a Fleet that lost its state does not know of the unit", view()["job"]["state"] == "idle", view()["job"])
+    refused("an install is running that Fleet does not know of: the host says so", E_INSTALL, True)
+    must(until(lambda: "FLEET-APT-EXIT" in (HOST / "var/log/fleet-apt-upgrade.log").read_text(), 30), "the install did not end")
+    check("all in all nothing was scheduled, the host never rebooted and no Telegram message was sent", scheduled() == [] and reboots() == []
+          and boot_id() == old and reboot_failures() == [], (scheduled(), reboots()))
+    flag("systemd-run-fails", True)                      # last, because it is the one refusal that reaches the host's systemd-run
+    st, r, _ = reboot()
+    check("a Defiant that cannot start the timer gets 502 and a fixed text, and nothing was rebooted or changed", st == 502 and r["error"] == "Defiant did not accept the reboot request."
+          and len(scheduled()) == 1 and reboots() == [] and rb()["state"] == "idle" and boot_id() == old, (st, r, scheduled()))
+    check("no refusal and no failed start leaves anything in the Messages list: a reboot writes an entry only once it runs", trail_is(), trail_raw())
+
+
+def story_reboot_no_answer():
+    """A start that gets no answer: Defiant sets the timer, but the call does not return (the stand-in systemd-run hangs), so Fleet gives up after
+    its 30 s. The host reboots all the same. Fleet must say that it may still reboot (not "did not start") and must not allow a second reboot."""
+    reset(FIRST=3600)
+    RB.update(REBOOT_POLL_S=1)
+    host_reboot(down=4)
+    flag("systemd-run-hangs", True)
+    start_fleet()
+    t0 = time.time()
+    st, r, _ = reboot()
+    check("a start that gets no answer within 30 s answers 502 with the fixed text that says Defiant may still reboot", st == 502 and r["error"] == E_UNSURE
+          and 29 <= time.time() - t0 < 45, (st, r, time.time() - t0))
+    check("Defiant had set the timer all the same, and the host rebooted", len(scheduled()) == 1 and until(lambda: reboots() == ["rebooted"], 15), (scheduled(), reboots()))
+    check("Fleet shows no reboot (it never saw one), and sent no message", rb()["state"] == "idle" and telegram() == [], (rb(), telegram()))
+    st, r2, _ = reboot()
+    check("a second click a moment later answers 409 and schedules nothing more: the first one took effect", st == 409 and r2["error"] == E_GAP
+          and len(scheduled()) == 1 and reboots() == ["rebooted"], (st, r2))
+    check("nothing in the Messages list either: Fleet never saw this reboot run", trail_is(), trail_raw())
+    time.sleep(max(0, 35 - (time.time() - t0)))          # the hung stand-in call ends before the next story resets the host folder
+
+
+def story_reboot_unsure_restart():
+    """A start that got no answer holds the button back for REBOOT_GAP, and that hold is saved: a Fleet that restarts inside the gap (it is deployed
+    often) still refuses a second reboot and schedules nothing more, while the made-up host really did reboot after the first request. The gap is
+    shortened to a minute in test code only; once it is over, the button works again."""
+    reset(FIRST=3600)
+    RB.update(REBOOT_POLL_S=1, REBOOT_GAP=60)
+    host_reboot(down=4)
+    flag("systemd-run-hangs", True)
+    start_fleet()
+    t0 = time.time()
+    st, r, _ = reboot()
+    check("a start that gets no answer within 30 s answers 502 with the fixed text that says Defiant may still reboot", st == 502 and r["error"] == E_UNSURE
+          and 29 <= time.time() - t0 < 45, (st, r, time.time() - t0))
+    check("Defiant had set the timer all the same, and the host rebooted", len(scheduled()) == 1 and until(lambda: reboots() == ["rebooted"], 15), (scheduled(), reboots()))
+    hold = lambda: saved().get("reboot_unsure") if STATE.exists() else None         # the file is written when the hold is set, so it is there
+    mark = hold()
+    check("the hold is in the saved file, as the time of the request", isinstance(mark, (int, float)) and not isinstance(mark, bool) and t0 - 1 <= mark <= t0 + 10, (mark, t0))
+    stop_fleet()
+    flag("systemd-run-hangs", False)                     # the next start must answer; the hung call of the first ends by itself
+    start_fleet()
+    check("the restarted Fleet shows no reboot (it never saw one), and the saved file still holds the same time", rb()["state"] == "idle" and hold() == mark, (rb(), hold(), mark))
+    st, r2, _ = reboot()
+    check("a click inside the gap answers 409 with the gap's sentence, asks the host nothing, and schedules nothing more", st == 409 and r2["error"] == E_GAP
+          and len(scheduled()) == 1 and len(ssh_times("reboot")) == 1 and reboots() == ["rebooted"], (st, r2, scheduled(), ssh_times("reboot")))
+    time.sleep(max(0, (mark or t0) + 61 - time.time()))      # the gap, counted from the first request, is over
+    st, r3, _ = reboot()
+    must(st == 200, f"the button did not work after the gap: {st} {r3}")
+    done = reboot_over()
+    check("after the gap the button reboots Defiant: done, started by the button, two reboots and two timers in all", done["state"] == "done" and done["auto"] is False
+          and done["error"] is None and reboots() == ["rebooted", "rebooted"] and len(scheduled()) == 2, (done, reboots(), scheduled()))
+    check("the Messages list has only this reboot's two entries: the first one was never seen to run", trail_is(R_START, R_DONE), trail_raw())
+
+
+def story_reboot_mid_start_restart():
+    """A restart of Fleet while the start call is on its way: Defiant has set the timer (the stand-in systemd-run does, then hangs) and Fleet is stopped before it gets
+    the answer, with no cleanup, as a deploy stops it. The hold is in the saved file already (it is written before Defiant is asked), so the restarted Fleet answers a
+    click with 409 and schedules nothing more, while the made-up host really reboots after the first request. The gap is shortened to a minute in test code only."""
+    reset(FIRST=3600)
+    RB.update(REBOOT_POLL_S=1, REBOOT_GAP=60)
+    host_reboot(down=4)
+    flag("systemd-run-hangs", True)
+    start_fleet()
+    t0, answers = time.time(), []
+
+    def press():
+        try:
+            answers.append(reboot())
+        except Exception as e:                           # Fleet is stopped under the call: the connection is cut, and no answer comes
+            answers.append(type(e).__name__)
+    threading.Thread(target=press, daemon=True).start()
+    must(until(lambda: len(scheduled()) == 1, 15, 0.1), "Defiant never got the request")
+    hold = lambda: saved().get("reboot_unsure") if STATE.exists() else None         # None: no file yet
+    mark = hold()
+    check("while the call is on its way, the saved file already holds the hold as the time of the request, and no reboot is running", isinstance(mark, (int, float))
+          and not isinstance(mark, bool) and t0 - 1 <= mark <= t0 + 10 and saved()["reboot"]["state"] == "idle" and answers == [], (mark, t0, answers))
+    stop_fleet()                                         # a stop runs no cleanup: only what the file holds is left
+    flag("systemd-run-hangs", False)                     # the next start must answer; the hung call of the first ends by itself
+    start_fleet()
+    check("the restarted Fleet shows no reboot (it never saw one), and the saved file still holds the same time", rb()["state"] == "idle" and hold() == mark, (rb(), hold(), mark))
+    st, r2, _ = reboot()
+    check("a click right after the restart answers 409 with the gap's sentence, asks the host nothing, and schedules nothing more", st == 409 and r2["error"] == E_GAP
+          and len(scheduled()) == 1 and len(ssh_times("reboot")) == 1, (st, r2, scheduled(), ssh_times("reboot")))
+    check("the host rebooted after the first request all the same, once, and the call that the stop cut off got no answer", until(lambda: reboots() == ["rebooted"], 15)
+          and reboots() == ["rebooted"] and until(lambda: answers, 5) and isinstance(answers[0], str), (reboots(), answers))
+    check("Fleet never saw that reboot run: no Telegram message, and nothing in the Messages list", telegram() == [] and trail_is(), (telegram(), trail_raw()))
+    time.sleep(max(0, 36 - (time.time() - t0)))         # the hung stand-in call ends before the next story resets the host folder
+
+
+def story_reboot_scan_race():
+    """The worker has decided to scan, and a reboot is requested before the scan starts: the two must not run together (a scan would ask a host that is
+    going down). Test code makes that moment last SCAN_LAG seconds (it leaves a marker when it begins) and the button is pressed inside it. The scan
+    that was decided on must not start while the reboot runs; it runs after it."""
+    reset(FIRST=3, EVERY=3600, RETRY=3600)
+    RB.update(REBOOT_POLL_S=1, SCAN_LAG=6)
+    host_reboot(down=8)
+    (SBX / "scan-decided").unlink(missing_ok=True)
+    start_fleet()
+    must(until(lambda: (SBX / "scan-decided").exists(), 30, 0.1), "the worker never decided to scan")
+    st, r, _ = reboot()
+    must(st == 200, f"the reboot was refused: {st} {r}")
+    check("the request came in the moment between the decision and the scan: no scan had started, and the host was told to reboot", ssh_times("scan") == []
+          and ssh_times("scan", "down") == [] and len(ssh_times("reboot")) == 1 and rb()["state"] == "running", (ssh_times("scan"), rb()))
+    done = reboot_over(60)
+    check("the reboot ended done, and from the request to the end no scan was started or tried: only the reboot's own calls reached the host",
+          done["state"] == "done" and ssh_kinds(r["started_at"], done["ended_at"]) <= {"reboot", "rpoll", "probe"}, (done, ssh_kinds(r["started_at"], done["ended_at"])))
+    u = must(until(lambda: (v := view()) and v["scan"] and v["scan"]["at"] and not v["scan"]["busy"] and v, 45), "the scan that was decided on never ran")
+    check("the scan that was skipped follows the reboot: it started after the reboot ended, and the reboot flag is gone", len(ssh_times("scan")) >= 1
+          and min(ssh_times("scan")) > done["ended_at"] and u["scan"]["at"] > done["ended_at"] and u["scan"]["error"] is None, (ssh_times("scan"), done["ended_at"], u["scan"]))
+
+
+def story_reboot_never():
+    """A host that ignores the reboot stays on its boot id: after REBOOT_START_WAIT (shortened here) the reboot is failed, with the fixed text
+    and one Telegram message, and it stays failed. The button works again afterwards."""
+    reset(FIRST=3600)
+    RB.update(REBOOT_POLL_S=1, REBOOT_START_WAIT=8, REBOOT_GAP=5)
+    host_reboot(never=True)
+    start_fleet()
+    old = boot_id()
+    st, r, _ = reboot()
+    must(st == 200, f"the reboot was refused: {st} {r}")
+    f = must(until(lambda: (v := rb())["state"] == "failed" and v, 40, 0.5), "the reboot did not fail")
+    check("it ends failed with the fixed text: Defiant never went down and kept its boot id", f["error"] == E_SAME_BOOT and f["down_at"] is None
+          and f["back_after"] is None and f["ended_at"] - f["started_at"] > 8 and reboots() == ["ignored"] and boot_id() == old, f)
+    must(until(reboot_failures, 15), "no failure message")
+    time.sleep(6)                                       # more polls must not send it again, move the state or rescan
+    t = telegram()
+    check("exactly one Telegram message: the headline, a blank line and the error, nothing after it (the error says where to look)", t == [reboot_text(E_SAME_BOOT)] and len(t[0]) < 3500
+          and t[0].split("\n")[0] == "Defiant: reboot failed" and t[0].endswith("check it in your hosting provider's console.") and chr(0x2014) not in t[0], t)
+    check("the same failure is in the Messages list once: the start, then the failure with the error cut at a word (140 characters at most)",
+          trail_is(R_START, R_SAME_BOOT) and len(trail_raw()[1][1]) <= 140, trail_raw())
+    check("the failed reboot stays as it was, and no rescan follows it", rb() == f and ssh_times("scan") == [], rb())
+    host_reboot(down=4)                                 # the host reboots this time
+    st, r, _ = reboot()
+    check("the button works again after a failed reboot", st == 200, (st, r))
+    done = reboot_over()
+    check("the new reboot ends done and replaces the failure", done["state"] == "done" and done["error"] is None and boot_id() != old
+          and reboots() == ["ignored", "rebooted"], done)
+    check("... with no further message, and its own two entries in the Messages list after the failure's", len(telegram()) == 1
+          and trail_is(R_START, R_SAME_BOOT, R_START, R_DONE), (telegram(), trail_raw()))
+
+
+def story_reboot_giveup():
+    """A host that goes down and does not come back: after REBOOT_GIVEUP (shortened here) the reboot is failed, with one Telegram message. A
+    Defiant that answers again later does not undo that: only a running reboot moves."""
+    reset(FIRST=3600)
+    RB.update(REBOOT_POLL_S=1, REBOOT_GIVEUP=10)
+    host_reboot(down=100000)
+    start_fleet()
+    st, r, _ = reboot()
+    must(st == 200, f"the reboot was refused: {st} {r}")
+    f = must(until(lambda: (v := rb())["state"] == "failed" and v, 40, 0.5), "the reboot did not fail")
+    check("it ends failed: Defiant went down and did not answer again", f["error"] == E_GIVEUP and f["down_at"] and f["back_after"] is None
+          and f["ended_at"] - f["started_at"] > 10 and reboots() == ["rebooted"], f)
+    must(until(reboot_failures, 15), "no failure message")
+    check("one Telegram message: the headline, a blank line and the error", telegram() == [reboot_text(E_GIVEUP)], telegram())
+    check("the Messages list has the start and the failure, once each", trail_is(R_START, R_GIVEUP), trail_raw())
+    (HOST / "ssh-down-until").write_text(str(int(time.time())))        # Defiant answers again, on its new boot id
+    time.sleep(4)
+    check("a Defiant that answers again later does not undo it, and nothing more is sent or written", rb() == f and len(telegram()) == 1 and trail_is(R_START, R_GIVEUP),
+          (rb(), trail_raw()))
+
+
+def story_reboot_restart():
+    """Fleet restarts in the middle of a reboot, while Defiant is down: it picks the reboot up from its saved state and sees it through, counted from
+    the original request. A scan is due every few seconds in this story, and none may start until the reboot is over."""
+    reset(FIRST=2, EVERY=3, RETRY=3)
+    RB.update(REBOOT_POLL_S=1)
+    pending_reboot()
+    host_reboot(down=10)
+    start_fleet()
+    must(until(lambda: view()["scan"] and view()["scan"]["at"], 20), "no first scan")
+    st, r, _ = reboot_when_idle()
+    x = must(until(lambda: (v := rb())["down_at"] and v, 30, 0.5), "Fleet never saw Defiant go down")
+    stop_fleet()
+    time.sleep(2)                                       # Fleet is away while Defiant is down
+    start_fleet()
+    y = rb()
+    check("after the restart the reboot is running, with the times it was saved with", y["state"] == "running" and y["started_at"] == r["started_at"]
+          and y["down_at"] == x["down_at"] and y["auto"] is False, (y, x))
+    done = reboot_over()
+    check("Fleet sees it through: done, counted from the original request", done["state"] == "done" and done["started_at"] == r["started_at"]
+          and done["back_after"] >= 11 and done["error"] is None, done)
+    check("no scan and no install poll started from the request to the end, although a scan was due all the time",
+          ssh_kinds(r["started_at"], done["ended_at"]) <= {"reboot", "rpoll", "probe"}, ssh_kinds(r["started_at"], done["ended_at"]))
+    u = must(until(lambda: (v := view()) and v["scan"]["at"] > done["ended_at"] and not v["scan"]["busy"] and v, 30), "no rescan after the reboot")
+    check("the rescan follows at once, and the reboot flag is gone", u["scan"]["reboot_required"] is False and len(telegram()) == 1 and reboot_failures() == [], telegram())
+    check("the Messages list has the start (written before the restart) and the end (after it), once each, with the seconds counted from the original request",
+          trail_is(R_START, R_DONE) and trail_raw()[1] == ("Defiant rebooted", f"Defiant answered again with a new boot after {done['back_after']} seconds."), trail_raw())
+
+
+def story_reboot_after_install():
+    """The reboot after an install: an install that leaves a reboot pending is followed by a reboot that Fleet starts by itself, in the tick that records the end of the
+    install, without a second key check and without the gap (a reboot by the button just before would refuse another by the button). The
+    rescan follows the reboot, not the install."""
+    reset(FIRST=3600)
+    RB.update(REBOOT_POLL_S=1)                          # REBOOT_GAP stays Fleet's own: ten minutes
+    sim("many")
+    start_fleet()
+    scan_now()
+    must(until(telegram, 10), "no alert for the security updates")
+    host_reboot(down=4)
+    st, r, _ = reboot()                                 # a reboot by the button first: the gap is open from now on
+    must(st == 200, f"the reboot was refused: {st} {r}")
+    first = reboot_over()
+    must(first["state"] == "done", first)
+    must(until(lambda: (v := view()) and v["scan"]["at"] > first["ended_at"] and not v["scan"]["busy"]), "no rescan after the first reboot")
+    st, r2, _ = reboot()
+    check("the gap is open: a second Reboot by the button answers 409", st == 409 and r2["error"] == E_GAP, (st, r2))
+    check("the button's reboot left its two entries in the Messages list", trail_is(R_START, R_DONE), trail_raw())
+
+    host_reboot(down=6)
+    job(rc=0, delay=6, per=2, reboot=1, after="quiet")
+    checks, calls = len(key_checks()), len(host_calls("systemd-run"))
+    st, r, _ = install()
+    must(st == 200, f"the install was refused: {st} {r}")
+    j = must(until(lambda: (v := view()) and v["job"]["state"] != "running" and v["job"], 40, 0.5), "the install did not end")
+    check("the install ends done and says that a reboot is needed", j["state"] == "done" and j["exit"] == 0 and j["reboot_required"] is True, j)
+    x = must(until(lambda: (v := rb())["auto"] and v, 20, 0.2), "Fleet did not reboot Defiant after the install")
+    t_start = ssh_times("reboot")[1]                    # the first was the button's
+    t_poll = max(t for t in ssh_times("poll", "END") if t < t_start)
+    check("Fleet started the reboot by itself, in spite of the gap: auto, running, and the call after the poll that saw the install end", x["state"] == "running"
+          and x["down_at"] is None and "boot" not in x and t_start - t_poll < 4 and ssh_kinds(t_poll + 1e-4, t_start - 1e-4) == set(), (x, t_start - t_poll))
+    done = reboot_over()
+    check("it ends done, still marked as the install's, and the host rebooted", done["state"] == "done" and done["auto"] is True and done["error"] is None
+          and done["back_after"] >= 8 and reboots() == ["rebooted", "rebooted"] and saved()["reboot"]["auto"] is True, done)
+    check("the key was checked once for all this, at the install click: not for the automatic reboot", len(key_checks()) == checks + 1, key_checks()[checks:])
+    check("the host was told what the button tells it, once more: a timer for a plain systemctl reboot", len(scheduled()) == 2
+          and scheduled()[1].endswith(" systemd-run --unit=fleet-reboot --on-active=3s --timer-property=AccuracySec=1s --collect /bin/systemctl reboot") and len(host_calls("systemd-run")) == calls + 2, scheduled())
+    u = must(until(lambda: (v := view()) and v["scan"]["at"] > done["ended_at"] and not v["scan"]["busy"] and v, 30), "no rescan after the reboot")
+    check("the rescan follows the reboot: nothing to install, and the reboot flag cleared with it", u["scan"]["count"] == 0
+          and u["scan"]["reboot_required"] is False and u["critical"] is False, u["scan"])
+    check("no scan and no install poll ran from the start of the reboot to its end", ssh_kinds(t_start, done["ended_at"]) <= {"reboot", "rpoll", "probe"},
+          ssh_kinds(t_start, done["ended_at"]))
+    time.sleep(1.5)
+    check("no Telegram message for the install or the reboot: only the alert for the security updates", len(telegram()) == 1 and failures() == [] and reboot_failures() == [], telegram())
+    check("the install changed the host once", len(lines(HOST / "applied.log")) == 1 and view()["job"]["state"] == "done", lines(HOST / "applied.log"))
+    check("the automatic reboot wrote its own two entries after the button's: started by Fleet after the install, then rebooted",
+          trail_is(R_START, R_DONE, R_AUTO, R_DONE), trail_raw())
+
+
+def story_reboot_after_install_busy():
+    """The reboot after an install, when it cannot start: the nightly run takes the apt lock the moment the install ends. The reboot is failed with
+    the reason, one Telegram message says so, the install stays done, nothing is scheduled, and the button works again once apt is idle."""
+    reset(FIRST=3600)
+    RB.update(REBOOT_POLL_S=1)
+    job(rc=0, delay=4, per=2, reboot=1, lock=1, after="quiet")
+    start_fleet()
+    checks = len(key_checks())
+    st, r, _ = install()
+    must(st == 200, f"the install was refused: {st} {r}")
+    j = must(until(lambda: (v := view()) and v["job"]["state"] != "running" and v["job"], 40, 0.5), "the install did not end")
+    x = must(until(lambda: (v := rb())["state"] == "failed" and v, 20, 0.2), "the reboot did not fail")
+    check("the install is done and wants a reboot, and the reboot after it is failed", j["state"] == "done" and j["reboot_required"] is True
+          and view()["job"]["state"] == "done" and x["auto"] is True, (j, x))
+    check("it names the reason, never started and never saw Defiant go down", x["error"] == E_AUTO_APT and x["started_at"] is None and x["down_at"] is None
+          and x["back_after"] is None
+          and 0 <= x["ended_at"] - j["ended_at"] < 7, x)      # the poll that saw the install end (every 5 s, and the host's end time has whole seconds) is the one that fails the reboot
+    check("the host was asked once, said apt was busy, and was told nothing", len(ssh_times("reboot")) == 1 and len(host_calls("fuser")) == 1
+          and scheduled() == [] and reboots() == [], (scheduled(), reboots()))
+    must(until(reboot_failures, 15), "no failure message")
+    time.sleep(3)
+    check("exactly one Telegram message: the headline, a blank line and the reason (nothing after it)", telegram() == [reboot_text(E_AUTO_APT)], telegram())
+    check("the Messages list has one entry for it, the failure with the reason cut at a word (140 characters at most), and none for a start that never happened",
+          trail_is(R_AUTO_APT) and len(trail_raw()[0][1]) <= 140, trail_raw())
+    check("no second key check for the automatic start", len(key_checks()) == checks + 1, key_checks()[checks:])
+    flag("apt-lock", False)                             # apt is idle again
+    host_reboot(down=4)
+    must(until(lambda: not view()["scan"] or not view()["scan"]["busy"], 20), "a scan was still running")
+    st, r, _ = reboot_when_idle()
+    done = reboot_over()
+    check("the button reboots Defiant now, and its result replaces the failure", done["state"] == "done" and done["auto"] is False and done["error"] is None
+          and len(scheduled()) == 1 and reboots() == ["rebooted"] and len(telegram()) == 1, done)
+    check("... and its two entries follow the failure's in the Messages list", trail_is(R_AUTO_APT, R_START, R_DONE), trail_raw())
+
+
+def story_no_auto_reboot():
+    """The reboot after an install, the cases that must not reboot, with the click as the pages send it (the flag that announces the reboot is there, so it is the case
+    that decides): an install that needs no reboot, a failed install on a host that wants one, and the scan that then finds one (what the nightly
+    run leaves behind). The host's reboot script is never even asked."""
+    reset(FIRST=3600)
+    RB.update(REBOOT_POLL_S=1)
+    start_fleet()
+    scan_now()
+    job(rc=0, delay=3, per=2, after="quiet")
+    st, r, _ = install()
+    must(st == 200, f"the install was refused: {st} {r}")
+    j = must(until(lambda: (v := view()) and v["job"]["state"] != "running" and v["job"], 40, 0.5), "the install did not end")
+    must(until(lambda: (v := view()) and v["scan"]["at"] > j["ended_at"] and not v["scan"]["busy"]), "no rescan after the install")
+    check("an install that needs no reboot is done and followed by none", j["state"] == "done" and j["reboot_required"] is False
+          and rb()["state"] == "idle" and ssh_times("reboot") == [], (j, rb()))
+
+    pending_reboot()                                    # the host wants a reboot now, whoever left it
+    job(rc=100, delay=2, per=1)
+    st, r, _ = install()
+    must(st == 200, f"the install was refused: {st} {r}")
+    j = must(until(lambda: (v := view()) and v["job"]["state"] != "running" and v["job"], 40, 0.5), "the install did not end")
+    u = must(until(lambda: (v := view()) and v["scan"]["at"] > j["ended_at"] and not v["scan"]["busy"] and v, 30), "no rescan after the install")
+    must(until(lambda: len(telegram()) == 2, 15), "the failure and the reboot alert were not both sent")
+    scan_now()
+    time.sleep(4)                                       # a reboot would start in the tick that ended the install; give any later one time to show
+    check("a failed install on a host that wants a reboot is failed, and none follows", j["state"] == "failed" and j["reboot_required"] is True
+          and rb()["state"] == "idle" and ssh_times("reboot") == [] and scheduled() == [] and reboots() == [], (j, rb()))
+    check("the scans find the pending reboot and start nothing", u["scan"]["reboot_required"] is True and view()["scan"]["reboot_required"] is True
+          and rb()["state"] == "idle" and ssh_times("reboot") == [], (view()["scan"], rb()))
+    check("one Telegram message for the failed install and one for the pending reboot, none for a reboot", [t.split("\n")[0] for t in telegram()]
+          == ["Defiant: update install failed (exit 100)", "Defiant: reboot required"], telegram())
+    check("nothing about a reboot in the Messages list", trail_is(), trail_raw())
+
+
+def story_install_without_flag():
+    """Fleet reboots Defiant after an install only when the click announced it: the body {"reboot_ok": true}, which both pages send. A page that was open
+    before this existed (it shows the old confirm text and sends {}), a script, a flag that is not the boolean true and a body that is no object install as
+    before and are never followed by a reboot: the install ends done and says that a reboot is needed, the rescan shows it waiting, the alert for the pending
+    reboot is as always, and nothing is scheduled or written. Then the same install with the flag reboots, so the flag is what decides."""
+    reset(FIRST=3600)
+    RB.update(REBOOT_POLL_S=1)
+    start_fleet(push=True)                              # a ready push sender and a registered device: a push that a reboot caused would be recorded
+    push_device()
+    scan_now()
+    host_reboot(down=4)
+    for label, body in (("an older page's {}", {}), ('the string "true" for the flag', {"reboot_ok": "true"}), ("a list for a body", [True])):
+        job(rc=0, delay=3, per=2, reboot=1, after="quiet")
+        st, r, _ = install(body=body)
+        must(st == 200, f"the install with {label} was refused: {st} {r}")
+        j = must(until(lambda: (v := view()) and v["job"]["state"] != "running" and v["job"], 40, 0.5), "the install did not end")
+        u = must(until(lambda: (v := view()) and v["scan"]["at"] > j["ended_at"] and not v["scan"]["busy"] and v, 30), "no rescan after the install")
+        time.sleep(2)                                   # a reboot would start in the tick that ended the install; give any later one time to show
+        check(f"an install with {label} ends done and needs a reboot, and none follows: the reboot idle, nothing asked of the host or scheduled, the same boot",
+              j["state"] == "done" and j["exit"] == 0 and j["reboot_required"] is True and rb()["state"] == "idle" and rb()["auto"] is False
+              and ssh_times("reboot") == [] and scheduled() == [] and reboots() == [] and boot_id() == BOOT0, (j, rb()))
+        check("... and the scan after it shows the reboot waiting, with its packages, while the job stays done",
+              u["scan"]["reboot_required"] is True and sorted(u["scan"]["reboot_pkgs"]) == ["libc6", "linux-image-6.8.0-99-generic"] and u["job"]["state"] == "done", u["scan"])
+    t = telegram()
+    check("the alert for the pending reboot went out once, as always, and points at Reboot Defiant; no failure message", len(t) == 1 and t[0].split("\n")[0] == "Defiant: reboot required"
+          and t[0].split("\n")[-1] == "Reboot: Starfleet, Systems, Defiant, Reboot Defiant" and failures() == [] and reboot_failures() == [], t)
+    check("nothing about a reboot in the Messages list", trail_is(), trail_raw())
+
+    job(rc=0, delay=3, per=2, reboot=1, after="quiet")
+    st, r, _ = install()                                # the click as the pages send it: with the flag
+    must(st == 200, f"the install with the flag was refused: {st} {r}")
+    must(until(lambda: (v := rb())["auto"] and v, 40, 0.2), "Fleet did not reboot Defiant after the install that announced it")
+    done = reboot_over()
+    check("the same install with the flag is followed by the reboot Fleet starts itself: auto, done, one timer, the host on a new boot", done["state"] == "done"
+          and done["auto"] is True and done["error"] is None and reboots() == ["rebooted"] and len(scheduled()) == 1 and boot_id() != BOOT0, (done, reboots(), scheduled()))
+    u = must(until(lambda: (v := view()) and v["scan"]["at"] > done["ended_at"] and not v["scan"]["busy"] and v, 30), "no rescan after the reboot")
+    check("the rescan follows the reboot and the flag is gone; still only the one alert, and the reboot wrote its two entries", u["scan"]["reboot_required"] is False
+          and len(telegram()) == 1 and trail_is(R_AUTO, R_DONE), (u["scan"], telegram(), trail_raw()))
+    check("nothing was pushed to the phone for the reboot Fleet started, although the sender was ready and a device was registered", pushes() == [], pushes())
 
 
 def story_pages(page):
+    """The page script runs one reboot that Fleet starts after an install, one by hand that the host ignores (ten seconds are enough to call it failed), one by hand that works,
+    and an install whose own reboot cannot start because the nightly run takes the apt lock."""
     reset(FIRST=3600)
+    RB.update(REBOOT_POLL_S=1, REBOOT_START_WAIT=10, REBOOT_GAP=5)
     start_fleet()
     env = dict(os.environ, E2E_BASE=f"http://127.0.0.1:{PORT}", E2E_HOST=str(HOST), E2E_SIMS=json.dumps({k: str(v) for k, v in SIMS.items()}),
                OUT=os.environ.get("OUT", str(HERE / "out")))
-    r = subprocess.run(["node", str(HERE / "ui.js"), page], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=600)
+    r = subprocess.run(["node", str(HERE / "ui.js"), page], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=900)
     for line in r.stdout.splitlines():
         if line.startswith(("ok   ", "FAIL ")):
             results.append(line.startswith("ok   "))
         print(line, flush=True)
     if r.returncode and "FAIL " not in r.stdout:
         check(f"{page} page script ran", False, r.stdout[-600:])
+    check(f"{page} page: the host rebooted twice, once on its own account after the install and once by hand, and ignored one request", reboots() == ["rebooted", "ignored", "rebooted"]
+          and len(scheduled()) == 3 and boot_id() != BOOT0, (reboots(), scheduled()))
+    check(f"{page} page: the reboot that did not happen and the one that could not start sent one Telegram message each, those that worked none",
+          reboot_failures() == [reboot_text(E_SAME_BOOT), reboot_text(E_AUTO_APT)], reboot_failures())
+    check(f"{page} page: the Messages list has one entry for each start, end and failure, in order: the automatic reboot, the one the host ignored, the one that worked, "
+          "the one that could not start", trail_is(R_AUTO, R_DONE, R_START, R_SAME_BOOT, R_START, R_DONE, R_AUTO_APT), trail_raw())
 
 
 STORIES = [("sandbox", story_sandbox), ("security-push", story_security_push), ("security-message", story_security_message), ("scan-and-alerts", story_scan_and_alerts), ("rate-limit", story_rate_limit), ("schedule", story_schedule),
            ("install", story_install), ("install-guard", story_install_guard), ("install-removals", story_install_removals), ("install-failure", story_install_failure), ("ssh-drop", story_ssh_drop),
-           ("restart-mid-job", story_restart_mid_job), ("unit-unknown-to-fleet", story_unit_unknown_to_fleet), ("page-desktop", lambda: story_pages("desktop")),
-           ("page-phone", lambda: story_pages("phone"))]
+           ("restart-mid-job", story_restart_mid_job), ("unit-unknown-to-fleet", story_unit_unknown_to_fleet), ("reboot-button", story_reboot), ("reboot-refusals", story_reboot_refusals),
+           ("reboot-no-answer", story_reboot_no_answer), ("reboot-unsure-restart", story_reboot_unsure_restart), ("reboot-mid-start-restart", story_reboot_mid_start_restart), ("reboot-scan-race", story_reboot_scan_race),
+           ("reboot-never", story_reboot_never), ("reboot-giveup", story_reboot_giveup), ("reboot-restart", story_reboot_restart), ("reboot-after-install", story_reboot_after_install),
+           ("reboot-after-install-busy", story_reboot_after_install_busy), ("no-auto-reboot", story_no_auto_reboot), ("install-without-flag", story_install_without_flag),
+           ("page-desktop", lambda: story_pages("desktop")), ("page-phone", lambda: story_pages("phone"))]
 
 
 def main():
@@ -855,6 +1491,9 @@ def main():
             check("nothing reached out: curl never ran, and ssh was refused for every host but the made-up one", REACH["curl"] == 0,
                   REACH["curl"])
             print(f"   (Fleet's other workers asked ssh for {len(REACH['refused'])} other host(s) and were refused)")
+            asked = lines(GATE_LOG)
+            check("the gate was asked for nothing but the key check and the model lists, by GET, in the whole run", all(l.split()[0] == "GET" and l.split()[1] in ("/starfleet/check", "/v1/models", "/running")
+                  for l in asked), sorted({l for l in asked if l.split()[1] not in ("/starfleet/check", "/v1/models", "/running") or l.split()[0] != "GET"}))
             bad = tracebacks(FLEET_LOG.read_text() if FLEET_LOG.exists() else "")
             check("Fleet's own log has no traceback", not bad, bad[:1])
     finally:

@@ -338,6 +338,7 @@ body.fs #compview{height:calc(100vh - 36px)}
   border-radius:20px;padding:9px 26px;margin-top:10px;background:var(--orange);color:#000;cursor:pointer}
 .bigbtn:hover{background:var(--peach)} .bigbtn:disabled{opacity:.35;cursor:default}
 .bigbtn.armed{background:var(--red)}
+.bigbtn.warn{background:var(--amber)} .bigbtn.warn:hover{background:var(--peach)}   /* Reboot Defiant while a reboot is waiting: amber, red is for failure */
 .vnote{margin-top:8px;font-size:12px;color:var(--dim);text-transform:uppercase;letter-spacing:.06em;line-height:1.4}
 /* Defiant updates: package table, tags, install log */
 .stat.warn b{color:var(--amber)}
@@ -349,6 +350,7 @@ tr.secure td:first-child{border-left-color:var(--amber)}
 .updnote{border-left:8px solid var(--amber);background:#1a1204;color:var(--amber);padding:6px 14px;font-size:13px;
   letter-spacing:.06em;margin-top:8px}
 .updnote.bad{border-left-color:var(--red);background:#2a0d0d;color:var(--red)}
+.updnote.ok{border-left-color:var(--blue);background:#07131c;color:var(--blue)}
 #updbox>table{margin-top:10px}
 .joblog{margin:8px 0 0;padding:8px 12px;background:#000;border:1px solid var(--grid);color:var(--text);max-height:260px;overflow:auto;
   font:12px/1.45 ui-monospace,Menlo,Consolas,monospace;letter-spacing:0;white-space:pre-wrap;overflow-wrap:anywhere}
@@ -1967,7 +1969,8 @@ function defPaint(){
     <div class="node ${d.status==="ok"?"":d.status==="warn"?"warn":"crit"}"><h3>${esc(d.host||"Defiant")}</h3>
       <div class="mem">${d.uptime_s?ctrDur(d.uptime_s):"–"} <s>up</s></div>
       <div class="sub2">${esc(d.os||"")} · kernel ${esc(d.kernel||"")}</div>
-      <div class="stats">${chip("Cores",d.cpus||"–")}${chip("Load",esc(d.load||"–"))}${chip("Updates",d.upd?d.upd.count:d.updates??"–")}${chip("Reboot",d.reboot_required?"Required":"No")}</div></div>
+      <div class="stats">${chip("Cores",d.cpus||"–")}${chip("Load",esc(d.load||"–"))}${chip("Updates",d.upd?d.upd.count:d.updates??"–")}${chip("Reboot",d.reboot_required?"Required":"No")}</div>
+      <div id="rebbox">${rebHtml()}</div></div>
     <div class="node ${sc(Math.max(d.cpu_pct||0,memU||0))}"><h3>CPU and Memory</h3>
       <div class="mem">${d.cpu_pct??"–"} <s>% CPU</s></div>${hwGauge(d.cpu_pct||0)}
       <div class="free">Memory ${memU==null?"–":memU.toFixed(0)+" % used"} · ${d.mem_avail_kb?(d.mem_avail_kb/1048576).toFixed(1):"–"} of ${d.mem_total_kb?(d.mem_total_kb/1048576).toFixed(1):"–"} GiB free</div>${hwGauge(memU||0)}</div>
@@ -2002,10 +2005,14 @@ async function defPoll(){
 
 /* Updates block. Fleet runs an apt simulation on Defiant every hour and keeps the result in memory
    (/api/defiant/updates, no ssh in the request); Install updates (Starfleet key, second click) starts the real
-   upgrade as one detached job on the server. It never reboots and never touches a model. While a scan or the
-   install runs this block polls every 3 s, otherwise the 15 s loop above is enough. Package names, versions and
-   log lines come from the server: escaped everywhere. */
+   upgrade as one detached job on the server and never touches a model. When a reboot is needed afterwards, Fleet
+   reboots Defiant by itself, but only for a request that says reboot_ok (this page's confirm text announces it,
+   and the Reboot block below shows it too). While a scan, the install or a reboot runs
+   (and for up to 90 s after an install that left a reboot due, until Fleet's own reboot shows) this block polls
+   every 3 s, otherwise the 15 s loop above is enough. Package names, versions and log lines come from the
+   server: escaped everywhere. */
 let updLast=null, updErr="", updMsg="", updSig="", updTimer=null, updArmed=false, updArmT=null, updBusy=false, updInst=false, updGrace=0, updMark="", updArmedAt=0;
+let rebArmed=false, rebArmT=null, rebArmedAt=0, rebSend=false;   /* Reboot Defiant: asking (8 s), request out */
 const UPD_SVC=/^(docker|containerd|tailscale)/, UPD_BOOT=/^(linux-image|libc6$)/;   /* restart services / need a reboot */
 const plural=(n,w)=>n+" "+w+(n===1?"":"s");
 const updWho=u=>u&&u.scan?u.scan.at+"|"+u.scan.error_at:"";   /* changes when a scan finishes */
@@ -2015,13 +2022,14 @@ function updWhy(){   /* why Install is disabled, "" when it is not */
   const u=updLast, s=u&&u.scan;
   return !u||!u.configured?"Defiant is not configured."
     :(u.job||{}).state==="running"?"An install is running, progress below."
+    :rebRun(u)||rebSend?"A reboot is running, progress above."
     :updInst?"Starting the install..."
     :!s||!s.at?"No scan yet: scan first."
     :s.busy?"A scan is running, try again in a minute."
     :!s.count?"Nothing to install."
     :"";
 }
-function updJob(j,reboot){   /* reboot: the latest scan still wants one */
+function updJob(j,reboot,rb){   /* reboot: the latest scan still wants one and none is running; rb: the reboot, shown below an install that rebooted by itself */
   const log=(j.log||[]).map(esc).join("\n"), at=j.started_at?`started ${updT(j.started_at)} (${ago(j.started_at)})`:"";
   if(j.state==="running") return `<div class="node ${j.lost?"warn":""}" style="grid-column:1/-1"><h3>Installing updates</h3>
     <div class="sub2">${at} · log refreshes every 3 seconds</div>
@@ -2029,7 +2037,7 @@ function updJob(j,reboot){   /* reboot: the latest scan still wants one */
     <pre class="joblog">${log||"Waiting for the first line of output..."}</pre></div>`;
   if(j.state==="done") return `<div class="node ${reboot?"warn":""}" style="grid-column:1/-1"><h3>Install finished</h3>
     <div class="sub2">${j.ended_at?"finished "+ago(j.ended_at)+" · ":""}${j.installed!=null?"installed "+plural(+j.installed||0,"package")+" · ":""}reboot required afterwards: ${j.reboot_required==null?"unknown":j.reboot_required?"yes":"no"}</div>
-    ${reboot?`<div class="vnote">Reboot Defiant when it suits you. The Install updates button never reboots.</div>`:""}</div>`;
+    ${reboot?`<div class="vnote">A reboot is waiting. Use Reboot Defiant when it suits you.</div>`:""}</div>${rebOwn(rb,j)?rebLine(rb,1):""}`;
   if(j.state==="failed") return `<div class="node crit" style="grid-column:1/-1"><h3>Install failed${j.exit!=null?" (exit "+esc(j.exit)+")":""}</h3>
     <div class="sub2">${at}${j.ended_at?" · ended "+ago(j.ended_at):""}</div>
     <pre class="joblog">${log||"No log lines."}</pre></div>`;
@@ -2039,13 +2047,14 @@ function updHtml(){
   const u=updLast, bad=updErr?`<div class="updnote bad">${esc(updErr)}</div>`:"";
   if(!u||!u.configured) return bad;
   const s=u.scan||{}, j=u.job||{}, ok=!!s.at, pk=s.packages||[], rm=s.remove||[], df=s.deferred||[], bp=s.reboot_pkgs||[];
-  const n=+s.count||0, sec=+s.security||0, run=j.state==="running", scanning=!!s.busy||updBusy||Date.now()<updGrace, why=updWhy();
+  const n=+s.count||0, sec=+s.security||0, run=j.state==="running", rb=rebRun(u), scanning=!!s.busy||updBusy||Date.now()<updGrace, why=updWhy();
   const names=pk.map(p=>p.name), fam=(re,l)=>[...new Set(l.map(x=>(String(x).match(re)||[])[1]).filter(Boolean))];
   const svc=fam(UPD_SVC,names), reb=fam(UPD_BOOT,names), armed=updArmed&&!why;
   const ask=`Install ${plural(n,"update")}${sec?` (${sec} security)`:""} on Defiant now?`+
     (rm.length?`<br>Removes ${plural(rm.length,"package")}: <span class="lc">${rm.slice(0,6).map(esc).join(", ")}${rm.length>6?", +"+(rm.length-6)+" more":""}</span>.`:"")+
     (svc.length?`<br>Restarts services (<span class="lc">${svc.join(", ")}</span>): the sites can be unreachable for a few seconds.`:"")+
-    (reb.length?`<br>Needs a reboot afterwards (<span class="lc">${reb.join(", ")}</span>). This button never reboots.`:"")+"<br>Click again to start.";
+    (reb.length?`<br>Needs a reboot afterwards (<span class="lc">${reb.join(", ")}</span>).`:"")+
+    "<br>"+(s.reboot_required?"A reboot is already waiting, so Defiant reboots by itself right after this install, and the sites are unreachable for about a minute.":"If a reboot is needed afterwards, Defiant reboots by itself and the sites are unreachable for about a minute.")+"<br>Click again to start.";
   const rows=sorted("updpkg",pk,{name:p=>p.name,from:p=>p.from,to:p=>p.to,suite:p=>(p.suites||[])[0],kind:p=>p.security?2:p.third_party?1:0});
   return `<div class="sec"><div class="cap"></div><h2>Updates${ok?" · "+n:""}</h2><div class="rule"></div></div>${bad}
   <div class="nodes">
@@ -2059,12 +2068,12 @@ function updHtml(){
       <div class="mem">${scanning?"Scanning...":ok?`<s>next scan</s> ${until(s.next_at)}`:"No scan yet"}</div>
       <div class="sub2">${ok?`Last scan ${updT(s.at)} (${ago(s.at)}) · next ${updT(s.next_at)}`:scanning?"Looking for updates on Defiant":s.error?`Fleet tries again at ${updT(s.next_at)}`:"The first scan runs shortly after Fleet starts"}</div>
       ${s.error?`<div class="err">Scan failed${s.error_at?" "+ago(s.error_at):""}${ok?", showing the last good scan":""}: ${esc(s.error)}</div>`:""}
-      <button class="bigbtn" ${scanning||run?"disabled":""} onclick="updScan()" title="Look for updates on Defiant now. A scan installs nothing.">${scanning?"Scanning...":"Scan now"}</button>
-      <div class="vnote">${run?"Scans again by itself when the install ends.":"Fleet scans every hour. A scan only looks, it installs nothing. Security updates and a pending reboot are sent once to Telegram."}</div></div>
+      <button class="bigbtn" ${scanning||run||rb?"disabled":""} onclick="updScan()" title="Look for updates on Defiant now. A scan installs nothing.">${scanning?"Scanning...":"Scan now"}</button>
+      <div class="vnote">${run?"Scans again by itself when the install (and a reboot after it) is done.":rb?"Scans again by itself when Defiant is back.":"Fleet scans every hour. A scan only looks, it installs nothing. Security updates and a pending reboot are sent once to Telegram."}</div></div>
     <div class="node"><h3>Install Updates</h3>
-      <button class="bigbtn${armed?" armed":""}" ${why?"disabled":""} onclick="updInstall()" title="Install everything in the list below on Defiant (Starfleet key, click twice). Never reboots.">${updInst?"Starting...":run?"Installing...":armed?"Sure? Install "+plural(n,"update"):"Install updates"}</button>
-      <div class="vnote">${why?why:armed?ask:"Installs everything in the list below, then scans again. Needs the Starfleet key. Never reboots."}</div></div>
-    ${updJob(j,s.reboot_required)}
+      <button class="bigbtn${armed?" armed":""}" ${why?"disabled":""} onclick="updInstall()" title="Install everything in the list below on Defiant (Starfleet key, click twice). If a reboot is needed afterwards, Fleet reboots Defiant.">${updInst?"Starting...":run?"Installing...":armed?"Sure? Install "+plural(n,"update"):"Install updates"}</button>
+      <div class="vnote">${why?why:armed?ask:"Installs everything in the list below, then scans again. Needs the Starfleet key. If a reboot is needed afterwards, Fleet reboots Defiant."}</div></div>
+    ${updJob(j,s.reboot_required&&!rb,u.reboot)}
   </div>
   ${rm.length?`<div class="updnote">The install removes ${plural(rm.length,"package")}: <span class="lc">${rm.map(esc).join(", ")}</span></div>`:""}
   ${pk.length?`<table data-table="updpkg"><thead><tr><th data-sort="name">Package</th><th data-sort="from">Installed</th><th data-sort="to">New version</th>
@@ -2074,7 +2083,7 @@ function updHtml(){
     <td>${p.security?`<span class="tag k-sec">Security</span>`:""}${p.third_party?`<span class="tag k-3p" title="Not from Ubuntu${p.origin?": "+esc(p.origin):""}">Third party</span>`:""}</td></tr>`).join("")}${
     n>pk.length?`<tr><td colspan="5" class="empty">+${n-pk.length} more not listed</td></tr>`:""}</tbody></table>`:""}`;
 }
-function updPaint(){ const el=document.getElementById("updbox"); if(!el) return; el.innerHTML=updHtml(); sortMarks(); updPin(); }
+function updPaint(){ const el=document.getElementById("updbox"); if(!el) return; el.innerHTML=updHtml(); rebPaint(); sortMarks(); updPin(); }
 async function updPoll(){
   clearTimeout(updTimer);
   if(!defOn) return;
@@ -2083,9 +2092,9 @@ async function updPoll(){
   if(!defOn) return;
   const u=updLast;
   if(u&&((u.scan&&u.scan.busy)||(u.job||{}).state==="running"||updWho(u)!==updMark)) updGrace=0;   /* the real state takes over */
-  const sig=JSON.stringify([u,updErr,Date.now()<updGrace],(k,v)=>k==="now"?0:v);
+  const sig=JSON.stringify([u,updErr,Date.now()<updGrace,rebRun(u)?Math.floor(Date.now()/1000):0],(k,v)=>k==="now"?0:v);   /* a running reboot repaints every poll: its seconds count up */
   if(sig!==updSig){ updSig=sig; updPaint(); }
-  if(u&&u.configured&&(!u.scan||u.scan.busy||(u.job||{}).state==="running"||Date.now()<updGrace)) updTimer=setTimeout(updPoll,3000);
+  if(u&&u.configured&&(!u.scan||u.scan.busy||(u.job||{}).state==="running"||rebRun(u)||rebWait(u)||Date.now()<updGrace)) updTimer=setTimeout(updPoll,3000);
 }
 async function updScan(){
   if(updBusy) return;
@@ -2095,7 +2104,7 @@ async function updScan(){
     const j=await r.json().catch(()=>({}));
     if(!r.ok) throw new Error(j.error||("HTTP "+r.status));
     if(j.started){ updGrace=Date.now()+(updLast&&updLast.scan?8000:60000); updMark=updWho(updLast); }   /* until the worker reports busy; a first scan is not visible before it ends */
-    else toast(j.reason==="busy"?"A scan is already running.":"A scan ran a moment ago.");
+    else toast(j.reason==="busy"?"A scan is already running.":j.reason==="rebooting"?"A reboot is running.":"A scan ran a moment ago.");
   }catch(e){ updMsg="Scan now failed: "+e.message; }
   await updPoll(); updBusy=false; defPaint();
 }
@@ -2106,13 +2115,63 @@ async function updInstall(){
   if(Date.now()-updArmedAt<450) return;   /* a double click is not a confirmation */
   updArmed=false; clearTimeout(updArmT); updInst=true; updMsg=""; updPaint();
   try{
-    const r=await fetch("/api/defiant/updates/install",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"});
+    const r=await fetch("/api/defiant/updates/install",{method:"POST",headers:{"Content-Type":"application/json"},body:'{"reboot_ok":true}'});   /* the confirm text announced the reboot: Fleet reboots afterwards only for a request that says so */
     const j=await r.json().catch(()=>({}));
     if(r.status===403&&!/Cannot verify/i.test(j.error||"")) throw new Error("Starfleet key missing or wrong (enter it on the Shuttle Bay page, Save key)");   /* "Cannot verify": the gate did not answer, not the key's fault */
     if(!r.ok) throw new Error(j.error||("HTTP "+r.status));
     updGrace=Date.now()+8000; updMark=updWho(updLast);
   }catch(e){ updMsg="Install updates failed: "+e.message; }
   await updPoll(); updInst=false; defPaint();
+}
+
+/* Reboot Defiant (Server block). "reboot" in /api/defiant/updates is idle, running (Fleet sees Defiant go down and
+   come back; polled every 3 s like a running install), done (shown for 10 minutes) or failed (shown until the next
+   reboot). Starfleet key, second click. It reboots the whole machine: the sites are down for about a minute. An
+   install that needs a reboot starts one by itself (reboot.auto): its lines show under the install panel too. An
+   older Fleet sends no "reboot" and the page then has no button. Everything from the server is escaped. */
+const REB_SHOW=600;   /* seconds a finished reboot stays on screen */
+const rebRun=u=>!!u&&!!u.reboot&&u.reboot.state==="running";
+const rebOwn=(r,j)=>!!r&&!!r.auto&&(r.started_at||r.ended_at||0)>=(j.ended_at||0)-5;   /* the reboot this install started by itself (it came right after it), not an older one */
+const rebWait=u=>{ const j=(u&&u.job)||{}; return !!u&&!!u.reboot&&u.reboot.state==="idle"&&j.state==="done"&&j.reboot_required===true&&(u.now||0)-(j.ended_at||0)<90; };   /* an install just ended with a reboot due: Fleet starts it by itself within seconds, ask again soon */
+const rebClock=t=>new Date(t*1000).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit",second:"2-digit",hour12:false});
+const rebNb=s=>esc(s).replace(/\(?\b\d+ s\b\)?/g,m=>`<span style="white-space:nowrap">${m}</span>`);   /* "(62 s)" stays on one line */
+function rebLine(r,bar){   /* the running, finished or failed reboot as a note; bar: full width, under the install panel */
+  const t=Date.now()/1000, w=r.state==="running"?(r.down_at?`Rebooting. Defiant has been down since ${rebClock(r.down_at)} (${Math.max(0,Math.round(t-r.down_at))} s).`:"Rebooting. Waiting for Defiant to go down.")
+    :r.state==="done"&&t-r.ended_at<REB_SHOW?`Defiant rebooted and answered again after ${Math.round(+r.back_after||0)} s.`
+    :r.state==="failed"?r.error||"The reboot failed.":"";
+  return w?`<div class="updnote${r.state==="done"?" ok":r.state==="failed"?" bad":""}"${bar?' style="grid-column:1/-1;margin-top:0"':""}>${rebNb(w)}</div>`:"";
+}
+function rebWhy(){   /* why Reboot is disabled, "" when it is not (Fleet answers 409 to a reboot during an install or a scan) */
+  const u=updLast;
+  return !u||!u.configured||!u.reboot?"Defiant is not configured.":rebRun(u)?"A reboot is running.":rebSend?"Starting the reboot..."
+    :(u.job||{}).state==="running"?"An install is running, progress below.":updInst?"Starting the install..."
+    :(u.scan||{}).busy||updBusy?"A scan is running, try again in a minute.":"";
+}
+function rebHtml(){
+  const u=updLast, r=u&&u.reboot; if(!u||!u.configured||!r) return "";
+  const s=u.scan||{}, bp=s.reboot_pkgs||[], n=((defLast||{}).sites||[]).length, run=rebRun(u), why=rebWhy(), armed=rebArmed&&!why;
+  const ask="This reboots the whole Defiant server. "+(n?plural(n,"site"):"The sites")+" and all containers are unreachable for about a minute, and Fleet cannot reach Defiant until it is back."+
+    (s.reboot_required&&bp.length?` A reboot is waiting for: <span class="lc">${bp.slice(0,4).map(esc).join(", ")}${bp.length>4?" and "+(bp.length-4)+" more":""}</span>.`:"");
+  return `<button class="bigbtn${armed?" armed":s.reboot_required?" warn":""}" ${why?"disabled":""} onclick="rebReboot()" title="Reboot the whole Defiant server (Starfleet key, click twice).">${rebSend?"Starting...":run?"Rebooting...":armed?"Sure? Reboot Defiant":"Reboot Defiant"}</button>
+    ${rebLine(r)}${run?"":`<div class="vnote">${why?why:armed?ask:"Reboots the whole server. All sites are unreachable for about a minute. Needs the Starfleet key."}</div>`}`;
+}
+function rebPaint(){ const el=document.getElementById("rebbox"); if(el) el.innerHTML=rebHtml(); }
+async function rebReboot(){
+  if(rebWhy()) return;
+  if(!rebArmed){   /* first click: the button turns into "Sure?" and the warning shows, for 8 s */
+    rebArmed=true; rebArmedAt=Date.now(); clearTimeout(rebArmT); rebArmT=setTimeout(()=>{ rebArmed=false; rebPaint(); },8000); rebPaint(); return; }
+  if(Date.now()-rebArmedAt<450) return;   /* a double click is not a confirmation */
+  rebArmed=false; clearTimeout(rebArmT); rebSend=true; updMsg=""; updPaint();
+  try{
+    const r=await fetch("/api/defiant/reboot",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"});
+    const j=await r.json().catch(()=>({}));
+    if(r.status===409) toast(j.error||"Defiant cannot be rebooted right now.");   /* the server's reason, no failure of the page: neutral */
+    else{
+      if(r.status===403&&!/Cannot verify/i.test(j.error||"")) throw new Error("Starfleet key missing or wrong (enter it on the Shuttle Bay page, Save key)");   /* "Cannot verify": the gate did not answer, not the key's fault */
+      if(!r.ok) throw new Error(j.error||("HTTP "+r.status));
+    }
+  }catch(e){ updMsg="Reboot Defiant failed: "+e.message; }
+  await updPoll(); rebSend=false; defPaint();
 }
 
 
@@ -2321,7 +2380,7 @@ function setView(v){
   if(nasOn){ nasFit(); nasPoll(); } else clearTimeout(nasTimer);
   if(ctrOn) ctrPoll(); else clearTimeout(ctrTimer);
   if(maOn) maPoll(); else clearTimeout(maTimer);
-  if(defOn) defPoll(); else{ clearTimeout(defTimer); clearTimeout(updTimer); clearTimeout(updArmT); updArmed=false; }
+  if(defOn) defPoll(); else{ clearTimeout(defTimer); clearTimeout(updTimer); clearTimeout(updArmT); updArmed=false; clearTimeout(rebArmT); rebArmed=false; }
   if(compOn) compOpen(); else CV.stop();     /* leaving Computer ends the speech: its Stop button is not on screen any more */
   if(v==="wiki"){ if(window.wikiOpen) wikiOpen(); } else if(window.wikiClose) wikiClose();   /* vendor/memcore.js */
 }

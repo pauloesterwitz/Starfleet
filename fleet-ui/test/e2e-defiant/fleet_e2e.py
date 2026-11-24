@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Starts the real fleet.py for the end to end test. Fleet is imported, not copied: the only differences from a
 normal start are the intervals (seconds instead of minutes, from E2E_UPD_* and E2E_DEF_TTL, and the events worker's
-waits and reminder interval from E2E_EV_*, only when a story sets them), three probe workers
+waits and reminder interval and the reboot's waits from E2E_EV_* and E2E_REBOOT_*, only when a story sets them), a pause between the
+worker's decision to scan and the scan (E2E_SCAN_LAG, only when a story sets it: it makes the moment in which a reboot request can
+arrive long enough to hit), three probe workers
 that would look at this machine's containers and GPU, and the two ways out of the Messages system: a push is
 recorded in a file of the sandbox instead of being sent (the senders are replaced here, in test code), and the
 device file, the events folder and the Speech tool all live in or point into the sandbox. Everything else Fleet
@@ -53,9 +55,17 @@ assert not os.path.exists(fleet.speech.CTL), "the Speech tool must not exist"
 
 for name in ("UPD_FIRST", "UPD_GAP", "UPD_RETRY", "UPD_EVERY", "UPD_LOST", "DEF_TTL"):
     setattr(fleet, name, float(os.environ["E2E_" + name]))
-for name in ("EV_GRACE", "EV_HEAVY", "EV_REMIND_S"):             # the events worker's waits: Fleet's own unless the story shortens them
-    if "E2E_" + name in os.environ:
+for name in ("EV_GRACE", "EV_HEAVY", "EV_REMIND_S", "REBOOT_POLL_S", "REBOOT_START_WAIT", "REBOOT_GIVEUP", "REBOOT_GAP"):
+    if "E2E_" + name in os.environ:             # the events worker's waits and the reboot's: Fleet's own unless the story shortens them
         setattr(fleet, name, float(os.environ["E2E_" + name]))
+if "E2E_SCAN_LAG" in os.environ:                # the worker has decided to scan: this long passes, and a marker file says so, before the scan starts
+    real_scan_once = fleet._upd_scan_once
+
+    def lagging_scan_once(now):
+        open(os.path.join(sandbox, "scan-decided"), "w").close()
+        time.sleep(float(os.environ["E2E_SCAN_LAG"]))
+        return real_scan_once(now)
+    fleet._upd_scan_once = lagging_scan_once
 fleet.poll_nodes = fleet.ct_worker = fleet.ctx_max_worker = lambda: None
 sys.argv = ["fleet.py", "--host", "127.0.0.1", "--port", str(port)]
 fleet.main()

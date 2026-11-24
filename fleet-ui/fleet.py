@@ -2852,8 +2852,10 @@ def defiant_state(force=False):
 # update, or a reboot waiting) goes out once as one Telegram message: its first line is the short headline, the
 # rest is the long detail (the sender puts its own title and a timestamp above the text; Telegram carries it to
 # the phone and the Mac). The install runs as one detached systemd unit on Defiant, so a Tailscale or Docker
-# restart cannot kill it halfway. It never reboots, and it may remove a package only when the last scan (a good,
-# recent one) listed removals.
+# restart cannot kill it halfway. The unit never reboots: Fleet reboots Defiant itself, once, when an install that
+# a keyed click of this Fleet started cleanly, from a page that announced the reboot (reboot_ok in the body of
+# the click), has ended well and needs one (the reboot below), and the Reboot button does the same on its own.
+# The install may remove a package only when the last scan (a good, recent one) listed removals.
 # Everything the host prints is untrusted: it is parsed strictly, capped in size and escaped where it is shown.
 # One lock guards the state; it is never held across ssh, Telegram or a sleep, so the 20 second probe above
 # never waits for any of this.
@@ -2867,6 +2869,13 @@ UPD_GAP = 60              # a requested scan is refused when the last attempt st
 UPD_LOST = 30 * 60        # an install that cannot be polled for this long counts as failed
 UPD_MAX = 500             # packages kept in a scan; its count stays the true number
 UPD_UNIT, UPD_LOG = "fleet-apt-upgrade", "/var/log/fleet-apt-upgrade.log"
+REBOOT_UNIT = "fleet-reboot"
+REBOOT_POLL_S = 5         # the worker polls a running reboot this often: its own cadence, apart from the hourly scan
+REBOOT_START_WAIT = 180   # seconds a reboot may stay on the old boot before it counts as "did not start" (a slow shutdown takes up to 90)
+REBOOT_GIVEUP = 900       # seconds until a Defiant that does not answer again counts as "did not come back"
+REBOOT_GAP = 600          # a new reboot is refused when the last request that may have taken effect is less than this old
+REBOOT_SHOW = 600         # the pages show a finished reboot this long; the state itself stays until the next reboot
+REBOOT_UNSURE = "No answer from Defiant. It may still reboot."      # the start got no complete answer: Defiant may have scheduled the reboot all the same
 
 # What runs on Defiant (fixed strings, no input goes into them). LC_ALL=C keeps apt's wording the one parsed below.
 UPD_SCAN = r"""export LC_ALL=C
@@ -2881,7 +2890,8 @@ def upd_start(allow_remove):
     full-upgrade gets --no-remove: apt then stops before it changes anything ("Packages need to be removed but remove is
     disabled", exit 100) instead of removing a package nobody was shown.
     truncate: opens the log once and empties it, and stderr shares that open file, so the log is this run's alone.
-    file: would not truncate: a shorter run leaves the end of the previous log behind, its exit line included."""
+    file: would not truncate: a shorter run leaves the end of the previous log behind, its exit line included.
+    The reboot after an install that needs one is Fleet's: it decides once it has read the result (_upd_poll), never the unit."""
     run = ('echo "FLEET-APT-START $(date +%s)"; apt-get -o DPkg::Lock::Timeout=600 -qq update; '
            'apt-get -o DPkg::Lock::Timeout=600 -y -o Dpkg::Options::=--force-confold ' + ("" if allow_remove else "--no-remove ") +
            'full-upgrade; rc=$?; echo "FLEET-APT-EXIT $rc $(date +%s)"; exit $rc')
@@ -2895,10 +2905,24 @@ echo "SETUP:$(grep -c '^Setting up ' $l 2>/dev/null)"
 echo "SUMMARY:$(grep -m 1 -E '^[0-9]+ upgraded, [0-9]+ newly installed' $l 2>/dev/null)"
 echo "REBOOT:$([ -f /var/run/reboot-required ] && echo yes || echo no)"
 echo LOG:; tail -n 40 $l 2>/dev/null"""
+# The reboot: refused (one FLEET-BUSY line) while an install, another reboot or any process holding a dpkg or apt lock is on the
+# host (never by process name: the idle unattended-upgrade-shutdown helper always matches). The lock check fails closed: fuser says 0
+# (held) or 1 (none held), and sudo says 1 too when it cannot run fuser (no sudo rule, fuser not installed), so a 1 counts only when a
+# plain `fuser -V` through sudo works as well; anything else is FLEET-NOCHECK and nothing is scheduled. Else it prints the boot id that
+# runs now and schedules a plain `systemctl reboot` three seconds ahead as a transient timer, so that this ssh call returns cleanly first.
+REBOOT_START = f"""if systemctl is-active --quiet {UPD_UNIT}; then echo "FLEET-BUSY install"; exit 0; fi
+if systemctl is-active --quiet {REBOOT_UNIT}.timer || systemctl is-active --quiet {REBOOT_UNIT}.service; then echo "FLEET-BUSY reboot"; exit 0; fi
+sudo -n fuser -s /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock 2>/dev/null; r=$?
+if [ $r -eq 0 ]; then echo "FLEET-BUSY apt"; exit 0; fi
+if [ $r -ne 1 ] || ! sudo -n fuser -V >/dev/null 2>&1; then echo "FLEET-NOCHECK fuser $r"; exit 0; fi
+echo "FLEET-BOOT $(cat /proc/sys/kernel/random/boot_id)"
+sudo -n systemd-run --unit={REBOOT_UNIT} --on-active=3s --timer-property=AccuracySec=1s --collect /bin/systemctl reboot 2>&1
+echo FLEET-RC:$?"""
+REBOOT_POLL = '''echo "BOOT:$(cat /proc/sys/kernel/random/boot_id)"; echo "UP:$(cut -d' ' -f1 /proc/uptime)"'''
 
 
-def _def_ssh(script, timeout):
-    return subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", DEFIANT_HOST, script],
+def _def_ssh(script, timeout, connect=8):
+    return subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=%d" % connect, DEFIANT_HOST, script],
                           capture_output=True, text=True, errors="replace", timeout=timeout, stdin=subprocess.DEVNULL)
 
 
@@ -2914,6 +2938,7 @@ _APT_INST = re.compile(r"Inst (\S+)(?: \[([^\]]*)\])? \((\S+)(?: (.*))?\)")
 _APT_SUMMARY = re.compile(r"([0-9]{1,6}) upgraded, ([0-9]{1,6}) newly installed, "
                           r"([0-9]{1,6}) to remove and ([0-9]{1,6}) not upgraded")
 _JOB_EXIT = re.compile(r"FLEET-APT-EXIT (-?[0-9]{1,4})\b(.*)")
+_BOOT_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")      # a boot id; anything else the host prints is no answer
 
 
 def _ubuntu_label(label):
@@ -3030,6 +3055,20 @@ def parse_job_probe(text):
     return None
 
 
+def parse_reboot_probe(text):
+    """The reboot poll's output -> {boot, up}; None (no answer) when it carries no valid boot id: ssh failed or the host printed
+    something else. up is the uptime in seconds, None when it is not a plain number."""
+    boot = up = None
+    for line in text.splitlines():
+        k, _, v = line.partition(":")
+        v = v.strip()
+        if k == "BOOT" and boot is None and _BOOT_ID.fullmatch(v):
+            boot = v
+        elif k == "UP" and up is None and re.fullmatch(r"[0-9]{1,9}(\.[0-9]{1,3})?", v):
+            up = float(v)
+    return {"boot": boot, "up": up} if boot else None
+
+
 # ---- the install job, alerts (pure)
 
 def _upd_installed(obs):
@@ -3118,12 +3157,47 @@ def upd_alert_text(scan):
         lines.append("Other updates: %d" % (scan["count"] - n))
     if reboot and scan["reboot_pkgs"]:
         lines.append("Reboot required: " + _clean(", ".join(scan["reboot_pkgs"][:8]), 300))
-    return "\n".join(lines + ["Install: Starfleet, Systems, Defiant, Install updates"])
+    where = (["Install: Starfleet, Systems, Defiant, Install updates"] if scan["count"] else []) + (["Reboot: Starfleet, Systems, Defiant, Reboot Defiant"] if reboot else [])      # Install is off when nothing is left to install
+    return "\n".join(lines + where)
 
 
 def upd_fail_text(job):
     code = " (exit %d)" % job["exit"] if job["exit"] is not None else ""
     return "Defiant: update install failed%s\n\n%s" % (code, "\n".join(_clean(l, 110) for l in job["log"][-25:]))
+
+
+# ---- the reboot (pure)
+
+def reboot_step(st, obs, now):
+    """The reboot after one poll. obs comes from parse_reboot_probe, or is None when Defiant gave no valid answer (ssh failed,
+    timed out, printed no boot id). Only a running reboot moves. A boot id other than the one of the request means it came back
+    (done). The same boot id more than REBOOT_START_WAIT after the request means it never rebooted (failed), even when a poll
+    or two found Defiant not answering in between: a dropped connection is not a reboot, and a machine that really rebooted
+    answers with a new boot id long before that. No answer for more than REBOOT_GIVEUP means it did not come back."""
+    st = dict(st)
+    if st["state"] != "running":
+        return st
+    if obs is not None and not (isinstance(obs, dict) and isinstance(obs.get("boot"), str) and _BOOT_ID.fullmatch(obs["boot"])):
+        obs = None                                                  # a boot id that is none counts as no answer
+    age = max(0, now - st["started_at"])                            # a clock that went back must not give the reboot a negative time
+    if obs is None:
+        if st["down_at"] is None:
+            st["down_at"] = now
+        if age > REBOOT_GIVEUP:
+            st.update(state="failed", ended_at=now, error="Defiant did not answer again within 15 minutes. Check it in your hosting provider's console.")
+    elif obs["boot"] != st["boot"]:
+        st.update(state="done", ended_at=now, back_after=round(age))
+    elif age > REBOOT_START_WAIT:
+        st.update(state="failed", ended_at=now, error="Defiant is still on the same boot three minutes after the request. It may still reboot. "
+                                                       "If it does not, check it in your hosting provider's console.")
+    return st
+
+
+def reboot_fail_text(rb):
+    """Line 1 is the headline (at most 100 characters), then a blank line and the error as one line, at most 300 characters. The
+    error says by itself where to look (the page shows the same words). Plain text; the sender puts its own title and a timestamp
+    above it."""
+    return "Defiant: reboot failed\n\n%s" % _clean(" ".join(str(rb["error"] or "").split()), 300)
 
 
 # ---- state: memory, one lock, one file
@@ -3133,12 +3207,17 @@ def _upd_job_idle():
             "installed": None, "reboot_required": None, "contact_at": None}     # contact_at stays inside, the API leaves it out
 
 
+def _upd_reboot_idle():
+    return {"state": "idle", "started_at": None, "ended_at": None, "down_at": None, "back_after": None, "error": None,
+            "boot": None, "auto": False}      # boot (the boot id of the request) stays inside, the API leaves it out; auto: an install started it
+
+
 def _upd_fresh():
-    return {"scan": None, "alerted": {}, "job": _upd_job_idle(), "busy": False, "starting": False, "want": False,
-            "started": 0.0, "next_at": 0.0, "first_err": None}
+    return {"scan": None, "alerted": {}, "job": _upd_job_idle(), "reboot": _upd_reboot_idle(), "busy": False, "starting": False,
+            "reboot_starting": False, "reboot_unsure": 0.0, "auto_reboot": False, "want": False, "started": 0.0, "next_at": 0.0, "first_err": None}
 
 
-_UPD = _upd_fresh()        # scan, alerted and job are saved; the rest lives in memory only
+_UPD = _upd_fresh()        # scan, alerted, job, reboot and reboot_unsure are saved; the rest lives in memory only
 _UPD_LOCK = threading.Lock()
 _UPD_WAKE = threading.Event()
 _SCAN_KEYS = ("at", "error", "error_at", "count", "security", "packages", "remove", "deferred", "reboot_required", "reboot_pkgs")
@@ -3146,14 +3225,17 @@ _PKG_KEYS = ("name", "from", "to", "suites", "origin", "security", "third_party"
 
 
 def _upd_save_locked():
-    """Write the saved state atomically. The caller holds _UPD_LOCK. Never raises: a full disk must not stop the worker."""
+    """Write the saved state atomically. The caller holds _UPD_LOCK. Never raises, whatever goes wrong: a full disk must not stop the
+    worker, and a save that raised in the middle of a reboot request would leave the reboot flags set, which blocks the scan and both
+    buttons until Fleet restarts."""
     try:
         os.makedirs(os.path.dirname(os.path.abspath(UPD_FILE)), exist_ok=True)
         with open(UPD_FILE + ".tmp", "w") as f:
-            json.dump({"scan": _UPD["scan"], "alerted": _UPD["alerted"], "job": _UPD["job"]}, f)
+            json.dump({"scan": _UPD["scan"], "alerted": _UPD["alerted"], "job": _UPD["job"], "reboot": _UPD["reboot"],
+                       "reboot_unsure": _UPD["reboot_unsure"]}, f)
         os.replace(UPD_FILE + ".tmp", UPD_FILE)
-    except OSError as e:
-        print(f"defiant updates: not saved: {e}", flush=True)
+    except Exception as e:
+        print(f"defiant updates: not saved: {e.__class__.__name__}: {str(e)[:160]}", flush=True)
 
 
 def _upd_scan_ok(s):
@@ -3165,6 +3247,23 @@ def _upd_scan_ok(s):
             and all(isinstance(p, dict) and all(k in p for k in _PKG_KEYS) for p in s["packages"]))
 
 
+_REBOOT_NUMS = {"running": ("started_at",), "done": ("started_at", "ended_at", "back_after"), "failed": ("ended_at",)}
+
+
+def _upd_reboot_ok(r):
+    """A saved reboot of one of the three kinds that carry something to show, with the numbers its kind needs; a running one also
+    needs the boot id it waits to see change (without it the worker could not tell a reboot from none). Anything else is replaced
+    by idle."""
+    n = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool) and 0 <= v < 1e12      # an epoch second or a duration, not NaN or absurd
+    if not (isinstance(r, dict) and all(k in r for k in _upd_reboot_idle()) and isinstance(r["state"], str) and r["state"] in _REBOOT_NUMS):
+        return False
+    return (all(n(r[k]) for k in _REBOOT_NUMS[r["state"]]) and all(r[k] is None or n(r[k]) for k in ("started_at", "ended_at", "down_at", "back_after"))
+            and all(r[k] is None or r[k] <= time.time() + 60 for k in ("started_at", "ended_at", "down_at"))      # saved while the clock was ahead: it would never give up
+            and (r["error"] is None or isinstance(r["error"], str)) and (r["state"] != "failed" or r["error"] is not None)
+            and isinstance(r["auto"], bool)
+            and (r["boot"] is None and r["state"] != "running" or isinstance(r["boot"], str) and _BOOT_ID.fullmatch(r["boot"]) is not None))
+
+
 def defiant_updates_load():
     """Restore the saved state at start, so the page has data at once after a restart. A file that is missing or
     does not look right is ignored."""
@@ -3172,9 +3271,15 @@ def defiant_updates_load():
         with open(UPD_FILE) as f:
             saved = json.load(f)
         scan, job, alerted = saved["scan"], saved["job"], saved["alerted"]
-    except (OSError, ValueError, KeyError, TypeError):
+        reboot = saved.get("reboot")                # a file from before the reboot has none
+        unsure = saved.get("reboot_unsure")         # nor has a file from before the hold was saved
+    except (OSError, ValueError, KeyError, TypeError, RecursionError):      # the last one: a file nested too deep for the parser must not stop Fleet at start
         return
     with _UPD_LOCK:
+        if _upd_reboot_ok(reboot):               # a running one is picked up and polled by the worker
+            _UPD["reboot"] = dict({k: reboot[k] for k in _upd_reboot_idle()}, error=reboot["error"] and _clean(reboot["error"], 300))
+        if isinstance(unsure, (int, float)) and not isinstance(unsure, bool) and 0 <= unsure < 1e12 and unsure <= time.time() + 60:      # the numbers' rule of _upd_reboot_ok
+            _UPD["reboot_unsure"] = float(unsure)       # the hold after a start that got no answer outlives a restart of Fleet; anything else is none
         if _upd_scan_ok(scan):
             _UPD["scan"] = scan
         if isinstance(alerted, dict) and isinstance(alerted.get("sig"), str):
@@ -3195,22 +3300,29 @@ def defiant_updates_view():
         return {"configured": False}
     with _UPD_LOCK:
         scan, job, busy, next_at, first = _UPD["scan"], _UPD["job"], _UPD["busy"], _UPD["next_at"], _UPD["first_err"]
+        reboot = _UPD["reboot"]
     if not scan and (busy or first):      # no good scan yet: say that it is running, or why the first one failed
         scan = {"at": None, "error": first and first[0], "error_at": first and first[1], "count": 0, "security": 0,
                 "packages": [], "remove": [], "deferred": [], "reboot_required": False, "reboot_pkgs": []}
     return {"configured": True, "now": time.time(), "scan": dict(scan, next_at=next_at, busy=busy) if scan else None,
             "critical": bool(scan and (scan["security"] > 0 or scan["reboot_required"])),
-            "job": {k: v for k, v in job.items() if k != "contact_at"}}
+            "job": {k: v for k, v in job.items() if k != "contact_at"},
+            "reboot": {k: v for k, v in reboot.items() if k != "boot"}}
 
 
 def defiant_updates_summary():
     """The short form for /api/defiant: None until the first successful scan."""
     with _UPD_LOCK:
-        scan, job = _UPD["scan"], _UPD["job"]
+        scan, job, reboot = _UPD["scan"], _UPD["job"], _UPD["reboot"]
     if not scan:
         return None
     return {"count": scan["count"], "security": scan["security"], "deferred": len(scan["deferred"]),
-            "remove": len(scan["remove"]), "scan_at": scan["at"], "job_state": job["state"]}
+            "remove": len(scan["remove"]), "scan_at": scan["at"], "job_state": job["state"], "reboot_state": reboot["state"]}
+
+
+def _upd_rebooting():
+    """A reboot runs, or its start command is on its way. The caller holds _UPD_LOCK."""
+    return _UPD["reboot"]["state"] == "running" or _UPD["reboot_starting"]
 
 
 def defiant_updates_scan_request():
@@ -3218,6 +3330,8 @@ def defiant_updates_scan_request():
     if not DEFIANT_HOST:
         raise ValueError("Defiant is not configured.")
     with _UPD_LOCK:
+        if _upd_rebooting():
+            return {"ok": True, "started": False, "reason": "rebooting"}
         if _UPD["busy"] or _UPD["starting"] or _UPD["job"]["state"] == "running":
             return {"ok": True, "started": False, "reason": "busy"}
         if time.time() - _UPD["started"] < UPD_GAP:
@@ -3227,25 +3341,32 @@ def defiant_updates_scan_request():
     return {"ok": True, "started": True}
 
 
-def defiant_updates_install(key):
+def defiant_updates_install(key, reboot_ok=False):
     """POST /api/defiant/updates/install: start the upgrade on Defiant as one detached systemd unit. Needs the
     Starfleet key. It runs root commands on another machine, so the key is checked by ctxproxy's own check, which
     fails closed (key_check lets any key through when no idle model is known). It touches no model, container or
     llama-swap member. A unit that is already running, or may be because ssh timed out, is answered with an error
     but followed from then on as the install job. The unit may remove packages only when Fleet's own latest scan is
-    good, recent and lists removals (upd_allow_remove); else apt is told --no-remove and the job ends failed, with a hint."""
+    good, recent and lists removals (upd_allow_remove); else apt is told --no-remove and the job ends failed, with a hint.
+    A reboot that the install leaves pending follows by itself (_upd_poll) only for a unit that this click started
+    cleanly, in this Fleet: not for a unit that was already running, a start whose ssh timed out or a job that outlived a restart.
+    And only when the page that sent the click announced it: reboot_ok is True only for a body {"reboot_ok": true}. A page that
+    was open before this existed (it shows the old confirm text), a script or any other body installs as before and never reboots."""
     computer_auth(key)
     if not DEFIANT_HOST:
         raise ValueError("Defiant is not configured.")
     now = time.time()
     with _UPD_LOCK:
+        if _upd_rebooting():
+            raise PermissionError("A reboot is running.")
         if _UPD["job"]["state"] == "running" or _UPD["starting"]:
             raise PermissionError("An update is already running.")
         if _UPD["busy"]:
             raise PermissionError("A scan is running. Try again in a minute.")
         _UPD["starting"] = True      # a second click gets the 409, and the worker neither polls nor scans until the unit is up
         start = upd_start(upd_allow_remove(_UPD["scan"], now))      # apt may remove packages only when the latest scan is good, recent and lists removals
-    live = False                     # the unit runs, or may run, on Defiant: the worker watches it from here on, whoever started it
+    live = clean = False             # the unit runs, or may run, on Defiant: the worker watches it from here on, whoever started it
+                                     # (clean: this click started it)
     try:
         r = _def_ssh(start, 40)
         if "FLEET-BUSY" in r.stdout:
@@ -3253,7 +3374,7 @@ def defiant_updates_install(key):
             raise PermissionError("The update unit is already running on Defiant.")
         if "FLEET-RC:0" not in r.stdout:
             raise OSError(_clean(" ".join((r.stdout + r.stderr).split()) or f"ssh exit {r.returncode}", 200))
-        live = True
+        live = clean = True
     except subprocess.TimeoutExpired:
         live = True                  # ssh may have died after systemd-run had started the unit; the unit's own log tells
         raise OSError("ssh to Defiant timed out. The install may be running: look at the Updates block.")
@@ -3262,10 +3383,99 @@ def defiant_updates_install(key):
             _UPD["starting"] = False
             if live:                 # only now: before this the log on the host is still the previous run's
                 _UPD["job"] = dict(_upd_job_idle(), state="running", started_at=now, contact_at=now)
+                _UPD["auto_reboot"] = clean and reboot_ok is True      # memory only: a unit Fleet found or lost track of, or one whose page did not announce the reboot, is followed but never rebooted after
                 _upd_save_locked()
         if live:
             _UPD_WAKE.set()          # the worker polls it now, not up to a minute from now
     return {"ok": True, "started_at": now}
+
+
+def _upd_audit(title, text):
+    """One entry in the Messages list for an event of a reboot: list only (kind audit: no push, no rule), a trace that stays when the
+    page has dropped the finished reboot (after REBOOT_SHOW seconds). One line of at most 140 characters: a longer text is cut at a word
+    and ends in "...". Never raises; a failed write costs one journal line. It writes a file and takes the events lock, so it is never
+    called with _UPD_LOCK held."""
+    text = " ".join(str(text or "").split())
+    if len(text) > 140:
+        text = text[:137].rsplit(" ", 1)[0] + "..."
+    try:
+        ev_audit(title, text, go="#/systems/defiant")
+    except Exception as e:
+        print(f"defiant updates: Messages entry not written: {e.__class__.__name__}: {str(e)[:160]}", flush=True)
+
+
+def _upd_reboot_start(auto, now):
+    """The part of a reboot request that follows the checks: one ssh call (REBOOT_START, 30 s). Only when Defiant named the boot id
+    that runs now and scheduled the reboot does the state become running; the worker follows it from there, whatever happens to the
+    caller. The caller has set _UPD["reboot_starting"]; it is cleared here in every case. Used by defiant_updates_reboot and, with
+    auto=True, by the worker for the reboot after an install that needs one. A refusal, a failure and a timeout leave the state as
+    it was and raise a fixed text (PermissionError when Defiant is busy, RuntimeError otherwise): nothing the host printed is
+    passed on, only the journal gets a capped line. A timeout, or an answer cut off after the boot id, is the one outcome that
+    says nothing: Defiant may have scheduled the reboot before ssh gave up. It raises REBOOT_UNSURE and keeps the mark of the time,
+    so that no second reboot is asked for within REBOOT_GAP. The mark is written and saved before Defiant is asked: Fleet may be
+    restarted while the call is on its way, after Defiant scheduled the reboot, and the hold must survive that. Every other
+    outcome puts the previous mark back. Once the reboot runs, one entry goes to the Messages list (_upd_audit)."""
+    boot, unsure = None, False
+    with _UPD_LOCK:
+        held = _UPD["reboot_unsure"]
+        _UPD["reboot_unsure"] = now          # written ahead, so that a restart of Fleet in the middle of the call finds the hold
+        _upd_save_locked()
+    try:
+        try:
+            r = _def_ssh(REBOOT_START, 30)
+        except subprocess.TimeoutExpired:
+            unsure = True
+            raise RuntimeError(REBOOT_UNSURE)
+        except (OSError, subprocess.SubprocessError):
+            raise RuntimeError("Defiant did not accept the reboot request.")
+        busy = re.search(r"^FLEET-BUSY (install|reboot|apt)\s*$", r.stdout, re.M)
+        if busy:
+            raise PermissionError({"install": "An install is running. Wait until it is done.", "reboot": "A reboot is already running.",
+                                   "apt": "apt is busy on Defiant, an upgrade may be running. Try again in a few minutes."}[busy.group(1)])
+        m = re.search(r"^FLEET-BOOT (\S+)\s*$", r.stdout, re.M)
+        if not (m and _BOOT_ID.fullmatch(m.group(1)) and re.search(r"^FLEET-RC:0\s*$", r.stdout, re.M)):
+            print("defiant updates: reboot not accepted: " + _clean(" ".join((r.stdout + r.stderr).split()), 200), flush=True)
+            unsure = bool(m and _BOOT_ID.fullmatch(m.group(1))) and not re.search(r"^FLEET-RC:[0-9]+\s*$", r.stdout, re.M)       # the end of the script never arrived
+            raise RuntimeError(REBOOT_UNSURE if unsure else "Defiant did not accept the reboot request.")
+        boot = m.group(1)
+    finally:
+        with _UPD_LOCK:
+            _UPD["reboot_starting"] = False
+            if not unsure:                   # the answer shows that nothing is pending (or the reboot runs, and its own time holds the button)
+                _UPD["reboot_unsure"] = held
+            if boot:                         # scheduled on Defiant: from here on the worker follows it
+                _UPD["reboot"] = dict(_upd_reboot_idle(), state="running", started_at=now, boot=boot, auto=auto)
+            _upd_save_locked()
+    print("DEFIANT reboot scheduled" + (" after the install" if auto else ""), flush=True)
+    _upd_audit("Defiant reboot started", "Started by Fleet after the install." if auto else "Started with the Reboot Defiant button.")
+    _UPD_WAKE.set()                          # the worker polls it now, not up to a minute from now
+    return {"ok": True, "started_at": now}
+
+
+def defiant_updates_reboot(key):
+    """POST /api/defiant/reboot: reboot the whole Defiant machine, a clean `systemctl reboot` that Defiant schedules three seconds ahead
+    so that the call returns first. Needs the Starfleet key, checked like the install's (ctxproxy's own check, which fails closed),
+    before anything else: a bad key asks Defiant nothing. It touches no model, container or llama-swap member. Refused while a
+    reboot runs or is starting, while an install runs, while a scan is busy and when the last request that may have taken effect
+    is less than REBOOT_GAP old: a reboot that went through, one that failed (a slow shutdown can end after the verdict) and a
+    start that got no answer. A request that Defiant refused (nothing was started) does not count. Defiant itself refuses while
+    an install, a reboot or apt holds it."""
+    computer_auth(key)
+    if not DEFIANT_HOST:
+        raise ValueError("Defiant is not configured.")
+    now = time.time()
+    with _UPD_LOCK:
+        rb = _UPD["reboot"]
+        if _upd_rebooting():
+            raise PermissionError("A reboot is already running.")
+        if _UPD["job"]["state"] == "running" or _UPD["starting"]:
+            raise PermissionError("An install is running. Wait until it is done.")
+        if _UPD["busy"]:
+            raise PermissionError("A scan is running. Try again in a moment.")
+        if any(0 <= now - t < REBOOT_GAP for t in (_UPD["reboot_unsure"], rb["started_at"] or 0)):      # a clock that went back must not lock the button
+            raise PermissionError("A reboot was requested a moment ago. Try again in a few minutes.")
+        _UPD["reboot_starting"] = True       # a second click, an install and a scan are refused, and the worker waits, until Defiant has answered
+    return _upd_reboot_start(False, now)
 
 
 # ---- the worker (blocking calls live here, never in a request thread)
@@ -3300,6 +3510,8 @@ def _upd_notify(scan):
 
 def _upd_scan_once(now):
     with _UPD_LOCK:
+        if _upd_rebooting():         # the tick's "due" check and this start are not one step: a reboot that began in between keeps want set, the scan follows it
+            return
         _UPD["busy"], _UPD["want"], _UPD["started"] = True, False, now
     data = err = None
     try:
@@ -3337,19 +3549,73 @@ def _upd_poll(now):
         obs = None
     with _UPD_LOCK:
         job = _UPD["job"] = upd_job_step(_UPD["job"], obs, now)
+        auto = job["state"] == "done" and job["reboot_required"] is True and _UPD["auto_reboot"]
         if job["state"] != "running":
-            _UPD["want"], _UPD["next_at"] = True, now
+            _UPD["want"], _UPD["next_at"], _UPD["auto_reboot"] = True, now, False      # once: the poll that sees the end is the only one
+        if auto:
+            _UPD["reboot_starting"] = True           # no scan, install or second reboot gets in between this and the start below
         _upd_save_locked()
     if job["state"] == "failed":
         _tg_send(upd_fail_text(job))
+    if auto:
+        _upd_reboot_after_install(now)
     return job["state"] == "running"
 
 
-def _upd_tick(now):
-    """One pass of the worker; returns how long to sleep."""
+def _upd_reboot_after_install(now):
+    """The reboot after an install that ended well and needs one: the worker starts it itself, once, in the tick that records the end
+    of the job. It is the button's start (auto=True) without the key, which the install click carried, and without the gap; every
+    remote guard still applies. A start that is refused or fails makes the reboot failed, with the one Telegram message and one entry
+    in the Messages list: the install stays done, and the person reboots when apt is idle. A start that got no answer says so
+    instead (Defiant may still reboot, and the button waits for REBOOT_GAP: _upd_reboot_start marked it)."""
+    try:
+        _upd_reboot_start(True, now)
+    except (PermissionError, RuntimeError) as e:
+        with _UPD_LOCK:
+            rb = _UPD["reboot"] = dict(_upd_reboot_idle(), state="failed", ended_at=now, auto=True, error=(
+                "The reboot after the install got no answer from Defiant. It may still reboot: wait a few minutes before rebooting it again."
+                if str(e) == REBOOT_UNSURE else
+                "The reboot after the install did not start: %s. Reboot Defiant when apt is idle." % _clean(str(e).rstrip("."), 200)))
+            _upd_save_locked()
+        _tg_send(reboot_fail_text(rb))
+        _upd_audit("Defiant reboot failed", rb["error"])
+
+
+def _upd_reboot_poll(now):
+    """Poll the running reboot once; True while it is still running. A finished one (Defiant answered with another boot id) makes a
+    rescan due at once, like a finished install, and takes the reboot flag out of the last scan right away (it stays gone even
+    when that rescan fails). A failed one is sent as one Telegram message. A finished reboot, either way, also leaves one entry in
+    the Messages list (_upd_audit); a success sends no message, the page shows it."""
+    try:
+        r = _def_ssh(REBOOT_POLL, 12, 5)
+        obs = parse_reboot_probe(r.stdout) if r.returncode != 255 else None       # 255: ssh itself failed, what came may be cut short
+    except (OSError, subprocess.SubprocessError):
+        obs = None
     with _UPD_LOCK:
-        running, next_at = _UPD["job"]["state"] == "running", _UPD["next_at"]
-        due = (_UPD["want"] or now >= next_at) and not _UPD["starting"]
+        old = _UPD["reboot"]
+        rb = _UPD["reboot"] = reboot_step(old, obs, now)
+        if rb != old:                        # saved when something changed: that the host is down, or the end
+            if rb["state"] == "done":
+                _UPD["want"], _UPD["next_at"] = True, now
+                if _UPD["scan"]:             # a new boot has no reboot flag: a rescan that fails right after it (apt busy) must not keep the old one
+                    _UPD["scan"] = dict(_UPD["scan"], reboot_required=False, reboot_pkgs=[])
+            _upd_save_locked()
+    if rb["state"] == "failed" and old["state"] == "running":
+        _tg_send(reboot_fail_text(rb))
+        _upd_audit("Defiant reboot failed", rb["error"])
+    elif rb["state"] == "done" and old["state"] == "running":
+        _upd_audit("Defiant rebooted", "Defiant answered again with a new boot after %d seconds." % rb["back_after"])
+    return rb["state"] == "running"
+
+
+def _upd_tick(now):
+    """One pass of the worker; returns how long to sleep. While a reboot runs it only polls that: ssh goes down with the machine, so a
+    scan or the poll of an install would fail."""
+    with _UPD_LOCK:
+        rebooting, running, next_at = _UPD["reboot"]["state"] == "running", _UPD["job"]["state"] == "running", _UPD["next_at"]
+        due = (_UPD["want"] or now >= next_at) and not (_UPD["starting"] or _UPD["reboot_starting"])
+    if rebooting:
+        return REBOOT_POLL_S if _upd_reboot_poll(now) else 0
     if running:
         return 5 if _upd_poll(now) else 0
     if due:
@@ -3359,7 +3625,7 @@ def _upd_tick(now):
 
 
 def defiant_updates_worker():
-    """Hourly scan, alerts and polling of a running install (also one that survived a Fleet restart). main() starts
+    """Hourly scan, alerts and polling of a running install or reboot (also one that survived a Fleet restart). main() starts
     it only when Defiant is configured."""
     now = time.time()
     with _UPD_LOCK:
@@ -5052,7 +5318,7 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(n) or "{}")
         except ValueError:
             return self._send(400, '{"error":"bad json"}', "application/json")
-        model = body.get("model")
+        model = body.get("model") if isinstance(body, dict) else None        # a body that is no object (a list, null, a number) must not end the request here
         key = self.headers.get(KEY_HDR)
         if self.path == "/api/autodestruct":
             try:
@@ -5130,7 +5396,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, json.dumps(res), "application/json")
         if self.path == "/api/defiant/updates/install":
             try:
-                res = defiant_updates_install(key)
+                res = defiant_updates_install(key, reboot_ok=isinstance(body, dict) and body.get("reboot_ok") is True)      # only the pages that announce the reboot send it
             except urllib.error.HTTPError as e:
                 return self._send(403, json.dumps({"error": _err_text(e)}), "application/json")
             except PermissionError as e:
@@ -5140,6 +5406,18 @@ class Handler(BaseHTTPRequestHandler):
             except (urllib.error.URLError, OSError, subprocess.SubprocessError) as e:
                 return self._send(502, json.dumps({"error": str(e)[:200]}), "application/json")
             print("DEFIANT updates install started", flush=True)
+            return self._send(200, json.dumps(res), "application/json")
+        if self.path == "/api/defiant/reboot":
+            try:
+                res = defiant_updates_reboot(key)
+            except urllib.error.HTTPError as e:
+                return self._send(403, json.dumps({"error": _err_text(e)}), "application/json")
+            except PermissionError as e:
+                return self._send(409, json.dumps({"error": str(e)}), "application/json")
+            except ValueError as e:
+                return self._send(400, json.dumps({"error": str(e)}), "application/json")
+            except (urllib.error.URLError, OSError, subprocess.SubprocessError, RuntimeError) as e:
+                return self._send(502, json.dumps({"error": str(e)[:200]}), "application/json")
             return self._send(200, json.dumps(res), "application/json")
         if self.path == "/api/containers/stop":
             try:

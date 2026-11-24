@@ -9,10 +9,16 @@
    declared; a GET of an /api path without a fixture fails the scene too.
 
    The scenes walk the states of the Updates block: never scanned, scanning, scan error with old data, nothing
-   pending, updates with security and removals and deferred, install confirm, wrong or missing key, installing
-   with log tail and lost contact, done with reboot required, failed. Further scenes check escaping of hostile
-   package names, a failing updates endpoint, the unconfigured view, the narrow window and (on a fake clock) the
-   polling: every 15 s when idle, every 3 s while a scan or the install runs, nothing after the view is left.
+   pending, updates with security and removals and deferred, install confirm (and its definite reboot sentence
+   when the scan already says a reboot is waiting), the request body of a confirmed install (reboot_ok), wrong or
+   missing key, installing with log tail and lost contact, done with reboot required, failed. Further scenes check
+   escaping of hostile package names, a failing updates endpoint, the unconfigured view, the narrow window and (on a
+   fake clock) the polling: every 15 s when idle, every 3 s while a scan, the install or a reboot runs, nothing after
+   the view is left.
+   The reboot scenes (reboot-*, auto-*) cover the Reboot Defiant button in the Server panel: idle and amber, the
+   two-click confirm, the 403 and 409 wording, the button off (with its reason) while an install or a scan runs,
+   running (before and after Defiant went down), done, failed, an older Fleet without "reboot", a failing probe, and
+   the lines under an install that rebooted by itself (and none under a later install for an older reboot).
 
    Run:  PW=<path to the playwright package> node fleet-ui/test/desktop-defiant.js [name-filter]
          OUT=<folder> for the pictures (default: fleet-ui/test/out). HTML=<file> to test another copy of the page.
@@ -27,7 +33,7 @@ const UI = path.join(__dirname, ".."), OUT = process.env.OUT || path.join(__dirn
 const HTML = process.env.HTML || path.join(UI, "fleet.html");
 const only = process.argv[2] || "";
 const TYPES = {".js": "application/javascript", ".css": "text/css"};
-const KEY = "fixture-key", UPD = "/api/defiant/updates";
+const KEY = "fixture-key", UPD = "/api/defiant/updates", INSTP = [UPD + "/install", {reboot_ok: true}];      /* what a confirmed install sends: the flag that lets Fleet reboot afterwards */
 const POLICY = (core.fixtures && core.fixtures.POLICY) || "Only Starfleet Command may load models.";
 const AMBER = "rgb(255, 204, 102)", RED = "rgb(204, 102, 102)";
 
@@ -62,7 +68,8 @@ function mkScan(o){
   return s;
 }
 const mkJob = o => Object.assign({state: "idle", started_at: null, ended_at: null, exit: null, log: [], lost: false, installed: null, reboot_required: null}, o || {});
-const mkUpd = o => Object.assign({configured: true, scan: mkScan(), job: mkJob()}, o || {});
+const mkReboot = o => Object.assign({state: "idle", started_at: null, ended_at: null, down_at: null, back_after: null, error: null, auto: false}, o || {});      /* "boot" is Fleet's own and not sent */
+const mkUpd = o => Object.assign({configured: true, scan: mkScan(), job: mkJob(), reboot: mkReboot()}, o || {});
 const finish = u => u.configured === false ? {configured: false}
   : Object.assign({}, u, {now: NOW(), critical: !!(u.scan && (u.scan.security > 0 || u.scan.reboot_required))});
 const logLines = n => Array.from({length: n}, (_, i) => i % 3 === 0 ? `Unpacking libfoo${i}:arm64 (1.${i}-2) over (1.${i}-1) ...` : i % 3 === 1 ? `Preparing to unpack .../libfoo${i}_1.${i}-2_arm64.deb ...` : `Setting up libfoo${i}:arm64 (1.${i}-2) ...`);
@@ -75,8 +82,9 @@ function defBody(u){
     sites: [{domain: "example.org", status: 200, ms: 84, cert_days: 61, error: null, deployed: NOW() - 86400 * 3}, {domain: "docs.example.org", status: 200, ms: 91, cert_days: 61, error: null, deployed: NOW() - 86400 * 9},
             {domain: "status.example.net", status: 401, ms: 77, cert_days: 40, error: null, deployed: null}],
     problems: sec ? [`${sec} security update${sec === 1 ? "" : "s"} pending`] : [], errors: [], status: sec ? "warn" : "ok", at: NOW(),
-    upd: s && s.at ? {count: s.count, security: sec, deferred: s.deferred.length, remove: s.remove.length, scan_at: s.at, job_state: u.job.state} : null};
+    upd: s && s.at ? {count: s.count, security: sec, deferred: s.deferred.length, remove: s.remove.length, scan_at: s.at, job_state: u.job.state, reboot_state: (u.reboot || mkReboot()).state} : null};
 }
+const PROBE_DOWN = {configured: true, containers: [], sites: [], problems: [], errors: ["ssh: connect to host defiant.example port 22: Connection timed out"], status: "error"};      /* defiant_state when the probe fails */
 const keyed = h => (h || {})["x-starfleet-key"] === KEY;
 const state = () => core.fixtures.state ? core.fixtures.state("nominal") : {nodes: {}, running: [], pins: [], errors: {}, queued: [], llm_loading: [], models: [], loading: []};
 
@@ -89,7 +97,7 @@ function answer(W, method, url, body, headers){
     if(p === "/api/containers") return {containers: [], sessions: [], errors: {}, at: NOW()};
     if(p === "/api/cluster/update") return {state: {phase: "idle"}, pending: {}, pending_at: null};   /* the cluster software strip under Node Status: not part of this feature, only answered so the page loads */
     if(p === "/api/defiant" || p === UPD) W.gets[p] = (W.gets[p] || 0) + 1;
-    if(p === "/api/defiant") return W.upd.configured === false ? {configured: false, status: "off", at: NOW()} : defBody(W.upd);
+    if(p === "/api/defiant") return W.upd.configured === false ? {configured: false, status: "off", at: NOW()} : W.probeDown ? Object.assign({at: NOW()}, PROBE_DOWN) : W.defOver ? W.defOver(defBody(W.upd)) : defBody(W.upd);
     if(p === UPD) return W.updStatus ? {__status: W.updStatus, body: {error: "boom"}} : W.updOff ? {configured: false} : finish(W.upd);
     return;
   }
@@ -100,6 +108,12 @@ function answer(W, method, url, body, headers){
     W.upd.job = mkJob({state: "running", started_at: NOW()});
     return {ok: true, started_at: W.upd.job.started_at};
   }
+  if(p === "/api/defiant/reboot"){
+    if(!keyed(headers)) return {__status: 403, body: {error: POLICY}};
+    if(W.rebootReply) return W.rebootReply;
+    W.upd.reboot = mkReboot({state: "running", started_at: NOW()});
+    return {ok: true, started_at: W.upd.reboot.started_at};
+  }
 }
 const fulfil = (route, r) => r && r.__status ? route.fulfill({status: r.__status, contentType: "application/json", body: JSON.stringify(r.body || {})})
   : route.fulfill({status: 200, contentType: "application/json", body: JSON.stringify(r)});
@@ -108,7 +122,22 @@ const fulfil = (route, r) => r && r.__status ? route.fulfill({status: r.__status
 const btn = label => `#updbox button.bigbtn:text-matches("^${label}", "i")`;
 const click2 = async t => { await t.click(btn("Install")); await t.page.waitForTimeout(500); await t.click(btn("Sure")); };   /* a confirm ignores a click in its first 450 ms */
 const text = async (page, sel) => page.locator(sel).first().innerText();
+/* Reboot Defiant: the button in the Server panel (#rebbox); textContent keeps the case, innerText has the page's capitals */
+const rbtn = label => `#rebbox button.bigbtn:text-matches("^${label}", "i")`;
+const rclick2 = async t => { await t.click(rbtn("Reboot")); await t.page.waitForTimeout(500); await t.click(rbtn("Sure")); };
+const rtext = async (page, sel) => ((await page.locator(sel).first().textContent()) || "").trim();
+const RBP = UPD.replace("/updates", "/reboot"), HINT = "Reboots the whole server. All sites are unreachable for about a minute. Needs the Starfleet key.";
+const ORANGE = "rgb(255, 153, 0)", BLUE = "rgb(153, 204, 255)";
+const REBOOT_SCAN = () => mkScan({packages: [], reboot_required: true, reboot_pkgs: ["linux-image-7.0.0-12-generic", "libc6"]});      /* a reboot is waiting for these */
+const RB_ASK = "This reboots the whole Defiant server. 3 sites and all containers are unreachable for about a minute, and Fleet cannot reach Defiant until it is back.";
+const AUTO_JOB = () => mkJob({state: "done", started_at: NOW() - 900, ended_at: NOW() - 200, exit: 0, installed: 24, reboot_required: true, log: logLines(10)});      /* ended before the reboot it started (every auto-* reboot below starts later) */
+const AUTO_NOSTART = "The reboot after the install did not start: apt is busy on Defiant, an upgrade may be running. Try again in a few minutes. Reboot Defiant when apt is idle.";
+const SAME_BOOT = "Defiant is still on the same boot three minutes after the request. It may still reboot. If it does not, check it in your hosting provider's console.";
+const RB_BUSY = ["A reboot is already running.", "An install is running. Wait until it is done.", "A scan is running. Try again in a moment.", "A reboot was requested a moment ago. Try again in a few minutes.",
+  "apt is busy on Defiant, an upgrade may be running. Try again in a few minutes."];
+const rbLabel = async page => ((await page.locator("#rebbox button.bigbtn").textContent()) || "").trim();
 const SAMPLE = {remove: ["libfoo-old1", "python3-oldlib"], deferred: ["distro-info", "python3-distro-info", "software-properties-common", "systemd-resolved"]};
+const WAITING = () => mkScan(Object.assign({reboot_required: true, reboot_pkgs: ["linux-image-7.0.0-12-generic", "libc6"]}, SAMPLE));      /* updates to install, and a reboot already waiting */
 const PLAIN = PACKAGES.filter(p => !p.security && !/^(docker|containerd|tailscale|linux-image|libc6)/.test(p.name)).slice(0, 8);
 const HOSTILE = '<img src=x onerror="window.__pwned=1"><script>window.__pwned=2<\/script>';
 
@@ -196,6 +225,9 @@ const scenes = [
       t.ok(/^Updates24$/.test(await page.locator("#defbody .node").first().locator(".stat", {hasText: "Updates"}).textContent()), "updates: the Server panel counts the same 24 updates");
       t.ok(/Last scan .+\(12 min ago\) . next /.test(await page.locator("#updbox .sub2").nth(1).textContent()), "updates: Last scan <time> (<ago>) and next <time>");
       t.ok(await page.locator(btn("Install")).isEnabled(), "updates: Install updates is enabled");
+      t.ok(/needs the starfleet key\. if a reboot is needed afterwards, fleet reboots defiant\./i.test(await text(page, "#updbox .node:nth-child(3) .vnote")) && !/never reboots/i.test(await text(page, "#updbox")),
+        "updates: the hint under Install says that Fleet reboots Defiant when a reboot is needed, not that it never reboots");
+      t.ok(/if a reboot is needed afterwards, fleet reboots defiant\./i.test(await page.locator(btn("Install")).getAttribute("title")) && !/never reboots/i.test(await page.locator(btn("Install")).getAttribute("title")), "updates: the tooltip of Install says the same");
       await t.shot("list");
       await page.locator('#updbox th[data-sort="name"]').click(); await page.waitForTimeout(200);
       const names = await page.$$eval("#updbox tbody tr td:first-child", c => c.map(x => x.textContent));
@@ -219,12 +251,13 @@ const scenes = [
       t.ok(/install 24 updates \(5 security\)/i.test(tx), "confirm: the text names the package count and the security share");
       t.ok(/removes 2 packages: libfoo-old1, python3-oldlib/i.test(tx), "confirm: lists the removals");
       t.ok(/restarts services \(containerd, docker, tailscale\).*unreachable for a few seconds/i.test(tx), "confirm: warns that docker, containerd and tailscale restart");
-      t.ok(/needs a reboot afterwards \(libc6, linux-image\)\.\s*this button never reboots/i.test(tx), "confirm: warns about the kernel and libc6, and that the button never reboots");
+      t.ok(/needs a reboot afterwards \(libc6, linux-image\)\./i.test(tx) && !/never reboots/i.test(tx), "confirm: warns about the kernel and libc6, and no longer says the button never reboots");
+      t.ok(/if a reboot is needed afterwards, defiant reboots by itself and the sites are unreachable for about a minute\.\s*click again to start\./i.test(tx), "confirm: says that Defiant reboots by itself when a reboot is needed, and for how long the sites are down: " + tx);
       t.ok(await page.locator(btn("Sure")).evaluate(e => getComputedStyle(e).backgroundColor) === "rgb(204, 102, 102)", "confirm: the armed button is red");
       t.ok(t.posts.length === 0, "confirm: nothing is sent by the first click");
       await t.shot("armed");
     }},
-  {name: "install-double-click", upd: () => mkUpd({scan: mkScan(SAMPLE)}), posts: [[UPD + "/install", {}]],
+  {name: "install-double-click", upd: () => mkUpd({scan: mkScan(SAMPLE)}), posts: [INSTP],
     run: async (page, t) => {
       await page.locator(btn("Install")).dblclick(); await page.waitForTimeout(300);
       t.ok(t.posts.length === 0 && /sure\?/i.test(await text(page, "#updbox .bigbtn.armed")), "double click: it only asks, nothing is sent");
@@ -236,9 +269,28 @@ const scenes = [
       await t.click(btn("Install"));
       const tx = await text(page, "#updbox .node:nth-child(3)");
       t.ok(/install 10 updates on defiant now\?/i.test(tx), "plain confirm: names the count, no security share: " + tx);
-      t.ok(!/removes|restarts|reboot/i.test(tx.replace(/never reboots/i, "")), "plain confirm: no removal, restart or reboot warning when the list has none of them (libc6-dev and linux-libc-dev are not libc6 or a kernel image): " + tx);
+      const general = /if a reboot is needed afterwards, defiant reboots by itself and the sites are unreachable for about a minute\./i;
+      t.ok(general.test(tx), "plain confirm: no reboot is waiting, so the sentence on the automatic reboot is the conditional one: " + tx);
+      t.ok(!/removes|restarts|reboot/i.test(tx.replace(general, "")), "plain confirm: no removal, restart or reboot warning when the list has none of them (libc6-dev and linux-libc-dev are not libc6 or a kernel image): " + tx);
     }},
-  {name: "install-wrong-key", upd: () => mkUpd({scan: mkScan(SAMPLE)}), key: "wrong", posts: [[UPD + "/install", {}]],
+  {name: "install-confirm-reboot-waiting", upd: () => mkUpd({scan: WAITING()}), posts: [INSTP],
+    run: async (page, t) => {      /* the latest scan already says a reboot is waiting: the sentence on the automatic reboot is definite, and follows the latest scan */
+      const node = () => text(page, "#updbox .node:nth-child(3)"), DEFINITE = /a reboot is already waiting, so defiant reboots by itself right after this install, and the sites are unreachable for about a minute\.\s*click again to start\./i;
+      await t.click(btn("Install"));
+      let tx = await node();
+      t.ok(DEFINITE.test(tx) && !/if a reboot is needed afterwards/i.test(tx), "confirm, a reboot is waiting: the sentence is definite, not conditional: " + tx);
+      t.ok(/needs a reboot afterwards \(libc6, linux-image\)\./i.test(tx) && /install 24 updates \(5 security\) on defiant now\?/i.test(tx), "confirm, a reboot is waiting: the count and the packages that need a reboot are named as before: " + tx);
+      t.ok(t.posts.length === 0, "confirm, a reboot is waiting: nothing is sent by the first click");
+      await t.shot("armed");
+      t.W.upd.scan = mkScan(SAMPLE); await t.poll();      /* a rescan finds no reboot waiting */
+      tx = await node();
+      t.ok(/sure\? install 24 updates/i.test(await text(page, "#updbox .bigbtn.armed")) && /if a reboot is needed afterwards, defiant reboots by itself/i.test(tx) && !/already waiting/i.test(tx), "confirm, the rescan found none waiting: the conditional sentence again: " + tx);
+      t.W.upd.scan = WAITING(); await t.poll();
+      t.ok(DEFINITE.test(await node()), "confirm, a reboot is waiting again: the definite sentence again");
+      await page.waitForTimeout(300); await t.click(btn("Sure"));
+      t.ok(t.posts.length === 1 && /installing updates/i.test(await text(page, "#updbox")), "confirm, a reboot is waiting: the second click sends the install (its body is declared in posts)");
+    }},
+  {name: "install-wrong-key", upd: () => mkUpd({scan: mkScan(SAMPLE)}), key: "wrong", posts: [INSTP],
     run: async (page, t) => {
       await click2(t);
       const m = await text(page, "#defmsg");
@@ -248,12 +300,12 @@ const scenes = [
       t.ok(t.W.upd.job.state === "idle", "wrong key: no job was started");
       await t.shot("refused");
     }},
-  {name: "install-no-key", upd: () => mkUpd({scan: mkScan(SAMPLE)}), key: "", posts: [[UPD + "/install", {}]],
+  {name: "install-no-key", upd: () => mkUpd({scan: mkScan(SAMPLE)}), key: "", posts: [INSTP],
     run: async (page, t) => {
       await click2(t);
       t.ok(/starfleet key missing or wrong/i.test(await text(page, "#defmsg")), "no key: the same wording");
     }},
-  {name: "install-gate-down-403", upd: () => mkUpd({scan: mkScan(SAMPLE)}), posts: [[UPD + "/install", {}]],
+  {name: "install-gate-down-403", upd: () => mkUpd({scan: mkScan(SAMPLE)}), posts: [INSTP],
     run: async (page, t) => {
       t.W.installReply = {__status: 403, body: {error: "Cannot verify the Starfleet key right now (gate not answering); try again in a moment."}};
       await click2(t);
@@ -263,14 +315,14 @@ const scenes = [
       t.ok(await page.locator("#defmsg").evaluate(e => e.classList.contains("err")), "gate down: the bar is red");
       t.ok(await page.locator(btn("Install")).isEnabled() && t.W.upd.job.state === "idle", "gate down: no job was started, Install updates can be tried again");
     }},
-  {name: "install-ssh-502", upd: () => mkUpd({scan: mkScan(SAMPLE)}), posts: [[UPD + "/install", {}]],
+  {name: "install-ssh-502", upd: () => mkUpd({scan: mkScan(SAMPLE)}), posts: [INSTP],
     run: async (page, t) => {
       t.W.installReply = {__status: 502, body: {error: "ssh: connect to host defiant.example port 22: Connection timed out"}};
       await click2(t);
       t.ok(/install updates failed: ssh: connect to host defiant\.example/i.test(await text(page, "#defmsg")), "502: the server's reason shows");
       t.ok(await page.locator(btn("Install")).isEnabled() && !/installing/i.test(await text(page, "#updbox")), "502: no progress panel for an install that did not start");
     }},
-  {name: "install-busy-409", upd: () => mkUpd({scan: mkScan(SAMPLE)}), posts: [[UPD + "/install", {}]],
+  {name: "install-busy-409", upd: () => mkUpd({scan: mkScan(SAMPLE)}), posts: [INSTP],
     run: async (page, t) => {
       t.W.installReply = {__status: 409, body: {error: "an install is already running"}};
       await click2(t);
@@ -291,6 +343,14 @@ const scenes = [
       t.ok(/a scan is already running\./i.test(await text(page, "#toast")), "scan now, answered 'busy': the page says a scan is running");
       t.ok(await page.locator(btn("Scan now")).isEnabled() && !/scanning/i.test(await text(page, "#updbox .nodes")), "scan now, answered 'busy': nothing pretends to scan");
     }},
+  {name: "scan-now-rebooting", upd: () => mkUpd({scan: mkScan(SAMPLE)}), posts: [[UPD + "/scan", {}]],
+    run: async (page, t) => {      /* another window started a reboot a moment ago: Fleet refuses the scan and says why */
+      t.W.scanReply = {ok: true, started: false, reason: "rebooting"};
+      await t.click(btn("Scan now")); await page.waitForTimeout(400);
+      t.ok(/^a reboot is running\.$/i.test((await text(page, "#toast")).trim()), "scan now, answered 'rebooting': the page says a reboot is running: " + await text(page, "#toast"));
+      t.ok(await page.locator(btn("Scan now")).isEnabled() && !/scanning/i.test(await text(page, "#updbox .nodes")), "scan now, answered 'rebooting': nothing pretends to scan");
+      t.ok(await page.locator("#defmsg").evaluate(e => !e.classList.contains("err")), "scan now, answered 'rebooting': no error");
+    }},
   {name: "scan-now-started", upd: () => mkUpd({scan: mkScan(SAMPLE)}), posts: [[UPD + "/scan", {}]],
     run: async (page, t) => {
       await t.click(btn("Scan now"));
@@ -308,7 +368,7 @@ const scenes = [
       await t.click(btn("Scan now")); await page.waitForTimeout(300);
       t.ok(/scan now failed: defiant is not configured/i.test(await text(page, "#defmsg")), "scan now, refused: the reason shows");
     }},
-  {name: "installing", upd: () => mkUpd({scan: mkScan(SAMPLE)}), posts: [[UPD + "/install", {}]],
+  {name: "installing", upd: () => mkUpd({scan: mkScan(SAMPLE)}), posts: [INSTP],
     run: async (page, t) => {
       await click2(t);
       t.ok(t.posts.length === 1, "installing: the second click sends the install request");
@@ -332,6 +392,7 @@ const scenes = [
       const tx = await text(page, "#updbox");
       t.ok(/install finished/i.test(tx) && /installed 24 packages/i.test(tx) && /reboot required afterwards: yes/i.test(tx), "done: the result line has the count and the reboot flag");
       t.ok(/scanning\.\.\./i.test(tx), "done: the block rescans and says so");
+      t.ok(/a reboot is waiting\. use reboot defiant when it suits you\./i.test(tx) && !/never reboots/i.test(tx), "done: the install result tells that a reboot is waiting and to use Reboot Defiant");
       t.ok(!/lost contact/i.test(tx), "done: no lost contact line");
       await t.shot("done-rescan");
       t.W.upd.scan = mkScan({packages: [], deferred: SAMPLE.deferred, reboot_required: true, reboot_pkgs: ["linux-image-7.0.0-14-generic", "libc6"]}); await t.poll();
@@ -339,6 +400,15 @@ const scenes = [
       t.ok(/nothing to install/i.test(tx2) && /reboot needed for linux-image-7.0.0-14-generic, libc6/i.test(tx2), "done: the refreshed block shows nothing pending and the packages that want a reboot");
       t.ok(await page.locator("#updbox .stat.warn b", {hasText: "Required"}).count() === 1, "done: the Reboot chip is amber");
       await t.shot("done");
+    }},
+  {name: "installing-scan-hint", upd: () => mkUpd({scan: mkScan(SAMPLE), job: mkJob({state: "running", started_at: NOW() - 30, log: logLines(5)})}),
+    run: async (page, t) => {      /* the Scan panel says when the next scan comes: after the install, and after the reboot that may follow it */
+      const hint = () => rtext(page, "#updbox .node:nth-child(2) .vnote");
+      t.ok(await page.locator(btn("Scan now")).isDisabled(), "install running: Scan now is off");
+      t.ok(await hint() === "Scans again by itself when the install (and a reboot after it) is done.", "install running: the Scan panel's hint names the install and the reboot after it: " + await hint());
+      await t.shot("hint");
+      t.W.upd.job = mkJob({state: "done", started_at: NOW() - 60, ended_at: NOW() - 1, exit: 0, installed: 3, reboot_required: false}); await t.poll();
+      t.ok(await page.locator(btn("Scan now")).isEnabled() && !/by itself when/i.test(await hint()), "install done: the hint is the ordinary one again: " + await hint());
     }},
   {name: "failed", upd: () => mkUpd({scan: mkScan(SAMPLE), job: mkJob({state: "failed", started_at: NOW() - 900, ended_at: NOW() - 600, exit: 100,
       log: logLines(36).concat(["E: Sub-process /usr/bin/dpkg returned an error code (1)", "FLEET-APT-EXIT 100 1763632000"])})}),
@@ -364,7 +434,308 @@ const scenes = [
     run: async (page, t) => {
       const tx = await text(page, "#updbox .node:last-child");
       t.ok(/installed 12 packages/i.test(tx) && /reboot required afterwards: yes/i.test(tx), "old result: says what it was: " + tx);
-      t.ok(await page.locator("#updbox .node.warn").count() === 0 && !/reboot defiant when/i.test(tx), "old result: no amber and no reboot hint once the latest scan says no reboot is pending");
+      t.ok(await page.locator("#updbox .node.warn").count() === 0 && !/a reboot is waiting/i.test(tx), "old result: no amber and no reboot hint once the latest scan says no reboot is pending");
+    }},
+  /* ---- Reboot Defiant: the button in the Server panel, its confirm, every state of reboot.state, and the install that reboots by itself ---- */
+  {name: "reboot-idle", upd: () => mkUpd({scan: REBOOT_SCAN()}),
+    run: async (page, t) => {
+      const host = page.locator("#defbody .node").first(), b = page.locator("#rebbox button.bigbtn");
+      t.ok(/Reboot\s*Required/i.test(await host.locator(".stats").innerText()) && await host.locator("#rebbox").count() === 1 && await page.locator("#updbox #rebbox").count() === 0, "reboot idle: the button sits in the Server panel under the Reboot chip, not in the Updates block");
+      t.ok(await b.count() === 1 && await rbLabel(page) === "Reboot Defiant" && await b.isEnabled(), "reboot idle: one button, Reboot Defiant, enabled");
+      t.ok(await b.evaluate(e => getComputedStyle(e).backgroundColor) === AMBER, "reboot idle: a reboot is waiting, so the button is amber (red is for failure)");
+      t.ok(await rtext(page, "#rebbox .vnote") === HINT, "reboot idle: the hint under the button: " + await rtext(page, "#rebbox .vnote"));
+      t.ok(await page.locator("#rebbox .updnote").count() === 0, "reboot idle: no state line");
+      t.ok(/starfleet key, click twice/i.test(await b.getAttribute("title")), "reboot idle: the tooltip names the key and the two clicks");
+      t.ok(/Reboot\s*Required/i.test(await host.locator(".stats").innerText()), "reboot idle: the Reboot chip stays as it is");
+      await t.shot("idle");
+    }},
+  {name: "reboot-idle-plain", upd: () => mkUpd({scan: mkScan(SAMPLE)}),
+    run: async (page, t) => {
+      t.ok(await page.locator("#rebbox button.bigbtn").evaluate(e => getComputedStyle(e).backgroundColor) === ORANGE, "reboot idle, nothing waiting: the ordinary orange button");
+      t.ok(await page.locator("#updbox .node:nth-child(3) button").isEnabled() && await page.locator(btn("Scan now")).isEnabled(), "reboot idle: Install updates and Scan now are not touched by an idle reboot");
+    }},
+  {name: "reboot-confirm", upd: () => mkUpd({scan: REBOOT_SCAN()}),
+    run: async (page, t) => {
+      await t.click(rbtn("Reboot"));
+      const b = page.locator("#rebbox button.bigbtn");
+      t.ok(await rbLabel(page) === "Sure? Reboot Defiant" && await b.evaluate(e => getComputedStyle(e).backgroundColor) === RED && await b.evaluate(e => e.classList.contains("armed")), "reboot confirm: the first click asks, the button turns red like the other two");
+      t.ok(await rtext(page, "#rebbox .vnote") === RB_ASK + " A reboot is waiting for: linux-image-7.0.0-12-generic, libc6.", "reboot confirm: the text names the sites, what stays down and what a reboot waits for: " + await rtext(page, "#rebbox .vnote"));
+      t.ok(t.posts.length === 0, "reboot confirm: nothing is sent by the first click");
+      await t.shot("armed");
+    }},
+  {name: "reboot-confirm-quiet", upd: () => mkUpd({scan: mkScan(SAMPLE)}),
+    run: async (page, t) => {
+      await t.click(rbtn("Reboot"));
+      t.ok(await rtext(page, "#rebbox .vnote") === RB_ASK, "reboot confirm, nothing waits for a reboot: the first two sentences alone: " + await rtext(page, "#rebbox .vnote"));
+      t.ok(await page.locator("#rebbox button.bigbtn").evaluate(e => getComputedStyle(e).backgroundColor) === RED, "reboot confirm: armed is red even though nothing is waiting");
+    }},
+  {name: "reboot-confirm-many", upd: () => mkUpd({scan: mkScan({packages: [], reboot_required: true, reboot_pkgs: ["linux-image-a", "linux-modules-a", "libc6", "systemd", "dbus", "udev", "openssl"]})}),
+    run: async (page, t) => {
+      await t.click(rbtn("Reboot"));
+      t.ok((await rtext(page, "#rebbox .vnote")).endsWith(" A reboot is waiting for: linux-image-a, linux-modules-a, libc6, systemd and 3 more."), "reboot confirm: four names, then the rest counted: " + await rtext(page, "#rebbox .vnote"));
+    }},
+  {name: "reboot-confirm-sites-unknown", upd: () => mkUpd({scan: mkScan(SAMPLE)}), defOver: d => Object.assign(d, {sites: []}),
+    run: async (page, t) => {
+      await t.click(rbtn("Reboot"));
+      t.ok((await rtext(page, "#rebbox .vnote")).startsWith("This reboots the whole Defiant server. The sites and all containers are unreachable for about a minute,"), "reboot confirm, the site list is empty: no count: " + await rtext(page, "#rebbox .vnote"));
+    }},
+  {name: "reboot-confirm-one-site", upd: () => mkUpd({scan: mkScan(SAMPLE)}), defOver: d => Object.assign(d, {sites: d.sites.slice(0, 1)}),
+    run: async (page, t) => {
+      await t.click(rbtn("Reboot"));
+      t.ok((await rtext(page, "#rebbox .vnote")).startsWith("This reboots the whole Defiant server. 1 site and all containers are unreachable"), "reboot confirm, one site: singular: " + await rtext(page, "#rebbox .vnote"));
+    }},
+  {name: "reboot-double-click", upd: () => mkUpd({scan: mkScan(SAMPLE)}), posts: [[RBP, {}]],
+    run: async (page, t) => {
+      await page.locator("#rebbox button.bigbtn").dblclick(); await page.waitForTimeout(300);
+      t.ok(t.posts.length === 0 && /sure\?/i.test(await text(page, "#rebbox .bigbtn.armed")), "reboot double click: it only asks, nothing is sent");
+      await page.waitForTimeout(600); await t.click(rbtn("Sure"));
+      t.ok(t.posts.length === 1, "reboot double click: a later click confirms");
+    }},
+  {name: "reboot-wrong-key", upd: () => mkUpd({scan: mkScan(SAMPLE)}), key: "wrong", posts: [[RBP, {}]],
+    run: async (page, t) => {
+      await rclick2(t);
+      const m = await text(page, "#defmsg");
+      t.ok(/^reboot defiant failed: starfleet key missing or wrong \(enter it on the shuttle bay page, save key\)( · |$)/i.test(m.trim()), "reboot wrong key: the 403 wording of Back up now and Install updates: " + m);
+      t.ok(await page.locator("#defmsg").evaluate(e => e.classList.contains("err")), "reboot wrong key: the bar is red");
+      t.ok(await rbLabel(page) === "Reboot Defiant" && await page.locator("#rebbox button.bigbtn").isEnabled() && t.W.upd.reboot.state === "idle", "reboot wrong key: nothing started, the button can be used again");
+      await t.shot("refused");
+    }},
+  {name: "reboot-no-key", upd: () => mkUpd({scan: mkScan(SAMPLE)}), key: "", posts: [[RBP, {}]],
+    run: async (page, t) => {
+      await rclick2(t);
+      t.ok(/starfleet key missing or wrong/i.test(await text(page, "#defmsg")), "reboot no key: the same wording");
+    }},
+  {name: "reboot-gate-down-403", upd: () => mkUpd({scan: mkScan(SAMPLE)}), posts: [[RBP, {}]],
+    run: async (page, t) => {
+      t.W.rebootReply = {__status: 403, body: {error: "Cannot verify the Starfleet key right now (gate not answering); try again in a moment."}};
+      await rclick2(t);
+      const m = await text(page, "#defmsg");
+      t.ok(/reboot defiant failed: cannot verify the starfleet key right now \(gate not answering\); try again in a moment\./i.test(m), "reboot gate down: the server's own words show: " + m);
+      t.ok(!/key missing or wrong|save key/i.test(m) && await page.locator("#defmsg").evaluate(e => e.classList.contains("err")), "reboot gate down: the key is not blamed, the bar is red: " + m);
+      t.ok(await page.locator("#rebbox button.bigbtn").isEnabled() && t.W.upd.reboot.state === "idle", "reboot gate down: nothing started");
+    }},
+  ...RB_BUSY.map((sentence, i) => ({name: "reboot-409-" + i, upd: () => mkUpd({scan: mkScan(SAMPLE)}), posts: [[RBP, {}]],
+    run: async (page, t) => {
+      t.W.rebootReply = {__status: 409, body: {error: sentence}};
+      await rclick2(t); await page.waitForTimeout(300);
+      t.ok(await rtext(page, "#toast") === sentence, "reboot 409: the server's sentence shows, exactly: " + await rtext(page, "#toast"));
+      t.ok(await page.locator("#defmsg").evaluate(e => !e.classList.contains("err") && !/failed|reboot/i.test(e.textContent)), "reboot 409: neutral, not the red error bar: " + await text(page, "#defmsg"));
+      t.ok(await rbLabel(page) === "Reboot Defiant" && await page.locator("#rebbox button.bigbtn").isEnabled(), "reboot 409: the button is back");
+      if(i === 0) await t.shot("refused");
+    }})),
+  {name: "reboot-502", upd: () => mkUpd({scan: mkScan(SAMPLE)}), posts: [[RBP, {}]],
+    run: async (page, t) => {
+      t.W.rebootReply = {__status: 502, body: {error: "Defiant did not accept the reboot request."}};
+      await rclick2(t);
+      t.ok(/^reboot defiant failed: defiant did not accept the reboot request\.( · |$)/i.test((await text(page, "#defmsg")).trim()) && await page.locator("#defmsg").evaluate(e => e.classList.contains("err")), "reboot 502: the server's reason shows, in the red bar: " + await text(page, "#defmsg"));
+      t.ok(await page.locator("#rebbox button.bigbtn").isEnabled() && !(await page.locator("#rebbox .updnote").count()), "reboot 502: no progress line for a reboot that did not start");
+    }},
+  {name: "reboot-502-timeout", upd: () => mkUpd({scan: mkScan(SAMPLE)}), posts: [[RBP, {}]],
+    run: async (page, t) => {
+      t.W.rebootReply = {__status: 502, body: {error: "No answer from Defiant. It may still reboot."}};
+      await rclick2(t);
+      t.ok(/reboot defiant failed: no answer from defiant\. it may still reboot\./i.test(await text(page, "#defmsg")), "reboot 502 timeout: the server's reason shows");
+    }},
+  {name: "reboot-500-no-body", upd: () => mkUpd({scan: mkScan(SAMPLE)}), posts: [[RBP, {}]],
+    run: async (page, t) => {
+      t.W.rebootReply = {__status: 500, body: {}};
+      await rclick2(t);
+      t.ok(/reboot defiant failed: http 500/i.test(await text(page, "#defmsg")), "reboot 500: the generic failure line of the install code");
+    }},
+  {name: "reboot-sending", upd: () => mkUpd({scan: mkScan(SAMPLE)}), posts: [[RBP, {}]],
+    run: async (page, t) => {      /* Fleet takes a while to answer (it asks Defiant over ssh first): the button says so and cannot be pressed again */
+      t.W.postDelay = 2000;
+      await t.click(rbtn("Reboot")); await page.waitForTimeout(500); await page.locator(rbtn("Sure")).click({noWaitAfter: true}); await page.waitForTimeout(400);
+      const b = page.locator("#rebbox button.bigbtn");
+      t.ok(await rbLabel(page) === "Starting..." && await b.isDisabled() && await rtext(page, "#rebbox .vnote") === "Starting the reboot...", "reboot sending: the button says Starting..., is disabled, and the note says why: " + await rbLabel(page));
+      t.ok(await b.evaluate(e => !e.classList.contains("armed")), "reboot sending: no longer asking");
+      t.ok(await page.locator(btn("Install")).isDisabled() && /a reboot is running, progress above\./i.test(await text(page, "#updbox .node:nth-child(3)")), "reboot sending: Install updates is off while the request is out, and says why");
+      await b.click({force: true, timeout: 1000}).catch(() => {}); await page.waitForTimeout(200);
+      t.ok(t.posts.length === 1, "reboot sending: pressing it again sends nothing more (" + t.posts.length + " requests)");
+      await t.shot("sending");
+      await page.waitForTimeout(2300);
+      t.ok(await rbLabel(page) === "Rebooting..." && await rtext(page, "#rebbox .updnote") === "Rebooting. Waiting for Defiant to go down." && t.posts.length === 1, "reboot sending: the answer comes: Rebooting...");
+    }},
+  {name: "reboot-started", upd: () => mkUpd({scan: mkScan(SAMPLE)}), posts: [[RBP, {}]],
+    run: async (page, t) => {
+      await rclick2(t);
+      t.ok(t.posts.length === 1, "reboot started: the second click sends the request");
+      const b = page.locator("#rebbox button.bigbtn");
+      t.ok(await rbLabel(page) === "Rebooting..." && await b.isDisabled(), "reboot started: the button says Rebooting... and is disabled");
+      t.ok(await rtext(page, "#rebbox .updnote") === "Rebooting. Waiting for Defiant to go down.", "reboot started: before Fleet has seen Defiant go down: " + await rtext(page, "#rebbox .updnote"));
+      t.ok(await page.locator("#rebbox .vnote").count() === 0, "reboot started: no hint while it runs");
+      t.ok(await page.locator(btn("Install")).isDisabled() && /a reboot is running, progress above\./i.test(await text(page, "#updbox .node:nth-child(3)")), "reboot started: Install updates is off and says why");
+      t.ok(await page.locator(btn("Scan now")).isDisabled() && /scans again by itself when defiant is back\./i.test(await text(page, "#updbox .node:nth-child(2)")), "reboot started: Scan now is off");
+      t.ok(!/lost contact/i.test(await text(page, "#updbox")) && await page.locator("#defmsg").evaluate(e => !e.classList.contains("err")), "reboot started: no error anywhere");
+      await t.shot("running");
+      t.W.upd.reboot = mkReboot({state: "running", started_at: NOW() - 70, down_at: NOW() - 55}); await t.poll();
+      const l = await rtext(page, "#rebbox .updnote"), n = +(/\((\d+) s\)/.exec(l) || [])[1];
+      t.ok(/^Rebooting\. Defiant has been down since \d\d:\d\d:\d\d \(\d+ s\)\.$/.test(l) && n >= 54 && n <= 60, "reboot started: Defiant is down: the time since and the seconds: " + l);
+      t.ok(await page.locator("#rebbox button.bigbtn").isDisabled() && await page.locator(btn("Install")).isDisabled(), "reboot started: the buttons stay off while Defiant is down");
+      await t.shot("down");
+      t.W.upd.reboot = mkReboot({state: "done", started_at: NOW() - 130, ended_at: NOW() - 2, down_at: NOW() - 110, back_after: 128});
+      t.W.upd.scan = mkScan({packages: [], deferred: SAMPLE.deferred}); await t.poll();
+      t.ok(await rtext(page, "#rebbox .updnote") === "Defiant rebooted and answered again after 128 s." && await page.locator("#rebbox .updnote").evaluate((e, c) => getComputedStyle(e).color === c, BLUE), "reboot started: back: the ok line in the ok colour: " + await rtext(page, "#rebbox .updnote"));
+      t.ok(await rbLabel(page) === "Reboot Defiant" && await page.locator("#rebbox button.bigbtn").isEnabled() && await page.locator(btn("Scan now")).isEnabled() && /reboots the whole server/i.test(await text(page, "#rebbox .vnote")), "reboot started: the plain button again, with its hint, and Scan now is back");
+      await t.shot("done");
+    }},
+  {name: "reboot-running-down", upd: () => mkUpd({scan: mkScan(SAMPLE), reboot: mkReboot({state: "running", started_at: NOW() - 75, down_at: NOW() - 61})}),
+    run: async (page, t) => {
+      t.ok(/^Rebooting\. Defiant has been down since \d\d:\d\d:\d\d \((6[1-5]) s\)\.$/.test(await rtext(page, "#rebbox .updnote")), "reboot down: the time since, in seconds: " + await rtext(page, "#rebbox .updnote"));
+      t.ok(await page.locator("#rebbox button.bigbtn").isDisabled() && await rbLabel(page) === "Rebooting...", "reboot down: the button is disabled");
+      t.ok(await page.locator(btn("Install")).isDisabled() && await page.locator(btn("Scan now")).isDisabled(), "reboot down: Install updates and Scan now are disabled");
+      t.ok(await page.locator("#rebbox .updnote").evaluate(e => getComputedStyle(e).color) === AMBER, "reboot down: the running line is not red");
+      await t.shot("down");
+    }},
+  {name: "reboot-live-seconds", upd: () => mkUpd({scan: mkScan(SAMPLE), reboot: mkReboot({state: "running", started_at: NOW() - 20, down_at: NOW() - 10})}),
+    run: async (page, t) => {
+      const secs = async () => +(/\((\d+) s\)/.exec(await rtext(page, "#rebbox .updnote")) || [])[1], a = await secs();
+      await page.waitForTimeout(7200); const b = await secs();
+      t.ok(b - a >= 3 && b - a <= 9, `reboot live: the seconds count up with every poll (${a}, then ${b} 7 s later)`);
+    }},
+  {name: "reboot-done", upd: () => mkUpd({scan: mkScan({packages: [], deferred: SAMPLE.deferred}), reboot: mkReboot({state: "done", started_at: NOW() - 160, ended_at: NOW() - 45, down_at: NOW() - 140, back_after: 115})}),
+    run: async (page, t) => {
+      t.ok(await rtext(page, "#rebbox .updnote") === "Defiant rebooted and answered again after 115 s.", "reboot done: the line: " + await rtext(page, "#rebbox .updnote"));
+      t.ok(await page.locator("#rebbox .updnote").evaluate((e, c) => e.classList.contains("ok") && getComputedStyle(e).color === c, BLUE), "reboot done: in the ok colour");
+      t.ok(await page.locator("#rebbox button.bigbtn").isEnabled() && await rbLabel(page) === "Reboot Defiant" && await rtext(page, "#rebbox .vnote") === HINT, "reboot done: the plain button again, with its hint");
+      t.ok(await page.locator("#updbox .updnote.ok, #updbox .updnote.bad").count() === 0, "reboot done: nothing under the install panel for a reboot that is no install's");
+      await t.shot("done");
+    }},
+  {name: "reboot-done-old", upd: () => mkUpd({scan: mkScan({packages: [], deferred: SAMPLE.deferred}), reboot: mkReboot({state: "done", started_at: NOW() - 1000, ended_at: NOW() - 700, down_at: NOW() - 980, back_after: 300})}),
+    run: async (page, t) => {
+      t.ok(await page.locator("#rebbox .updnote").count() === 0 && await rbLabel(page) === "Reboot Defiant" && await page.locator("#rebbox button.bigbtn").isEnabled(), "reboot done 11 minutes ago: no line, the plain button");
+    }},
+  {name: "reboot-done-expires", clock: true, upd: () => mkUpd({scan: mkScan({packages: [], deferred: SAMPLE.deferred}), reboot: mkReboot({state: "done", started_at: NOW() - 700, ended_at: NOW() - 595, down_at: NOW() - 680, back_after: 105})}),
+    run: async (page, t) => {
+      t.ok(/answered again after 105 s/.test(await rtext(page, "#rebbox .updnote")), "reboot done 595 s ago: the line is still there");
+      await t.advance(20000);
+      t.ok(await page.locator("#rebbox .updnote").count() === 0, "reboot done: after 10 minutes the line goes by itself, with the 15 s repaint");
+    }},
+  {name: "reboot-failed", upd: () => mkUpd({scan: REBOOT_SCAN(), reboot: mkReboot({state: "failed", started_at: NOW() - 1300, ended_at: NOW() - 400, down_at: NOW() - 1250, error: "Defiant did not answer again within 15 minutes. Check it in your hosting provider's console."})}),
+    run: async (page, t) => {
+      t.ok(await rtext(page, "#rebbox .updnote") === "Defiant did not answer again within 15 minutes. Check it in your hosting provider's console.", "reboot failed: the server's error text: " + await rtext(page, "#rebbox .updnote"));
+      t.ok(await page.locator("#rebbox .updnote").evaluate((e, c) => e.classList.contains("bad") && getComputedStyle(e).color === c, RED), "reboot failed: a red line");
+      t.ok(await page.locator("#rebbox button.bigbtn").isEnabled() && await rbLabel(page) === "Reboot Defiant" && await rtext(page, "#rebbox .vnote") === HINT, "reboot failed: the button can be used again");
+      t.ok(await page.locator("#defmsg").evaluate(e => !e.classList.contains("err")), "reboot failed: the red bar on top is for the click's own failures");
+      await t.shot("failed");
+    }},
+  {name: "reboot-failed-same-boot", upd: () => mkUpd({scan: mkScan(SAMPLE), reboot: mkReboot({state: "failed", started_at: NOW() - 300, ended_at: NOW() - 100, error: SAME_BOOT})}),
+    run: async (page, t) => {
+      t.ok(await rtext(page, "#rebbox .updnote") === SAME_BOOT, "reboot failed, same boot: the text as sent: " + await rtext(page, "#rebbox .updnote"));
+      t.ok(await page.locator("#rebbox .updnote").evaluate((e, c) => e.classList.contains("bad") && getComputedStyle(e).color === c, RED), "reboot failed, same boot: a red line");
+      t.ok(await page.locator("#rebbox button.bigbtn").isEnabled() && await rtext(page, "#rebbox .vnote") === HINT, "reboot failed, same boot: the button can be used again, with its hint");
+      await t.shot("same-boot");
+    }},
+  {name: "reboot-no-scan", upd: () => mkUpd({scan: null}),
+    run: async (page, t) => {      /* no scan yet: Install is off, a reboot does not depend on a scan */
+      t.ok(await page.locator(btn("Install")).isDisabled() && await page.locator("#rebbox button.bigbtn").isEnabled() && await rbLabel(page) === "Reboot Defiant", "reboot, no scan yet: Install updates is off, Reboot Defiant is on");
+      t.ok(await page.locator("#rebbox button.bigbtn").evaluate(e => getComputedStyle(e).backgroundColor) === ORANGE, "reboot, no scan yet: the ordinary button");
+      await t.click(rbtn("Reboot"));
+      t.ok(await rtext(page, "#rebbox .vnote") === RB_ASK, "reboot, no scan yet: the confirm text has no package list: " + await rtext(page, "#rebbox .vnote"));
+    }},
+  {name: "reboot-during-install", upd: () => mkUpd({scan: mkScan(SAMPLE), job: mkJob({state: "running", started_at: NOW() - 30, log: logLines(5)})}),
+    run: async (page, t) => {      /* Fleet would answer 409: the button is off and says why, so no confirm ends in a refusal */
+      t.ok(await page.locator("#rebbox button.bigbtn").isDisabled() && await rbLabel(page) === "Reboot Defiant" && await rtext(page, "#rebbox .vnote") === "An install is running, progress below.", "reboot during an install: the button is off, and the note says why: " + await rtext(page, "#rebbox .vnote"));
+      await page.locator("#rebbox button.bigbtn").click({force: true, timeout: 1000}).catch(() => {}); await page.waitForTimeout(600);
+      t.ok(t.posts.length === 0 && await rbLabel(page) === "Reboot Defiant" && await rtext(page, "#rebbox .vnote") === "An install is running, progress below.", "reboot during an install: a click does not ask for a confirm and sends nothing");
+      t.ok(await page.locator(btn("Installing")).isDisabled(), "reboot during an install: the install goes on");
+      t.W.upd.job = mkJob({state: "done", started_at: NOW() - 60, ended_at: NOW() - 1, exit: 0, installed: 3, reboot_required: false}); await t.poll();
+      t.ok(await page.locator("#rebbox button.bigbtn").isEnabled() && await rtext(page, "#rebbox .vnote") === HINT, "reboot during an install: when it has ended the button is back, with its hint");
+    }},
+  {name: "reboot-during-scan", upd: () => mkUpd({scan: mkScan(Object.assign({busy: true}, SAMPLE))}),
+    run: async (page, t) => {      /* the same for a scan that runs (Fleet answers 409 to a reboot during one) */
+      t.ok(await page.locator("#rebbox button.bigbtn").isDisabled() && await rtext(page, "#rebbox .vnote") === "A scan is running, try again in a minute.", "reboot during a scan: the button is off, and the note says why: " + await rtext(page, "#rebbox .vnote"));
+      t.W.upd.scan = mkScan(SAMPLE); await t.poll();
+      t.ok(await page.locator("#rebbox button.bigbtn").isEnabled() && await rtext(page, "#rebbox .vnote") === HINT, "reboot during a scan: when it has ended the button is back, with its hint");
+    }},
+  {name: "reboot-none", upd: () => mkUpd({scan: mkScan(SAMPLE), reboot: undefined}),
+    run: async (page, t) => {      /* an older Fleet: no "reboot" in the answer */
+      t.ok(await page.locator("#rebbox button").count() === 0 && (await page.locator("#rebbox").innerHTML()).trim() === "" && !/Reboot Defiant/i.test(await text(page, "#defbody")), "reboot none: no button, no line, nothing about a reboot button");
+      t.ok(await page.locator(btn("Install")).isEnabled() && await page.locator(btn("Scan now")).isEnabled() && await page.locator("#updbox tbody tr").count() === PACKAGES.length, "reboot none: the Updates block is as before");
+      t.ok(/Reboot\s*No/i.test(await page.locator("#defbody .node").first().locator(".stats").innerText()), "reboot none: the Reboot chip is as before");
+      await t.shot("none");
+    }},
+  {name: "reboot-probe-down", probeDown: true, upd: () => mkUpd({scan: mkScan(SAMPLE), reboot: mkReboot({state: "running", started_at: NOW() - 75, down_at: NOW() - 61})}),
+    run: async (page, t) => {      /* the 20-second probe cannot reach Defiant: its error shows, and so does the reboot */
+      t.ok(/ssh: connect to host defiant\.example/i.test(await text(page, "#defmsg")) && await page.locator("#defmsg").evaluate(e => e.classList.contains("err")), "reboot probe down: the probe's error stays on top, red");
+      t.ok(/^Rebooting\. Defiant has been down since/.test(await rtext(page, "#rebbox .updnote")) && await page.locator("#rebbox button.bigbtn").isDisabled(), "reboot probe down: the reboot line and the disabled button are still there");
+      t.ok(await page.locator("#updbox button.bigbtn").count() === 2 && await page.locator("#updbox tbody tr").count() === PACKAGES.length, "reboot probe down: the Updates block is still there");
+      await t.shot("probe-down");
+    }},
+  {name: "reboot-hostile", upd: () => mkUpd({scan: mkScan({packages: [], reboot_required: true, reboot_pkgs: [HOSTILE + "-boot"]}), reboot: mkReboot({state: "failed", started_at: NOW() - 300, ended_at: NOW() - 100, error: "boom " + HOSTILE})}),
+    run: async (page, t) => {
+      await t.click(rbtn("Reboot"));
+      const bad = await page.evaluate(() => ({pwned: window.__pwned || 0, scripts: document.querySelectorAll("#defbody script").length, imgs: document.querySelectorAll("#defbody img").length, injected: document.querySelectorAll("#defbody [onerror]").length}));
+      t.ok(!bad.pwned && !bad.scripts && !bad.imgs && !bad.injected, "reboot hostile: nothing from the server runs or becomes markup: " + JSON.stringify(bad));
+      t.ok((await rtext(page, "#rebbox")).includes('<img src=x onerror="window.__pwned=1">') && (await rtext(page, "#rebbox .vnote")).includes("<script>"), "reboot hostile: the error and the package name are shown literally");
+    }},
+  /* an install that needs a reboot starts one by itself (reboot.auto): the lines show under the install result, and in the Server panel */
+  {name: "auto-running", upd: () => mkUpd({scan: REBOOT_SCAN(), job: AUTO_JOB(), reboot: mkReboot({state: "running", auto: true, started_at: NOW() - 12})}),
+    run: async (page, t) => {
+      const sib = await page.locator("#updbox .nodes > .node").filter({hasText: "Install finished"}).evaluate(e => e.nextElementSibling && {cls: e.nextElementSibling.className, text: e.nextElementSibling.textContent.trim(), w: e.nextElementSibling.getBoundingClientRect().width, jw: e.getBoundingClientRect().width});
+      t.ok(sib && /updnote/.test(sib.cls) && sib.text === "Rebooting. Waiting for Defiant to go down." && Math.abs(sib.w - sib.jw) < 2, "auto running: the line directly under the install result, as wide as it: " + JSON.stringify(sib));
+      t.ok(!/a reboot is waiting/i.test(await text(page, "#updbox .nodes > .node:has(h3:text('Install finished'))")), "auto running: no hint to reboot by hand while it runs");
+      t.ok(await rtext(page, "#rebbox .updnote") === "Rebooting. Waiting for Defiant to go down." && await page.locator("#rebbox button.bigbtn").isDisabled(), "auto running: the Server panel shows it too, with the button off");
+      t.ok(await page.locator("#updbox .updnote").evaluate(e => getComputedStyle(e).color) === AMBER, "auto running: not red");
+      await t.shot("running");
+    }},
+  {name: "auto-down", upd: () => mkUpd({scan: REBOOT_SCAN(), job: AUTO_JOB(), reboot: mkReboot({state: "running", auto: true, started_at: NOW() - 75, down_at: NOW() - 61})}),
+    run: async (page, t) => {
+      t.ok(/^Rebooting\. Defiant has been down since \d\d:\d\d:\d\d \(\d+ s\)\.$/.test(await rtext(page, "#updbox .nodes > .updnote")), "auto down: the live line under the install result: " + await rtext(page, "#updbox .nodes > .updnote"));
+      await t.shot("down");
+    }},
+  {name: "auto-done", upd: () => mkUpd({scan: mkScan({packages: [], deferred: SAMPLE.deferred}), job: AUTO_JOB(), reboot: mkReboot({state: "done", auto: true, started_at: NOW() - 160, ended_at: NOW() - 45, down_at: NOW() - 140, back_after: 115})}),
+    run: async (page, t) => {
+      t.ok(await rtext(page, "#updbox .nodes > .updnote") === "Defiant rebooted and answered again after 115 s." && await page.locator("#updbox .nodes > .updnote").evaluate((e, c) => e.classList.contains("ok") && getComputedStyle(e).color === c, BLUE), "auto done: the ok line under the install result");
+      t.ok(!/a reboot is waiting/i.test(await text(page, "#updbox")) && /reboot required afterwards: yes/i.test(await text(page, "#updbox")), "auto done: no hint, and the install's own line stays factual: reboot required afterwards: yes");
+      await t.shot("done");
+    }},
+  {name: "auto-failed", upd: () => mkUpd({scan: REBOOT_SCAN(), job: AUTO_JOB(), reboot: mkReboot({state: "failed", auto: true, started_at: null, ended_at: NOW() - 100,
+      error: "The reboot after the install did not start: apt is busy on Defiant, an upgrade may be running. Try again in a few minutes. Reboot Defiant when apt is idle."})}),
+    run: async (page, t) => {
+      const w = "The reboot after the install did not start: apt is busy on Defiant, an upgrade may be running. Try again in a few minutes. Reboot Defiant when apt is idle.";
+      t.ok(await rtext(page, "#updbox .nodes > .updnote") === w && await page.locator("#updbox .nodes > .updnote").evaluate((e, c) => e.classList.contains("bad") && getComputedStyle(e).color === c, RED), "auto failed: the red line under the install result");
+      t.ok(/a reboot is waiting\. use reboot defiant when it suits you\./i.test(await text(page, "#updbox")), "auto failed: the reboot is still waiting, and the install result says so");
+      t.ok(await rtext(page, "#rebbox .updnote") === w && await page.locator("#rebbox button.bigbtn").isEnabled() && await page.locator("#rebbox button.bigbtn").evaluate(e => getComputedStyle(e).backgroundColor) === AMBER, "auto failed: the Server panel has the line, and an amber button to do it by hand");
+      await t.shot("failed");
+    }},
+  {name: "auto-by-hand", upd: () => mkUpd({scan: mkScan({packages: [], deferred: SAMPLE.deferred}), job: AUTO_JOB(), reboot: mkReboot({state: "done", auto: false, started_at: NOW() - 160, ended_at: NOW() - 45, down_at: NOW() - 140, back_after: 115})}),
+    run: async (page, t) => {
+      t.ok(await page.locator("#updbox .nodes > .updnote").count() === 0, "by hand: no line under the install result for a reboot that the install did not start");
+      t.ok(/answered again after 115 s/.test(await rtext(page, "#rebbox .updnote")), "by hand: the Server panel has it");
+    }},
+  {name: "auto-old-failed", upd: () => mkUpd({scan: mkScan({packages: [], deferred: SAMPLE.deferred}), job: mkJob({state: "done", started_at: NOW() - 200, ended_at: NOW() - 60, exit: 0, installed: 3, reboot_required: false}),
+      reboot: mkReboot({state: "failed", auto: true, started_at: null, ended_at: NOW() - 86400, error: AUTO_NOSTART})}),
+    run: async (page, t) => {      /* a day-old failure of the reboot after an EARLIER install: not under this install's result, but still in the Server panel */
+      t.ok(await page.locator("#updbox .nodes > .updnote").count() === 0 && /reboot required afterwards: no/i.test(await text(page, "#updbox")), "auto old failed: nothing under the install result of a later install");
+      t.ok(await rtext(page, "#rebbox .updnote") === AUTO_NOSTART, "auto old failed: the Server panel still has the red line");
+    }},
+  {name: "auto-old-done", upd: () => mkUpd({scan: mkScan({packages: [], deferred: SAMPLE.deferred}), job: mkJob({state: "done", started_at: NOW() - 200, ended_at: NOW() - 60, exit: 0, installed: 3, reboot_required: false}),
+      reboot: mkReboot({state: "done", auto: true, started_at: NOW() - 420, ended_at: NOW() - 300, down_at: NOW() - 400, back_after: 120})}),
+    run: async (page, t) => {      /* an automatic reboot that finished five minutes ago, then an install that needs none */
+      t.ok(await page.locator("#updbox .nodes > .updnote").count() === 0, "auto old done: no reboot line under the result of an install that needs no reboot");
+      t.ok(/answered again after 120 s/.test(await rtext(page, "#rebbox .updnote")), "auto old done: the Server panel has it");
+    }},
+  {name: "auto-just-after", upd: () => mkUpd({scan: REBOOT_SCAN(), job: mkJob({state: "done", started_at: NOW() - 200, ended_at: NOW() - 100, exit: 0, installed: 3, reboot_required: true}),
+      reboot: mkReboot({state: "failed", auto: true, started_at: null, ended_at: NOW() - 97, error: AUTO_NOSTART})}),
+    run: async (page, t) => {      /* the reboot that came right after this install (a few seconds, the same tick) does show under it */
+      t.ok(await rtext(page, "#updbox .nodes > .updnote") === AUTO_NOSTART, "auto just after: the line is under the install result it belongs to");
+    }},
+  {name: "auto-story", upd: () => mkUpd({scan: REBOOT_SCAN(), job: mkJob({state: "running", started_at: NOW() - 120, log: logLines(5)})}),
+    run: async (page, t) => {      /* the install ends with a reboot needed, Fleet reboots by itself, Defiant goes down and comes back */
+      const bar = () => page.locator("#updbox .nodes > .updnote"), srv = () => page.locator("#rebbox .updnote");
+      t.ok(await bar().count() === 0 && await srv().count() === 0, "story: an install runs: no reboot line anywhere");
+      t.W.upd.job = AUTO_JOB(); await t.poll();
+      t.ok(/a reboot is waiting\. use reboot defiant when it suits you\./i.test(await text(page, "#updbox")) && await bar().count() === 0 && await srv().count() === 0 && await page.locator("#rebbox button.bigbtn").isEnabled(), "story: the install ended, a reboot is needed, none started: the hint to reboot by hand, no line");
+      t.W.upd.reboot = mkReboot({state: "running", auto: true, started_at: NOW()}); await t.poll();
+      t.ok(await rtext(page, "#updbox .nodes > .updnote") === "Rebooting. Waiting for Defiant to go down." && await rtext(page, "#rebbox .updnote") === "Rebooting. Waiting for Defiant to go down.", "story: Fleet reboots by itself: the line under the install result and in the Server panel");
+      t.ok(!/a reboot is waiting/i.test(await text(page, "#updbox")) && await page.locator("#rebbox button.bigbtn").isDisabled() && await page.locator(btn("Install")).isDisabled() && await page.locator(btn("Scan now")).isDisabled(), "story: no hint to do it by hand while it runs, all three buttons off");
+      t.W.upd.reboot = mkReboot({state: "running", auto: true, started_at: NOW() - 40, down_at: NOW() - 25}); await t.poll();
+      t.ok(/^Rebooting\. Defiant has been down since \d\d:\d\d:\d\d \(\d+ s\)\.$/.test(await rtext(page, "#updbox .nodes > .updnote")) && /has been down since/.test(await rtext(page, "#rebbox .updnote")), "story: down: the seconds in both places");
+      t.W.upd.reboot = mkReboot({state: "done", auto: true, started_at: NOW() - 90, ended_at: NOW(), down_at: NOW() - 75, back_after: 90}); t.W.upd.scan = mkScan({packages: [], deferred: SAMPLE.deferred}); await t.poll();
+      t.ok(await rtext(page, "#updbox .nodes > .updnote") === "Defiant rebooted and answered again after 90 s." && await rtext(page, "#rebbox .updnote") === "Defiant rebooted and answered again after 90 s.", "story: back: the ok line in both places");
+      t.ok(!/a reboot is waiting/i.test(await text(page, "#updbox")) && await page.locator("#rebbox button.bigbtn").isEnabled() && await page.locator(btn("Scan now")).isEnabled(), "story: the rescan found nothing waiting: no hint, the buttons are back");
+      await t.shot("done");
     }},
   {name: "main-view-loads-nothing-of-defiant", hash: "", upd: () => mkUpd({scan: mkScan(SAMPLE)}),
     run: async (page, t) => {
@@ -418,9 +789,17 @@ const scenes = [
     }},
   {name: "narrow-window", upd: () => mkUpd({scan: mkScan(SAMPLE)}), size: [820, 760],
     run: async (page, t) => { await t.click(btn("Install")); await t.shot("armed"); }},
+  {name: "narrow-window-reboot-waiting", upd: () => mkUpd({scan: WAITING()}), size: [820, 760],
+    run: async (page, t) => { await t.click(btn("Install"));      /* the longer, definite reboot sentence in the narrow Install panel */
+      t.ok(/a reboot is already waiting, so defiant reboots by itself right after this install, and the sites are unreachable for about a minute\./i.test(await text(page, "#updbox .node:nth-child(3)")), "narrow window, a reboot is waiting: the definite sentence");
+      await t.shot("armed"); }},
 
   {name: "phone-width", upd: () => mkUpd({scan: mkScan(SAMPLE)}), size: [390, 844],
     run: async (page, t) => { await t.click(btn("Install")); await t.shot("armed"); }},
+  {name: "phone-width-reboot-waiting", upd: () => mkUpd({scan: WAITING()}), size: [390, 844],
+    run: async (page, t) => { await t.click(btn("Install"));
+      t.ok(/a reboot is already waiting, so defiant reboots by itself right after this install, and the sites are unreachable for about a minute\./i.test(await text(page, "#updbox .node:nth-child(3)")), "phone width, a reboot is waiting: the definite sentence");
+      await t.shot("armed"); }},
 
   ...(process.env.UPD_JSON ? [{name: "from-file", upd: () => JSON.parse(fs.readFileSync(process.env.UPD_JSON, "utf8")),
     run: async (page, t) => {
@@ -476,6 +855,64 @@ const scenes = [
       await t.click("#defbtn"); await t.click("#defbtn"); await t.advance(1000);
       t.ok(await page.locator("#updbox .bigbtn.armed").count() === 0, "confirm window: leaving the view ends the question");
     }},
+  {name: "polling-reboot", clock: true, upd: () => mkUpd({scan: mkScan(SAMPLE), reboot: mkReboot({state: "running", started_at: NOW() - 30})}),
+    run: async (page, t) => {
+      const c = () => t.W.gets[UPD] || 0, d = () => t.W.gets["/api/defiant"] || 0, c0 = c();
+      await t.advance(12000); t.ok(c() - c0 >= 3 && c() - c0 <= 5, `reboot: the updates are polled every 3 s while a reboot runs (${c() - c0} in 12 s)`);
+      t.ok(d() === 1, `reboot: the page's own loop stays at 15 s (${d()} requests in 12 s)`);
+      t.W.upd.reboot = mkReboot({state: "done", started_at: NOW() - 100, ended_at: NOW(), down_at: NOW() - 80, back_after: 100});
+      await t.advance(4000); const c1 = c(); await t.advance(9000);
+      t.ok(c() - c1 <= 1, `reboot: back to the 15 s loop once the reboot is over (${c() - c1} in 9 s)`);
+      t.W.upd.reboot = mkReboot({state: "running", started_at: NOW() - 30}); await page.evaluate(() => updPoll()); await t.advance(500);
+      t.W.upd.reboot = mkReboot({state: "failed", started_at: NOW() - 900, ended_at: NOW(), error: "Defiant did not answer again within 15 minutes. Check it in your hosting provider's console."});
+      await t.advance(4000); const c3 = c(); await t.advance(9000);
+      t.ok(c() - c3 <= 1, `reboot: no 3 s polling after a failed reboot (${c() - c3} in 9 s)`);
+      t.W.upd.reboot = mkReboot({state: "running", started_at: NOW() - 30}); await page.evaluate(() => updPoll()); await t.advance(500);
+      await t.click("#defbtn");
+      const c2 = c(), d2 = d(); await t.advance(60000);
+      t.ok(c() === c2 && d() === d2, `reboot: nothing is polled after the view is left, although the reboot still runs (${c() - c2}, ${d() - d2})`);
+      await t.click("#defbtn"); await t.advance(7000);
+      t.ok(c() - c2 >= 2, `reboot: coming back resumes the 3 s polling (${c() - c2} in 7 s)`);
+    }},
+  {name: "polling-reboot-none", clock: true, upd: () => mkUpd({scan: mkScan(SAMPLE), reboot: undefined}),
+    run: async (page, t) => {      /* an older Fleet: no reboot, so the 15 s loop alone */
+      const c = () => t.W.gets[UPD] || 0, c0 = c();
+      await t.advance(14000); t.ok(c() === c0, `reboot none: nothing before 15 s (${c() - c0})`);
+      await t.advance(2000); t.ok(c() === c0 + 1, `reboot none: one more at 15 s (${c() - c0})`);
+    }},
+  {name: "polling-reboot-after-install", clock: true, upd: () => mkUpd({scan: REBOOT_SCAN(), job: mkJob({state: "done", started_at: NOW() - 300, ended_at: NOW() - 10, exit: 0, installed: 24, reboot_required: true, log: logLines(5)})}),
+    run: async (page, t) => {      /* the install ended 10 s ago with a reboot due and Fleet has not started it yet (one ssh call): the page asks every 3 s until Fleet's own reboot shows */
+      const c = () => t.W.gets[UPD] || 0, c0 = c();
+      await t.advance(9500); t.ok(c() - c0 >= 2 && c() - c0 <= 4, `after an install that left a reboot due: the updates are polled every 3 s (${c() - c0} in 9.5 s)`);
+      t.ok(/a reboot is waiting\. use reboot defiant when it suits you\./i.test(await text(page, "#updbox")), "after an install that left a reboot due: until then the hint to reboot by hand shows");
+      t.W.upd.reboot = mkReboot({state: "running", auto: true, started_at: NOW()}); await t.advance(3500);
+      t.ok(await rtext(page, "#updbox .nodes > .updnote") === "Rebooting. Waiting for Defiant to go down." && !/a reboot is waiting/i.test(await text(page, "#updbox")), "after an install that left a reboot due: Fleet's own reboot shows within one poll, in place of the hint");
+    }},
+  {name: "polling-reboot-after-old-install", clock: true, upd: () => mkUpd({scan: REBOOT_SCAN(), job: AUTO_JOB()}),
+    run: async (page, t) => {      /* the install ended 2 minutes ago and no reboot came: nothing to wait for, the 15 s loop alone */
+      const c = () => t.W.gets[UPD] || 0, c0 = c();
+      await t.advance(14000); t.ok(c() === c0, `old install, no reboot: nothing before 15 s (${c() - c0})`);
+      await t.advance(2000); t.ok(c() === c0 + 1, `old install, no reboot: one more at 15 s (${c() - c0})`);
+    }},
+  {name: "polling-reboot-confirm-window", clock: true, upd: () => mkUpd({scan: mkScan(SAMPLE)}),
+    run: async (page, t) => {
+      await t.click(rbtn("Reboot")); await t.advance(300);
+      await t.advance(7000); t.ok(/sure/i.test(await text(page, "#rebbox .bigbtn.armed")), "reboot confirm window: still asking after 7 s");
+      await t.advance(1500); t.ok(await page.locator("#rebbox .bigbtn.armed").count() === 0 && await rbLabel(page) === "Reboot Defiant", "reboot confirm window: the question lapses after 8 s");
+      t.ok(t.posts.length === 0, "reboot confirm window: nothing was sent");
+      await t.click(rbtn("Reboot")); await t.advance(300);
+      await t.click("#defbtn"); await t.click("#defbtn"); await t.advance(1000);
+      t.ok(await page.locator("#rebbox .bigbtn.armed").count() === 0, "reboot confirm window: leaving the view ends the question");
+    }},
+  {name: "reboot-narrow-window", upd: () => mkUpd({scan: REBOOT_SCAN()}), size: [820, 760],
+    run: async (page, t) => { await t.click(rbtn("Reboot")); await t.shot("armed"); }},
+  {name: "reboot-narrow-running", upd: () => mkUpd({scan: REBOOT_SCAN(), job: AUTO_JOB(), reboot: mkReboot({state: "running", auto: true, started_at: NOW() - 75, down_at: NOW() - 61})}), size: [820, 760],
+    run: async (page, t) => { await t.shot("running"); }},
+  {name: "reboot-phone-width", upd: () => mkUpd({scan: REBOOT_SCAN()}), size: [390, 844],
+    run: async (page, t) => { await t.click(rbtn("Reboot")); await t.shot("armed"); }},
+  {name: "reboot-phone-width-failed", upd: () => mkUpd({scan: REBOOT_SCAN(), job: AUTO_JOB(), reboot: mkReboot({state: "failed", auto: true, started_at: null, ended_at: NOW() - 100,
+      error: "The reboot after the install did not start: apt is busy on Defiant, an upgrade may be running. Try again in a few minutes. Reboot Defiant when apt is idle."})}), size: [390, 844],
+    run: async (page, t) => { await t.shot("failed"); }},
 ];
 
 /* ---------- runner ---------- */
@@ -485,7 +922,7 @@ const scenes = [
   const browser = await webkit.launch();
   for(const sc of todo){
     const problems = [], posts = [], missing = [], extra = [];
-    const W = {upd: sc.upd(), gets: {}, inflight: 0, updStatus: sc.updStatus || 0, updOff: !!sc.updOff, installReply: null, scanReply: null};
+    const W = {upd: sc.upd(), gets: {}, inflight: 0, updStatus: sc.updStatus || 0, updOff: !!sc.updOff, installReply: null, scanReply: null, rebootReply: null, probeDown: !!sc.probeDown, defOver: sc.defOver || null, postDelay: 0};
     const size = sc.size || [1280, 900];
     const ctx = await browser.newContext({viewport: {width: size[0], height: size[1]}, deviceScaleFactor: 1});
     const handle = async route => {
@@ -498,6 +935,7 @@ const scenes = [
         posts.push([url.pathname, body]);
         const r = answer(W, "POST", url, body, req.headers());
         if(r === undefined){ missing.push("POST " + url.pathname); return route.fulfill({status: 404, contentType: "application/json", body: '{"error":"no fixture"}'}); }
+        if(W.postDelay) await new Promise(res => setTimeout(res, W.postDelay));      /* a Fleet that is slow to answer: the request is out for this long */
         return fulfil(route, r);
       }
       if(url.pathname === "/") return route.fulfill({status: 200, contentType: "text/html; charset=utf-8", body: fs.readFileSync(HTML)});
@@ -526,7 +964,8 @@ const scenes = [
         for(let i = 0; i < 40 && W.inflight; i++) await page.waitForTimeout(5);        /* let the answers arrive before the next slice of time */
         await page.waitForTimeout(30); } },
       shot: async name => { const f = path.join(OUT, `${sc.name}--${name}.png`); await page.screenshot({path: f, fullPage: true}); extra.push(f);
-        const b = page.locator("#updbox"); if(await b.count()) await b.screenshot({path: path.join(OUT, `${sc.name}--${name}-block.png`)}); },
+        const b = page.locator("#updbox"); if(await b.count()) await b.screenshot({path: path.join(OUT, `${sc.name}--${name}-block.png`)});
+        const r = page.locator("#rebbox"); if(await r.count()) await r.locator("xpath=ancestor::div[contains(@class,'node')][1]").screenshot({path: path.join(OUT, `${sc.name}--${name}-server.png`)}).catch(() => {}); },
     };
     try{
       if(sc.clock) await page.clock.install({time: Date.now()});
@@ -551,6 +990,12 @@ const scenes = [
           if(box){
             for(const tg of box.querySelectorAll(".tag")){ if(tg.getBoundingClientRect().height > 24) out.push("a tag wraps: " + tg.textContent); }
             for(const b2 of box.querySelectorAll("button")){ const r = b2.getBoundingClientRect(), s = getComputedStyle(b2); if(r.height < 28 || s.visibility === "hidden") out.push("button too small or hidden: " + b2.textContent); }
+          }
+          const rb = document.getElementById("rebbox"), host = rb && rb.closest(".node");      /* the Reboot block in the Server panel, at every width */
+          if(rb && host && host.getClientRects().length){
+            const a = host.getBoundingClientRect();
+            for(const c of rb.querySelectorAll("*")){ const r = c.getBoundingClientRect(); if(r.width && (r.right > a.right + 1 || r.left < a.left - 1 || r.bottom > a.bottom + 1)) out.push(`sticks out of the Server panel: <${c.tagName.toLowerCase()}> "${(c.textContent || "").trim().slice(0, 30)}"`); }
+            for(const b2 of rb.querySelectorAll("button")){ const r = b2.getBoundingClientRect(); if(r.height < 28 || getComputedStyle(b2).visibility === "hidden") out.push("Reboot button too small or hidden: " + b2.textContent); if(b2.scrollWidth > b2.clientWidth + 1) out.push("Reboot button text clipped: " + b2.textContent); }
           }
           return out;
         }, size[0] <= 700);

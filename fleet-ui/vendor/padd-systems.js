@@ -36,8 +36,8 @@ const fig = v => { const [n, u] = String(v).split(" "); return `<b>${esc(n)}${u 
 const info = o => `<div class="p-row p-sy-flat" style="--c:var(--${o.c || "grid"})"><span class="p-m"><span class="p-t${o.wrap ? " wrap" : ""} p-sel">${esc(o.t)}</span>${
   (o.lines || []).filter(Boolean).map(l => `<span class="p-s">${l}</span>`).join("")}${o.e ? `<span class="p-s wrap p-sel" style="color:var(--red)">${esc(o.e)}</span>` : ""}</span>${o.tag ? H.tag(o.tag, o.tagc) : ""}</div>`;
 const dl = rows => `<div class="p-sy-dl">${rows.map(([k, v]) => `<div><span>${esc(k)}</span><b class="p-sel">${esc(v == null || v === "" ? "–" : v)}</b></div>`).join("")}</div>`;
-const pan = (c, title, big, sub, kv, mid) => `<div class="p-card" style="--c:var(--${c})"><h3>${esc(title)}</h3>${big ? `<div class="p-free">${big}</div>` : ""}${mid || ""}${
-  sub ? `<div class="p-s wrap p-sel">${esc(sub)}</div>` : ""}${kv ? `<div class="p-kv">${kv.map(([l, v]) => `<div><b>${esc(v ?? "–")}</b><span>${esc(l)}</span></div>`).join("")}</div>` : ""}</div>`;
+const pan = (c, title, big, sub, kv, mid, tail) => `<div class="p-card" style="--c:var(--${c})"><h3>${esc(title)}</h3>${big ? `<div class="p-free">${big}</div>` : ""}${mid || ""}${
+  sub ? `<div class="p-s wrap p-sel">${esc(sub)}</div>` : ""}${kv ? `<div class="p-kv">${kv.map(([l, v]) => `<div><b>${esc(v ?? "–")}</b><span>${esc(l)}</span></div>`).join("")}</div>` : ""}${tail || ""}</div>`;
 const gauge = (pct, c) => `<div${c ? ` style="--g:var(--${c})"` : ""}>${H.gauge(pct || 0, 20)}</div>`;
 /* P.sheet upper-cases and cuts its sub-line: a path or an image name keeps its case and wraps */
 const keepCase = s => { const el = s.el.querySelector(".p-shd .p-s"); if(el) el.classList.add("p-sy-path"); };
@@ -48,6 +48,8 @@ P.css(`
 .p-sy-fig small{margin-left:4px;font-size:12px;font-weight:600;color:var(--dim);letter-spacing:.1em;text-transform:uppercase}
 .p-sy-amb{color:var(--amber)}
 .p-kv .p-sy-amb{color:var(--amber)}
+.p-btn.amber{background:var(--amber)}            /* Reboot Defiant while a reboot is waiting: amber, red is for failure */
+.p-msg.p-sy-ok{background:#07131c;border-left-color:var(--blue);color:var(--blue)}
 .p-sy-up{overflow-wrap:anywhere}            /* an apt error or a package name can hold a URL with no break in it */
 .p-sy-flat:active{background:var(--card)}
 .p-sy-log{margin-top:8px;padding:8px 10px;background:var(--ink);border-left:4px solid var(--track);font:400 11px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;
@@ -552,13 +554,13 @@ P.screens["systems/defiant"] = { tab: "systems", title: "Defiant", color: "peach
     const sc = p => p == null ? "" : p > 90 ? "red" : p > 80 ? "amber" : "", gbi = kb => kb ? (kb / 1048576).toFixed(1) : "–";
     const hostC = d.status === "ok" ? "peach" : d.status === "warn" ? "amber" : "red", cpuC = sc(Math.max(d.cpu_pct || 0, memU || 0)), diskC = sc(diskU);
     const sites = d.sites || [], ctrs = d.containers || [], upn = d.upd ? d.upd.count : d.updates;       /* the scan's count (the probe's also counts what phasing holds back) until there is a scan */
-    if(d.host == null){ P.put(el, `<div class="p-sy-state">${H.tag(tag, tagc)}</div>${lost("defiant")}${notes(d) || empty("The web server sent no figures")}${updBlock()}`); return; }   /* the probe failed: its error, and the install still in view (the upgrade can restart the network) */
+    if(d.host == null){ P.put(el, `<div class="p-sy-state">${H.tag(tag, tagc)}</div>${lost("defiant")}${notes(d) || empty("The web server sent no figures")}${rbCard()}${updBlock()}`); return; }   /* the probe failed: its error, and the install and the reboot still in view (the upgrade can restart the network, a reboot takes the probe down) */
     P.put(el, `<div class="p-sy-state">${H.tag(tag, tagc)}<span class="p-s">${esc(d.os || "")}${d.kernel ? " · kernel " + esc(d.kernel) : ""}</span></div>
       ${lost("defiant")}${notes(d)}
       ${d.reboot_required ? H.msg(`Reboot required.${upn ? ` ${plural(upn, "update")} ${upn === 1 ? "is" : "are"} pending.` : ""}`) : ""}
       ${H.sec("Server")}<div class="p-sy-pans">
       ${pan(hostC, d.host || "Defiant", d.uptime_s ? `${esc(dur(d.uptime_s))}<small>up</small>` : "–", "",
-        [["Cores", d.cpus || "–"], ["Load", String(d.load || "–").split(" ")[0]], ["Updates", upn ?? "–"], ["Reboot", d.reboot_required ? "Required" : "No"]])}
+        [["Cores", d.cpus || "–"], ["Load", String(d.load || "–").split(" ")[0]], ["Updates", upn ?? "–"], ["Reboot", d.reboot_required ? "Required" : "No"]], "", rbBlock())}
       <div class="p-card" style="--c:var(--${cpuC || "peach"})"><h3>CPU and memory</h3><div class="p-free">${esc(d.cpu_pct ?? "–")}<small>% CPU</small></div>${gauge(d.cpu_pct, sc(d.cpu_pct))}
         <div class="p-s wrap">Memory ${memU == null ? "–" : memU.toFixed(0) + " % used"} · ${gbi(d.mem_avail_kb)} of ${gbi(d.mem_total_kb)} GiB free</div>${gauge(memU, sc(memU))}</div>
       ${pan(diskC || "peach", "Disk and network", `${esc(fmtB(d.disk_used))}<small>of ${esc(fmtB(d.disk_total))}</small>`, "",
@@ -573,26 +575,32 @@ P.screens["systems/defiant"] = { tab: "systems", title: "Defiant", color: "peach
   } };
 
 /* ---- package updates (fleet.html, Updates block: same rules, same words). Fleet runs an apt simulation on Defiant every
-   hour and keeps the result in memory, so /api/defiant/updates is cheap. While a scan or the install runs, or none has
-   run yet, the screen asks again every 3 s. Package names, versions and log lines come from the server: escaped everywhere. */
+   hour and keeps the result in memory, so /api/defiant/updates is cheap. While a scan, the install or a reboot runs, or none
+   has run yet (and for up to 90 s after an install that left a reboot due), the screen asks again every 3 s. Package names,
+   versions and log lines come from the server: escaped everywhere.
+   The reboot ("reboot" in the same answer, see the Reboot Defiant block below) is idle, running, done or failed; an install
+   that needs a reboot starts one by itself (reboot.auto), but only for a request that says reboot_ok, as this screen's does. */
 const UP_SVC = /^(docker|containerd|tailscale)/, UP_BOOT = /^(linux-image|libc6$)/;      /* restart services / need a reboot */
 const UP_ROWS = 12;                                                                       /* a phone lists the first 12, security first; the Mac page lists them all */
 const upName = x => typeof x === "string" ? x : x && x.name != null ? x.name : "";     /* a removal may arrive as a name or as an object */
 const upSome = (l, n) => l.length > n ? `${l.slice(0, n).join(", ")}, +${l.length - n} more` : l.join(", ");
 const upFam = (re, l) => [...new Set(l.map(x => (String(x).match(re) || [])[1]).filter(Boolean))];
-let sgrace = 0, igrace = 0, smark = "", imark = 0, upTimer = 0;     /* a scan / the install counts as starting until this time: forever while its request is out, 8 s after Fleet accepted it */
+let sgrace = 0, igrace = 0, rgrace = 0, smark = "", imark = 0, rmark = 0, upTimer = 0;     /* a scan / the install / a reboot counts as starting until this time: forever while its request is out, 8 s after Fleet accepted it */
 const going = t => Date.now() < t;
 const upMark = u => u && u.scan ? `${u.scan.at}|${u.scan.error_at}` : "";     /* changes when a scan ends */
 const sgoing = u => going(sgrace) && upMark(u) === smark;     /* a scan asked for here is running until its result shows, not for the whole grace */
 const igoing = u => going(igrace) && ((u.job || {}).started_at || 0) === imark;     /* an install asked for here is starting until Fleet shows its job (a new start time) */
-const upLive = u => !!u && u.configured !== false && (!u.scan || u.scan.busy || (u.job || {}).state === "running" || sgoing(u) || igoing(u));
-const upWhy = (u, sc) => (u.job || {}).state === "running" ? "An install is running, progress below." : igoing(u) ? "Starting the install..."
+const rbRun = u => !!u && !!u.reboot && u.reboot.state === "running";
+const rbWait = u => { const j = u.job || {}; return !!u.reboot && u.reboot.state === "idle" && j.state === "done" && j.reboot_required === true && (u.now || 0) - (j.ended_at || 0) < 90; };     /* an install just ended with a reboot due: Fleet starts it by itself within seconds, ask again soon */
+const rgoing = u => going(rgrace) && ((u.reboot || {}).started_at || 0) === rmark;     /* a reboot asked for here is starting until Fleet shows it (a new start time) */
+const upLive = u => !!u && u.configured !== false && (!u.scan || u.scan.busy || (u.job || {}).state === "running" || sgoing(u) || igoing(u) || rbRun(u) || rgoing(u) || rbWait(u));
+const upWhy = (u, sc) => (u.job || {}).state === "running" ? "An install is running, progress below." : rbRun(u) || rgoing(u) ? "A reboot is running, progress above." : igoing(u) ? "Starting the install..."
   : sc.busy || sgoing(u) ? "A scan is running, try again in a minute." : !sc.at ? "No scan yet: scan first." : !sc.count ? "Nothing to install." : "";     /* Fleet answers 409 to an install during a scan */
 const upLog = (log, bad) => { const l = (log || []).slice(-10); return l.length ? `<div class="p-sy-log p-sel${bad ? " err" : ""}">${l.map(esc).join("\n")}</div>` : ""; };
 const upRow = p => info({c: p.security ? "amber" : p.third_party ? "mauve" : "blue", t: p.name, wrap: true, tag: p.security ? "Security" : "", tagc: "warn",
   lines: [`<span class="p-sy-path">${p.from ? `${esc(p.from)} → ${esc(p.to)}` : `new ${esc(p.to)}`}</span>`,
     `<span class="p-sy-path">${esc((p.suites || []).join(", "))}${p.third_party ? ` · third party${p.origin ? ` (${esc(p.origin)})` : ""}` : ""}</span>`]});
-function upJob(j, reboot){      /* reboot: the latest scan still wants one */
+function upJob(j, reboot){      /* reboot: the latest scan still wants one and none is running */
   const at = j.started_at ? `Started ${hm(j.started_at)}` : "";
   if(j.state === "running") return `<div class="p-card" style="--c:var(--${j.lost ? "amber" : "peach"})"><h3>Installing updates</h3>
     <div class="p-free">${j.started_at ? `${esc(dur(now() - j.started_at))}<small>running</small>` : "..."}</div><div class="p-track indet"><i></i></div>
@@ -602,7 +610,7 @@ function upJob(j, reboot){      /* reboot: the latest scan still wants one */
   if(j.state === "done") return `<div class="p-card" style="--c:var(--blue)"><h3>Install finished</h3>
     <div class="p-free">${j.installed != null ? `${esc(j.installed)}<small>installed</small>` : "Done"}</div>
     <div class="p-s wrap p-sel">${j.ended_at ? `${ago(j.ended_at)} · ` : ""}reboot required afterwards: ${j.reboot_required == null ? "unknown" : j.reboot_required ? "yes" : "no"}</div>
-    ${reboot ? `<p>Reboot Defiant when it suits you. The Install updates button never reboots.</p>` : ""}</div>`;
+    ${reboot ? `<p>A reboot is waiting. Use Reboot Defiant when it suits you.</p>` : ""}</div>`;
   if(j.state === "failed") return `<div class="p-card" style="--c:var(--red)"><h3>Install failed</h3>
     <div class="p-free" style="color:var(--red)">${j.exit != null ? `exit ${esc(j.exit)}` : "no exit code"}</div>
     <div class="p-s wrap p-sel">${at}${j.ended_at ? ` · ended ${ago(j.ended_at)}` : ""}</div>
@@ -626,10 +634,10 @@ function updBlock(){
       <div class="p-s wrap p-sel">${ok ? `Last scan ${hm(s.at)} (${ago(s.at)})${s.next_at ? ` · next ${hm(s.next_at)}` : ""}` : s.error ? `No scan yet. Fleet tries again at ${hm(s.next_at)}.` : "No scan yet. The first one runs shortly after Fleet starts."}</div>
       ${held ? `<p>${held} held back by Ubuntu's staged rollout: Ubuntu releases them in steps, they follow by themselves.</p>` : ""}
       ${s.reboot_required && bp.length ? `<p>Reboot needed for ${esc(upSome(bp, 4))}.</p>` : ""}</div>
-    <div class="p-pair" style="margin-top:8px"><button class="p-btn ghost" type="button" data-act="sys.scan"${scanning || run ? " disabled" : ""}>${scanning ? "Scanning" : "Scan now"}</button>
+    <div class="p-pair" style="margin-top:8px"><button class="p-btn ghost" type="button" data-act="sys.scan"${scanning || run || rbRun(u) ? " disabled" : ""}>${scanning ? "Scanning" : "Scan now"}</button>
       <button class="p-btn" type="button" data-act="sys.install"${why ? " disabled" : ""}>${igoing(u) && !run ? "Starting" : run ? "Installing" : "Install updates"}</button></div>
-    <p class="p-note p-sel">${esc(why || "Fleet scans every hour and sends security updates and a pending reboot once to Telegram. Install needs the Starfleet key and never reboots Defiant.")}</p>
-    ${upJob(j, s.reboot_required)}
+    <p class="p-note p-sel">${esc(why || "Fleet scans every hour and sends security updates and a pending reboot once to Telegram. Install needs the Starfleet key. If a reboot is needed afterwards, Fleet reboots Defiant.")}</p>
+    ${upJob(j, s.reboot_required && !rbRun(u))}${j.state === "done" && rbOwn(u.reboot, j) ? rbLine(u.reboot) : ""}
     ${gone.length ? H.msg(`The install removes ${plural(gone.length, "package")}: ${upSome(gone, 6)}.`) : ""}
     ${pk.length ? `${H.sec("Packages", n)}<div class="p-list">${shown.map(upRow).join("")}${rest > 0 ? info({t: `+${rest} more`, lines: [esc(restSec ? `${restSec} of them security updates` : "No security updates among them")]}) : ""}</div>` : ""}</div>`;
 }
@@ -637,7 +645,7 @@ P.on("sys.scan", () => P.run(async () => {
   if(sgoing(P.data.updates)) return;
   smark = upMark(P.data.updates); sgrace = Infinity; P.paint();
   try{ const j = await P.api.post("/api/defiant/updates/scan", {}, {key: false});             /* a scan only looks: no key */
-       if(j && j.started === false){ sgrace = 0; P.toast(j.reason === "busy" ? "A scan is already running." : "A scan ran a moment ago."); }
+       if(j && j.started === false){ sgrace = 0; P.toast(j.reason === "busy" ? "A scan is already running." : j.reason === "rebooting" ? "A reboot is running." : "A scan ran a moment ago."); }
        else { sgrace = Date.now() + 8000; P.haptic("success"); P.toast("Scan started."); } }
   catch(e){ sgrace = 0; fail("Scan failed", e); }
   finally{ P.refresh(["updates"]); P.paint(); }
@@ -649,10 +657,44 @@ P.on("sys.install", () => P.run(async () => {
     text: `${plural(+s.count, "package")} will be upgraded${sec ? `, ${sec} of them security updates` : ""}.`
       + (gone.length ? ` It removes ${plural(gone.length, "package")}: ${upSome(gone, 6)}.` : "")
       + (svc.length ? ` It restarts services (${svc.join(", ")}): the sites can be unreachable for a few seconds.` : "")
-      + (reb.length ? ` It needs a reboot afterwards (${reb.join(", ")}), and this button never reboots.` : "")})) return;
+      + (reb.length ? ` It needs a reboot afterwards (${reb.join(", ")}).` : "")
+      + (s.reboot_required ? " A reboot is already waiting, so Defiant reboots by itself right after this install, and the sites are unreachable for about a minute."
+        : " If a reboot is needed afterwards, Defiant reboots by itself and the sites are unreachable for about a minute.")})) return;
   imark = (P.data.updates.job || {}).started_at || 0; igrace = Infinity; P.paint();
-  try{ await P.api.post("/api/defiant/updates/install", {}, {timeout: 60000}); igrace = Date.now() + 8000; P.haptic("success"); P.toast("Install started."); }
+  try{ await P.api.post("/api/defiant/updates/install", {reboot_ok: true}, {timeout: 60000}); igrace = Date.now() + 8000; P.haptic("success"); P.toast("Install started."); }       /* the sheet announced the reboot: Fleet reboots afterwards only for a request that says so */
   catch(e){ igrace = 0; fail("Install failed", e); }
+  finally{ P.refresh(["updates"]); P.paint(); }
+}));
+
+/* ---- Reboot Defiant (fleet.html, Reboot block in the Server section: same rules, same words). "reboot" in /api/defiant/updates is
+   idle, running (Fleet sees Defiant go down and come back, 3 s polls), done (shown for 10 minutes) or failed (shown until the next
+   reboot). The button sits in the Server panel next to the Reboot figure and needs the Starfleet key. An older Fleet sends no
+   "reboot": then there is no button. The error text comes from the server: escaped. */
+const RB_SHOW = 600;                                                                      /* seconds a finished reboot stays on screen */
+const rbOwn = (r, j) => !!r && !!r.auto && (r.started_at || r.ended_at || 0) >= (j.ended_at || 0) - 5;      /* the reboot this install started by itself (it came right after it), not an older one */
+const rbWhy = u => (u.job || {}).state === "running" ? "An install is running, progress below." : igoing(u) ? "Starting the install..." : (u.scan || {}).busy || sgoing(u) ? "A scan is running, try again in a minute." : "";     /* Fleet answers 409 to a reboot during either */
+const rbNb = s => esc(s).replace(/\(?\b\d+ s\b\)?/g, m => `<span style="white-space:nowrap">${m}</span>`);      /* "(62 s)" stays on one line */
+function rbLine(r){      /* the running, finished or failed reboot as one line */
+  const t = now(), w = r.state === "running" ? (r.down_at ? `Rebooting. Defiant has been down since ${clock(r.down_at * 1000)} (${Math.max(0, Math.round(t - r.down_at))} s).` : "Rebooting. Waiting for Defiant to go down.")
+    : r.state === "done" && t - r.ended_at < RB_SHOW ? `Defiant rebooted and answered again after ${Math.round(+r.back_after || 0)} s.` : r.state === "failed" ? r.error || "The reboot failed." : "";
+  return w ? `<div class="p-msg${r.state === "done" ? " p-sy-ok" : r.state === "failed" ? " err" : ""} p-sel">${rbNb(w)}</div>` : "";
+}
+function rbBlock(){      /* the button with the hint and the state, for the Server panel */
+  const u = P.data.updates, r = u && u.reboot; if(!r || u.configured === false) return "";
+  const run = rbRun(u), go = rgoing(u), why = rbWhy(u);
+  return `<div class="p-pair" style="margin-top:12px"><button class="p-btn${(u.scan || {}).reboot_required ? " amber" : ""}" type="button" data-act="sys.reboot"${run || go || why ? " disabled" : ""}>${run ? "Rebooting" : go ? "Starting" : "Reboot Defiant"}</button></div>
+    ${rbLine(r)}${run ? "" : `<p class="p-sel">${esc(why || "Reboots the whole server. All sites are unreachable for about a minute. Needs the Starfleet key.")}</p>`}`;
+}
+const rbCard = () => { const b = rbBlock(); return b ? `${H.sec("Server")}<div class="p-card" style="--c:var(--peach)"><h3>Defiant</h3>${b}</div>` : ""; };      /* the probe failed: the Server panel is gone, the reboot is not */
+P.on("sys.reboot", () => P.run(async () => {
+  const u = P.data.updates; if(!u || u.configured === false || !u.reboot || rbRun(u) || rgoing(u) || rbWhy(u)) return;
+  const s = u.scan || {}, bp = s.reboot_pkgs || [], n = ((P.data.defiant || {}).sites || []).length;
+  if(!await P.confirm({title: "Reboot Defiant?", sub: "Defiant", danger: true, yes: "Reboot",
+    text: `This reboots the whole Defiant server. ${n ? plural(n, "site") : "The sites"} and all containers are unreachable for about a minute, and Fleet cannot reach Defiant until it is back.`
+      + (s.reboot_required && bp.length ? ` A reboot is waiting for: ${bp.slice(0, 4).join(", ")}${bp.length > 4 ? ` and ${bp.length - 4} more` : ""}.` : "")})) return;
+  rmark = (u.reboot || {}).started_at || 0; rgrace = Infinity; P.paint();
+  try{ await P.api.post("/api/defiant/reboot", {}, {timeout: 60000}); rgrace = Date.now() + 8000; P.haptic("success"); P.toast("Reboot started."); }
+  catch(e){ rgrace = 0; if(e && e.status === 409) P.toast(e.message); else fail("Reboot failed", e); }      /* 409: Fleet's own reason (an install runs, a reboot a moment ago), no failure of the page: a plain toast */
   finally{ P.refresh(["updates"]); P.paint(); }
 }));
 })();

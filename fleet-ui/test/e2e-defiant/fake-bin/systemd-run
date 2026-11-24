@@ -1,18 +1,43 @@
 #!/bin/bash
-# Stands in for `systemd-run --unit=NAME --collect -p StandardOutput=truncate:LOG -p StandardError=inherit -E VAR=value
-# COMMAND...`: starts the command as one detached process (own session) and returns at once. The log is opened the way
-# systemd opens it: truncate: empties it, append: appends, file: writes from the start WITHOUT truncating, so a shorter
-# run leaves the end of the previous log behind. stderr goes to the same open file (inherit). One unit at a time; its
-# pid is what the fake systemctl looks at.
+# Stands in for `systemd-run`; every call is logged in calls.log. Two kinds of unit, one at a time of each:
+#  - a service, `--unit=NAME --collect -p StandardOutput=truncate:LOG -p StandardError=inherit -E VAR=value COMMAND...` (the install):
+#    starts the command as one detached process (own session) and returns at once. The log is opened the way systemd opens it:
+#    truncate: empties it, append: appends, file: writes from the start WITHOUT truncating, so a shorter run leaves the end of the
+#    previous log behind. stderr goes to the same open file (inherit). The pid is what the stand-in systemctl looks at. A command that
+#    names a way to reboot or power off is refused: the install has none, and this stand-in must never run one.
+#  - a timer, `--unit=fleet-reboot --on-active=Ns --timer-property=AccuracySec=1s --collect /bin/systemctl reboot` (the reboot): the command is NOT run. The only one this stand-in
+#    knows is that one, and after N seconds it calls the stand-in systemctl of its own folder, by that path, with `reboot`. The path
+#    it was given is never executed, and any other command is refused. While the flag file systemd-run-fails exists the timer is not started.
+#    While systemd-run-hangs exists the timer is started and the call then hangs for 33 seconds (Fleet's start gives up after 30).
 H=$E2E_HOST
 echo "$(date +%s.%N) systemd-run $*" >> "$H/calls.log"
-out=/dev/null mode=file
+out=/dev/null mode=file unit= after=
 while [ $# -gt 0 ]; do case $1 in
-  --unit=* | --collect) shift ;;
+  --unit=*) unit=${1#--unit=}; shift ;;
+  --on-active=*) after=${1#--on-active=}; after=${after%s}; shift ;;
+  --collect) shift ;;
+  --timer-property=*) [ "$1" = --timer-property=AccuracySec=1s ] || { echo "Failed to start transient timer unit: the stand-in knows only AccuracySec=1s" >&2; exit 1; }; shift ;;
   -p) case $2 in StandardOutput=truncate:* | StandardOutput=append:* | StandardOutput=file:*) mode=${2#StandardOutput=}; out=${mode#*:}; mode=${mode%%:*} ;; esac; shift 2 ;;
   -E) export "${2?}"; shift 2 ;;
   *) break ;;
 esac; done
+if [ -n "$after" ]; then
+  [ "$unit" = fleet-reboot ] && [ "$*" = "/bin/systemctl reboot" ] && [[ $after =~ ^[0-9]+$ ]] || {
+    echo "Failed to start transient timer unit: the stand-in knows only fleet-reboot, /bin/systemctl reboot and whole seconds" >&2; exit 1; }
+  [ -e "$H/systemd-run-fails" ] && { echo "Failed to start transient timer unit: Access denied" >&2; exit 1; }      # a flag of the sandbox: systemd-run does not work
+  pid=$(cat "$H/reboot-timer.pid" 2>/dev/null)
+  if { [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; } || [ -e "$H/active-fleet-reboot.timer" ]; then
+    echo "Failed to start transient timer unit: Unit fleet-reboot.timer was already loaded or has a fragment file." >&2; exit 1; fi
+  rm -f "$H/reboot-timer.pid"
+  setsid bash -c 'echo $$ > "$1"; sleep "$2"; rm -f "$1"; echo $$ > "$3"; "$4" reboot; rm -f "$3"' FLEET-REBOOT \
+    "$H/reboot-timer.pid" "$after" "$H/reboot-service.pid" "$(dirname "$0")/systemctl" < /dev/null > /dev/null 2>&1 &
+  for ((i = 0; i < 100; i++)); do [ -s "$H/reboot-timer.pid" ] && break; sleep 0.05; done
+  echo "Running as unit: fleet-reboot.timer; will run service as unit: fleet-reboot.service."
+  [ -e "$H/systemd-run-hangs" ] && sleep 33      # a flag of the sandbox: the timer is set, but the call does not return in time (Fleet's start gives up after 30 s)
+  exit 0
+fi
+case "$*" in *systemctl* | *reboot* | *shutdown* | *poweroff* | *halt* | *kexec*)
+  echo "Failed to start transient service unit: the stand-in refuses a command that names a way to reboot or power off" >&2; exit 1 ;; esac
 if [ -s "$H/unit.pid" ] && kill -0 "$(cat "$H/unit.pid")" 2>/dev/null; then
   echo "Failed to start transient service unit: Unit fleet-apt-upgrade.service was already loaded or has a fragment file." >&2; exit 1; fi
 rm -f "$H/unit.pid"
@@ -22,5 +47,5 @@ case $mode in
   append) unit "$@" >> "$out" 2>&1 & ;;
   *) unit "$@" 1<> "$out" 2>&1 & ;;
 esac
-for ((i = 0; i < 100 && ! -s "$H/unit.pid"; i++)); do sleep 0.05; done
+for ((i = 0; i < 100; i++)); do [ -s "$H/unit.pid" ] && break; sleep 0.05; done
 echo "Running as unit: fleet-apt-upgrade.service" >&2

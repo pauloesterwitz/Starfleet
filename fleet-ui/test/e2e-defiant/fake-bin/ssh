@@ -1,21 +1,37 @@
 #!/bin/bash
-# Stands in for ssh. Understands the layout Fleet uses, `ssh -o BatchMode=yes -o ConnectTimeout=N HOST SCRIPT`,
-# and runs SCRIPT with bash inside the sandbox ($E2E_HOST) instead of on a machine. Only the made-up host
-# answers. Every other host is refused the way an unreachable one is (exit 255), so nothing real can be
-# reached through this PATH. The script runs with an empty environment and a PATH of stand-ins.
+# Stands in for ssh. Understands the layout Fleet uses, `ssh -o BatchMode=yes -o ConnectTimeout=N HOST SCRIPT`, and runs SCRIPT with bash
+# inside the sandbox ($E2E_HOST) instead of on a machine. The script runs with an empty environment and a PATH of stand-ins.
+# Only the made-up host answers, and only to the scripts Fleet is known to send: a script of any other kind is refused, and so is one that
+# names a way to reboot or power off other than the pinned line below. Every other host is refused the way an unreachable one is (exit 255),
+# so nothing real can be reached through this PATH.
+# The host does not answer (exit 255) while ssh-down-until, an epoch second, is ahead: a dropped Tailscale connection, or a reboot. Its boot
+# id is in boot-id and its start in boot-at. A reboot leaves the next id in boot-next, which becomes the boot id when the host answers
+# again: a machine shows its new id only once it is up.
 H=${E2E_HOST:?}
 while [ $# -gt 0 ]; do case $1 in -o) shift 2 ;; -*) shift ;; *) break ;; esac; done
 host=$1; shift; script="$*"
 log() { printf '%s %s\n' "$(date +%s.%N)" "$*" >> "$H/ssh.log"; }
 if [ "$host" != fake@defiant.example ]; then
   echo "ssh: Could not resolve hostname ${host##*@}: Name or service not known" >&2; log "refused $host"; exit 255; fi
-if [ "$(date +%s)" -lt "$(cat "$H/ssh-down-until" 2>/dev/null || echo 0)" ]; then      # a dropped Tailscale connection
-  echo "ssh: connect to host defiant.example port 22: Connection timed out" >&2; log "down"; exit 255; fi
 case $script in
-  *"FLEET-SCAN sim"*) kind=scan ;; *systemd-run*) kind=install ;; *ACTIVE:*) kind=poll ;; *'"H:'*) kind=probe ;; *) kind=other ;;
+  *FLEET-BOOT*) kind=reboot ;; *'echo "BOOT:'*) kind=rpoll ;; *"FLEET-SCAN sim"*) kind=scan ;; *systemd-run*) kind=install ;;
+  *ACTIVE:*) kind=poll ;; *'"H:'*) kind=probe ;; *) kind=other ;;
 esac
+# The one line that schedules a reboot is pinned here. Apart from it, and from the file names and labels that only say "reboot", no script may name a way to
+# reboot or power off: one that does is refused before bash sees it, so a Fleet that was changed to try it could not reach a real program (/bin/systemctl).
+PIN='sudo -n systemd-run --unit=fleet-reboot --on-active=3s --timer-property=AccuracySec=1s --collect /bin/systemctl reboot 2>&1'
+rest=${script/"$PIN"/}
+for w in reboot-required rebootpkgs fleet-reboot "FLEET-BUSY reboot" "FLEET-SCAN reboot" "REBOOT:"; do rest=${rest//"$w"/}; done
+case ${rest,,} in *reboot* | *shutdown* | *poweroff* | *halt* | *kexec*) echo "ssh: stand-in: a script that names a way to reboot or power off is refused" >&2; log "refused-script"; exit 255 ;; esac
+now=$(date +%s)
+if [ "$now" -lt "$(cat "$H/ssh-down-until" 2>/dev/null || echo 0)" ]; then
+  echo "ssh: connect to host defiant.example port 22: Connection timed out" >&2; log "down $kind"; exit 255; fi
+if [ $kind = other ]; then echo "ssh: stand-in: not a script Fleet is known to send" >&2; log "refused-script"; exit 255; fi
+[ -e "$H/boot-next" ] && { cp "$H/ssh-down-until" "$H/boot-at"; cp "$H/boot-next" "$H/boot-id"; rm -f "$H/boot-next"; }      # the reboot is over
+echo "$((now - $(cat "$H/boot-at" 2>/dev/null || echo "$now"))).00 0.00" > "$H/uptime"
 shopt -u patsub_replacement 2>/dev/null
 script=${script//\/var\/run\//$H/var/run/}; script=${script//\/var\/log\//$H/var/log/}; script=${script//\/srv\//$H/srv/}      # the host's disk lives in the sandbox
+script=${script//\/proc\/sys\/kernel\/random\/boot_id/$H/boot-id}; script=${script//\/proc\/uptime/$H/uptime}
 log "BEGIN $kind"
 env -i PATH="$PATH" HOME="$H" E2E_HOST="$H" bash --noprofile --norc -c "$script"; rc=$?
 log "END $kind $rc"

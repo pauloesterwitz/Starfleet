@@ -1,10 +1,28 @@
 #!/bin/bash
-# Stands in for `systemctl is-active [--quiet] UNIT`, the only thing Fleet asks. The unit counts as active
-# while the process the fake systemd-run started is alive (a zombie is not).
-[ "$1" = is-active ] || exit 1
+# Stands in for the two things Fleet's scripts ask of systemctl. Nothing real is rebooted: only the host folder changes.
+#   is-active [--quiet] UNIT   a unit is active while the process the stand-in systemd-run started for it is alive (a zombie
+#                              is not), or while a flag file active-UNIT exists (a unit someone else started)
+#   reboot                     what the timer of the stand-in systemd-run runs when it fires. reboot.conf holds DOWN, the seconds the host
+#                              does not answer (ssh exits 255), and NEVER=1 for a host that ignores the reboot. A reboot clears the reboot flag
+#                              and leaves the next boot id in boot-next (see the stand-in ssh). reboots.log gets one line for each call.
+H=$E2E_HOST
+case $1 in
+  reboot)
+    DOWN=6 NEVER=0; . "$H/reboot.conf" 2> /dev/null
+    echo "$(date +%s.%N) $([ "$NEVER" = 1 ] && echo ignored || echo rebooted)" >> "$H/reboots.log"
+    [ "$NEVER" = 1 ] && exit 0
+    n=$(($(cat "$H/boot-n" 2> /dev/null || echo 0) + 1)); echo $n > "$H/boot-n"
+    printf '%08x-0000-4000-8000-%012x\n' 1 $n > "$H/boot-next"
+    echo $(($(date +%s) + DOWN)) > "$H/ssh-down-until"
+    rm -f "$H"/var/run/reboot-required "$H"/var/run/reboot-required.pkgs
+    exit 0 ;;
+  is-active) ;;
+  *) exit 1 ;;
+esac
 shift; quiet=; [ "$1" = --quiet ] && { quiet=1; shift; }
-pid=$(cat "$E2E_HOST/unit.pid" 2>/dev/null)
+case $1 in fleet-apt-upgrade) f=unit.pid ;; fleet-reboot.timer) f=reboot-timer.pid ;; fleet-reboot.service) f=reboot-service.pid ;; *) f=no-such-unit ;; esac
+pid=$(cat "$H/$f" 2>/dev/null)
 state=$(awk '/^State:/ { print $2 }' "/proc/${pid:-0}/status" 2>/dev/null)
-if [ -n "$state" ] && [ "$state" != Z ]; then [ -n "$quiet" ] || echo active; exit 0; fi
+if { [ -n "$state" ] && [ "$state" != Z ]; } || [ -e "$H/active-$1" ]; then [ -n "$quiet" ] || echo active; exit 0; fi
 [ -n "$quiet" ] || echo inactive
 exit 3
